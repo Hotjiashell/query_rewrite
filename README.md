@@ -10,39 +10,57 @@ retrieval service. The first strategy is a one-shot baseline using
 pip install -r requirements.txt
 ```
 
-## Run the baseline
+## Configure and run the baseline
 
-Supply an OpenAI-compatible URL, model name, and API key either as arguments
-or environment variables. The baseline includes
+Edit [config.json](config.json) before running. It contains the model URL and
+name, retrieval URL and timeout, input path, output path, and concurrency:
+
+```json
+{
+  "llm": {
+    "base_url": "https://your-llm.example/v1",
+    "model_name": "your-model-name",
+    "api_key_env": "OPENAI_API_KEY"
+  },
+  "retrieval": {
+    "url": "http://10.67.43.14:8276/run_case_retrieval",
+    "timeout": 30
+  },
+  "evaluation": {
+    "input_path": "data/dialog_example.json",
+    "output_path": "results/baseline.json",
+    "concurrency": 4
+  }
+}
+```
+
+By default the key is read from the environment variable named by
+`llm.api_key_env`:
+
+```bash
+export OPENAI_API_KEY="your-api-key"
+python evaluate.py
+```
+
+For a short-lived local setup, `llm.api_key` is also supported, but keeping a
+secret in the configuration file is not recommended. Regardless of its source,
+the API key is never written to the result artifact.
+
+Use another settings file with `--config`, or override a specific setting for
+one run:
+
+```bash
+python evaluate.py --config configs/experiment-a.json
+python evaluate.py --concurrency 8 --output results/experiment-a.json
+```
+
+Resolution priority is command-line option, then config-file value, then
+environment variable. The baseline includes
 `extra_body={"chat_template_kwargs": {"enable_thinking": false}}` on every
 model request.
 
-```bash
-export OPENAI_BASE_URL="https://your-llm.example/v1"
-export OPENAI_MODEL="your-model-name"
-export OPENAI_API_KEY="your-api-key"
-
-python evaluate.py \
-  --input data/dialog_example.json \
-  --output results/baseline.json \
-  --concurrency 4
-```
-
-Equivalent command-line configuration:
-
-```bash
-python evaluate.py \
-  --input data/dialog_example.json \
-  --output results/baseline.json \
-  --base-url "https://your-llm.example/v1" \
-  --model "your-model-name" \
-  --api-key "your-api-key" \
-  --concurrency 4
-```
-
-The current retrieval service URL comes from `search.py`. Override it with
-`--retrieval-url` when needed. `--timeout` defaults to 30 seconds and applies
-to each retrieval request.
+The current retrieval service URL comes from `search.py`. `retrieval.timeout`
+applies to each retrieval request.
 
 No external request is made by installing dependencies or running tests. An
 evaluation run does call both the configured LLM and the retrieval endpoint.

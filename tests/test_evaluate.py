@@ -10,6 +10,8 @@ from evaluate import (
     calculate_metrics,
     extract_retrieval_trace,
     load_dialogue_samples,
+    parse_args,
+    resolve_run_config,
     write_json_atomically,
 )
 from gen_query import QueryGenerator
@@ -82,6 +84,47 @@ class EvaluationTests(unittest.TestCase):
             persisted = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["metrics"]["hits_at_1"], 1)
             self.assertNotIn("content", persisted["records"][0]["retrieval_trace"][0])
+
+    def test_config_file_supplies_run_settings_and_cli_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "llm": {
+                            "base_url": "http://model",
+                            "model_name": "model-a",
+                            "api_key": "test-key",
+                        },
+                        "retrieval": {"url": "http://retrieval", "timeout": 12},
+                        "evaluation": {
+                            "input_path": "input.json",
+                            "output_path": "output.json",
+                            "concurrency": 3,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = parse_args(
+                [
+                    "--config",
+                    str(config_path),
+                    "--model",
+                    "model-from-cli",
+                    "--concurrency",
+                    "5",
+                ]
+            )
+            run_config = resolve_run_config(args)
+
+            self.assertEqual(run_config.llm.base_url, "http://model")
+            self.assertEqual(run_config.llm.model_name, "model-from-cli")
+            self.assertEqual(run_config.input_path, "input.json")
+            self.assertEqual(run_config.output_path, "output.json")
+            self.assertEqual(run_config.retrieval_url, "http://retrieval")
+            self.assertEqual(run_config.retrieval_timeout, 12.0)
+            self.assertEqual(run_config.concurrency, 5)
 
 
 if __name__ == "__main__":

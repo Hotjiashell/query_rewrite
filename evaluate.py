@@ -1,8 +1,7 @@
 """Run and persist query-rewrite retrieval evaluations.
 
-Example:
-    python evaluate.py --input data/dialog_example.json --output results/baseline.json \
-      --base-url "$OPENAI_BASE_URL" --model "$OPENAI_MODEL" --api-key "$OPENAI_API_KEY"
+The default ``config.json`` carries normal run settings. Command-line options
+can override individual settings for one-off experiments.
 """
 
 from __future__ import annotations
@@ -51,6 +50,18 @@ class RetrievedCase:
     rank: int
     case_id: str
     case_title: str
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """All resolved settings needed to execute one evaluation run."""
+
+    input_path: str
+    output_path: str
+    llm: LLMConfig
+    retrieval_url: str
+    retrieval_timeout: float
+    concurrency: int
 
 
 class SearchRetriever:
@@ -265,50 +276,152 @@ def write_json_atomically(payload: Mapping[str, Any], output_path: str | Path) -
     temporary_path.replace(target)
 
 
-def _env_or_argument(argument: str | None, env_name: str) -> str | None:
-    return argument if argument is not None else os.getenv(env_name)
+def load_config_file(path: str | Path) -> Mapping[str, Any]:
+    """Read a JSON config file and ensure its root is an object."""
+
+    config_path = Path(path)
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"configuration file does not exist: {config_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"configuration file is not valid JSON: {config_path}: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("configuration file root must be a JSON object")
+    return payload
+
+
+def _config_section(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    section = config.get(name, {})
+    if not isinstance(section, Mapping):
+        raise ValueError(f"configuration section '{name}' must be an object")
+    return section
+
+
+def _first_defined(*values: Any) -> Any:
+    """Return the first value that was explicitly provided and is not empty."""
+
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _string_setting(name: str, value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"missing or invalid configuration value: {name}")
+    return value.strip()
+
+
+def _integer_setting(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"configuration value '{name}' must be an integer greater than zero")
+    return value
+
+
+def _positive_number_setting(name: str, value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError(f"configuration value '{name}' must be a number greater than zero")
+    return float(value)
+
+
+def resolve_run_config(args: argparse.Namespace) -> RunConfig:
+    """Merge CLI arguments, config JSON, and environment variables.
+
+    Precedence is CLI argument, config-file value, then environment variable.
+    The retrieval URL, timeout, and concurrency have safe defaults.
+    """
+
+    config = load_config_file(args.config)
+    llm_section = _config_section(config, "llm")
+    retrieval_section = _config_section(config, "retrieval")
+    evaluation_section = _config_section(config, "evaluation")
+
+    configured_key_env = llm_section.get("api_key_env")
+    if configured_key_env is not None and (
+        not isinstance(configured_key_env, str) or not configured_key_env.strip()
+    ):
+        raise ValueError("configuration value 'llm.api_key_env' must be a non-empty string")
+    configured_key = os.getenv(configured_key_env.strip()) if configured_key_env else None
+
+    llm = LLMConfig(
+        base_url=_string_setting(
+            "llm.base_url",
+            _first_defined(args.base_url, llm_section.get("base_url"), os.getenv("OPENAI_BASE_URL")),
+        ),
+        model_name=_string_setting(
+            "llm.model_name",
+            _first_defined(args.model, llm_section.get("model_name"), os.getenv("OPENAI_MODEL")),
+        ),
+        api_key=_string_setting(
+            "llm.api_key",
+            _first_defined(args.api_key, llm_section.get("api_key"), configured_key, os.getenv("OPENAI_API_KEY")),
+        ),
+    )
+    return RunConfig(
+        input_path=_string_setting(
+            "evaluation.input_path",
+            _first_defined(args.input, evaluation_section.get("input_path")),
+        ),
+        output_path=_string_setting(
+            "evaluation.output_path",
+            _first_defined(args.output, evaluation_section.get("output_path")),
+        ),
+        llm=llm,
+        retrieval_url=_string_setting(
+            "retrieval.url",
+            _first_defined(args.retrieval_url, retrieval_section.get("url"), DEFAULT_RETRIEVAL_URL),
+        ),
+        retrieval_timeout=_positive_number_setting(
+            "retrieval.timeout",
+            _first_defined(args.timeout, retrieval_section.get("timeout"), 30.0),
+        ),
+        concurrency=_integer_setting(
+            "evaluation.concurrency",
+            _first_defined(args.concurrency, evaluation_section.get("concurrency"), 1),
+        ),
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate the one-shot query-rewrite baseline.")
-    parser.add_argument("--input", required=True, help="JSON input following data/dialog_example.json")
-    parser.add_argument("--output", required=True, help="Path for the JSON result artifact")
+    parser.add_argument("--config", default="config.json", help="Run configuration JSON (default: config.json)")
+    parser.add_argument("--input", help="Override evaluation.input_path")
+    parser.add_argument("--output", help="Override evaluation.output_path")
     parser.add_argument("--base-url", help="OpenAI-compatible base URL (or OPENAI_BASE_URL)")
     parser.add_argument("--model", help="Model name (or OPENAI_MODEL)")
     parser.add_argument("--api-key", help="API key (or OPENAI_API_KEY)")
     parser.add_argument(
         "--retrieval-url",
-        default=DEFAULT_RETRIEVAL_URL,
-        help=f"Case retrieval endpoint (default: {DEFAULT_RETRIEVAL_URL})",
+        help=f"Override retrieval.url (default: {DEFAULT_RETRIEVAL_URL})",
     )
-    parser.add_argument("--concurrency", type=int, default=1, help="Concurrent samples (default: 1)")
-    parser.add_argument("--timeout", type=float, default=30.0, help="Retrieval request timeout in seconds")
+    parser.add_argument("--concurrency", type=int, help="Override evaluation.concurrency")
+    parser.add_argument("--timeout", type=float, help="Override retrieval.timeout in seconds")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    config = LLMConfig(
-        base_url=_env_or_argument(args.base_url, "OPENAI_BASE_URL") or "",
-        model_name=_env_or_argument(args.model, "OPENAI_MODEL") or "",
-        api_key=_env_or_argument(args.api_key, "OPENAI_API_KEY") or "",
-    )
     try:
-        config.validate()
-        samples = load_dialogue_samples(args.input)
+        run_config = resolve_run_config(args)
+        run_config.llm.validate()
+        samples = load_dialogue_samples(run_config.input_path)
         evaluator = Evaluator(
-            generator=BaselineQueryGenerator.from_config(config),
-            retriever=SearchRetriever(url=args.retrieval_url, timeout=args.timeout),
+            generator=BaselineQueryGenerator.from_config(run_config.llm),
+            retriever=SearchRetriever(
+                url=run_config.retrieval_url,
+                timeout=run_config.retrieval_timeout,
+            ),
         )
-        records = evaluator.evaluate(samples, concurrency=args.concurrency)
+        records = evaluator.evaluate(samples, concurrency=run_config.concurrency)
         artifact = build_artifact(
             records,
-            input_path=args.input,
-            model_name=config.model_name,
-            retrieval_url=args.retrieval_url,
-            concurrency=args.concurrency,
+            input_path=run_config.input_path,
+            model_name=run_config.llm.model_name,
+            retrieval_url=run_config.retrieval_url,
+            concurrency=run_config.concurrency,
         )
-        write_json_atomically(artifact, args.output)
+        write_json_atomically(artifact, run_config.output_path)
     except (ValueError, RuntimeError) as exc:
         print(f"Evaluation setup failed: {exc}", file=sys.stderr)
         return 2
