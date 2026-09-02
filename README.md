@@ -63,6 +63,18 @@ python evaluate.py generate
 python evaluate.py retrieve
 ```
 
+If you want one command for the complete pipeline, use `all`. It still writes
+the intermediate query file, then reads that file for retrieval, and uses the
+two configured concurrency values independently:
+
+```bash
+python evaluate.py all
+```
+
+In `all` mode, `query_generation.output_path` is always used as the retrieval
+input for that run, ensuring retrieval consumes the queries just generated.
+The final result is written to `retrieval.output_path`.
+
 Use another settings file with `--config`, or override a specific setting for
 one stage:
 

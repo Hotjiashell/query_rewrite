@@ -19,7 +19,7 @@ import re
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
@@ -618,11 +618,25 @@ def parse_args(
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one stage of query-rewrite evaluation.")
     if forced_stage is None:
-        parser.add_argument("stage", choices=("generate", "retrieve"), help="Stage to run")
+        parser.add_argument("stage", choices=("generate", "retrieve", "all"), help="Stage to run")
     parser.add_argument("--config", default="config.json", help="Run configuration JSON (default: config.json)")
     parser.add_argument("--input", help="Override the current stage input path")
     parser.add_argument("--output", help="Override the current stage output path")
     parser.add_argument("--concurrency", type=int, help="Override the current stage concurrency")
+    parser.add_argument("--query-input", help="Override query_generation.input_path in all mode")
+    parser.add_argument("--query-output", help="Override query_generation.output_path in all mode")
+    parser.add_argument(
+        "--query-concurrency",
+        type=int,
+        help="Override query_generation.concurrency in all mode",
+    )
+    parser.add_argument("--retrieval-input", help="Override retrieval.input_path in all mode")
+    parser.add_argument("--retrieval-output", help="Override retrieval.output_path in all mode")
+    parser.add_argument(
+        "--retrieval-concurrency",
+        type=int,
+        help="Override retrieval.concurrency in all mode",
+    )
     parser.add_argument("--base-url", help="Override llm.base_url for the generate stage")
     parser.add_argument("--model", help="Override llm.model_name for the generate stage")
     parser.add_argument("--api-key", help="Override llm.api_key for the generate stage")
@@ -683,12 +697,82 @@ def _run_retrieve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_all(args: argparse.Namespace) -> int:
+    """Run generation followed immediately by retrieval using both configs."""
+
+    generation_args = argparse.Namespace(**vars(args))
+    generation_args.input = args.query_input if args.query_input is not None else args.input
+    generation_args.output = args.query_output
+    generation_args.concurrency = (
+        args.query_concurrency if args.query_concurrency is not None else args.concurrency
+    )
+    generation_config = resolve_query_generation_config(generation_args)
+    generation_config.llm.validate()
+    generated_records = QueryGenerationRunner(
+        BaselineQueryGenerator.from_config(generation_config.llm)
+    ).generate(
+        load_dialogue_samples(generation_config.input_path),
+        concurrency=generation_config.concurrency,
+    )
+    query_artifact = build_query_artifact(
+        generated_records,
+        input_path=generation_config.input_path,
+        model_name=generation_config.llm.model_name,
+        concurrency=generation_config.concurrency,
+    )
+    write_json_atomically(query_artifact, generation_config.output_path)
+
+    # In all-in-one mode the freshly generated artifact is the source of truth
+    # for retrieval, even if retrieval.input_path still points to an older file.
+    retrieval_args = argparse.Namespace(**vars(args))
+    retrieval_args.input = args.retrieval_input
+    retrieval_args.output = args.retrieval_output if args.retrieval_output is not None else args.output
+    retrieval_args.concurrency = (
+        args.retrieval_concurrency if args.retrieval_concurrency is not None else args.concurrency
+    )
+    retrieval_config = replace(
+        resolve_retrieval_config(retrieval_args),
+        input_path=generation_config.output_path,
+    )
+    retrieval_records = RetrievalEvaluator(
+        SearchRetriever(retrieval_config.url, retrieval_config.timeout)
+    ).evaluate(
+        load_generated_query_records(retrieval_config.input_path),
+        concurrency=retrieval_config.concurrency,
+    )
+    retrieval_artifact = build_retrieval_artifact(
+        retrieval_records,
+        input_path=retrieval_config.input_path,
+        retrieval_url=retrieval_config.url,
+        timeout=retrieval_config.timeout,
+        concurrency=retrieval_config.concurrency,
+    )
+    write_json_atomically(retrieval_artifact, retrieval_config.output_path)
+
+    generation_summary = query_artifact["summary"]
+    retrieval_metrics = retrieval_artifact["metrics"]
+    print(
+        "All stages complete: "
+        f"generated={generation_summary['successful_samples']}/{generation_summary['total_samples']} "
+        f"retrieved={retrieval_metrics['successful_samples']}/{retrieval_metrics['total_samples']} "
+        f"R@1={retrieval_metrics['recall_at_1']:.4f} "
+        f"R@3={retrieval_metrics['recall_at_3']:.4f} "
+        f"R@5={retrieval_metrics['recall_at_5']:.4f} "
+        f"R@10={retrieval_metrics['recall_at_10']:.4f} "
+        f"query_output={generation_config.output_path} "
+        f"result_output={retrieval_config.output_path}"
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None, *, forced_stage: str | None = None) -> int:
     args = parse_args(argv, forced_stage=forced_stage)
     try:
         if args.stage == "generate":
             return _run_generate(args)
-        return _run_retrieve(args)
+        if args.stage == "retrieve":
+            return _run_retrieve(args)
+        return _run_all(args)
     except (ValueError, RuntimeError) as exc:
         print(f"{args.stage.capitalize()} stage failed to start or save results: {exc}", file=sys.stderr)
         return 2

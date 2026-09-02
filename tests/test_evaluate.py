@@ -208,6 +208,20 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(retrieval_config.timeout, 12.0)
         self.assertEqual(retrieval_config.concurrency, 8)
 
+    def test_all_mode_accepts_independent_concurrency_overrides(self):
+        args = parse_args(
+            [
+                "all",
+                "--query-concurrency",
+                "4",
+                "--retrieval-concurrency",
+                "9",
+            ]
+        )
+        self.assertEqual(args.stage, "all")
+        self.assertEqual(args.query_concurrency, 4)
+        self.assertEqual(args.retrieval_concurrency, 9)
+
 
 if __name__ == "__main__":
     unittest.main()
