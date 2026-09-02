@@ -105,6 +105,27 @@ class SearchRetriever:
         return test_retrieval(query, url=self._url, timeout=self._timeout)
 
 
+def _print_progress(
+    stage: str,
+    completed: int,
+    total: int,
+    successful: int,
+    failed: int,
+) -> None:
+    """Render one in-place progress update without adding a dependency on tqdm."""
+
+    percentage = 100.0 if total == 0 else completed / total * 100
+    print(
+        f"\r[{stage}] {completed}/{total} ({percentage:5.1f}%) "
+        f"success={successful} failed={failed}",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
+    if completed >= total:
+        print(file=sys.stderr)
+
+
 def _load_json(path: str | Path, description: str) -> Any:
     source_path = Path(path)
     try:
@@ -204,17 +225,42 @@ class QueryGenerationRunner:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
-    def generate(self, samples: Sequence[DialogueSample], concurrency: int = 1) -> list[GeneratedQueryRecord]:
+    def generate(
+        self,
+        samples: Sequence[DialogueSample],
+        concurrency: int = 1,
+        *,
+        progress: bool = False,
+    ) -> list[GeneratedQueryRecord]:
         if concurrency < 1:
             raise ValueError("concurrency must be at least 1")
+        total = len(samples)
+        completed = 0
+        successful = 0
+        failed = 0
         if concurrency == 1:
-            return [self.generate_sample(sample) for sample in samples]
+            records: list[GeneratedQueryRecord] = []
+            for sample in samples:
+                record = self.generate_sample(sample)
+                records.append(record)
+                completed += 1
+                successful += record.status == "success"
+                failed += record.status != "success"
+                if progress:
+                    _print_progress("generate", completed, total, successful, failed)
+            return records
 
         records: list[GeneratedQueryRecord] = []
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [executor.submit(self.generate_sample, sample) for sample in samples]
             for future in as_completed(futures):
-                records.append(future.result())
+                record = future.result()
+                records.append(record)
+                completed += 1
+                successful += record.status == "success"
+                failed += record.status != "success"
+                if progress:
+                    _print_progress("generate", completed, total, successful, failed)
         return sorted(records, key=lambda record: record.sample_index)
 
 
@@ -393,17 +439,38 @@ class RetrievalEvaluator:
         self,
         query_records: Sequence[GeneratedQueryRecord],
         concurrency: int = 1,
+        *,
+        progress: bool = False,
     ) -> list[dict[str, Any]]:
         if concurrency < 1:
             raise ValueError("concurrency must be at least 1")
+        total = len(query_records)
+        completed = 0
+        successful = 0
+        failed = 0
         if concurrency == 1:
-            return [self.evaluate_query(record) for record in query_records]
+            records: list[dict[str, Any]] = []
+            for query_record in query_records:
+                record = self.evaluate_query(query_record)
+                records.append(record)
+                completed += 1
+                successful += record.get("status") == "success"
+                failed += record.get("status") != "success"
+                if progress:
+                    _print_progress("retrieve", completed, total, successful, failed)
+            return records
 
         records: list[dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [executor.submit(self.evaluate_query, record) for record in query_records]
             for future in as_completed(futures):
-                records.append(future.result())
+                record = future.result()
+                records.append(record)
+                completed += 1
+                successful += record.get("status") == "success"
+                failed += record.get("status") != "success"
+                if progress:
+                    _print_progress("retrieve", completed, total, successful, failed)
         return sorted(records, key=lambda record: int(record["sample_index"]))
 
 
@@ -654,6 +721,7 @@ def _run_generate(args: argparse.Namespace) -> int:
     records = QueryGenerationRunner(BaselineQueryGenerator.from_config(config.llm)).generate(
         load_dialogue_samples(config.input_path),
         concurrency=config.concurrency,
+        progress=True,
     )
     artifact = build_query_artifact(
         records,
@@ -676,6 +744,7 @@ def _run_retrieve(args: argparse.Namespace) -> int:
     records = RetrievalEvaluator(SearchRetriever(config.url, config.timeout)).evaluate(
         load_generated_query_records(config.input_path),
         concurrency=config.concurrency,
+        progress=True,
     )
     artifact = build_retrieval_artifact(
         records,
@@ -713,6 +782,7 @@ def _run_all(args: argparse.Namespace) -> int:
     ).generate(
         load_dialogue_samples(generation_config.input_path),
         concurrency=generation_config.concurrency,
+        progress=True,
     )
     query_artifact = build_query_artifact(
         generated_records,
@@ -739,6 +809,7 @@ def _run_all(args: argparse.Namespace) -> int:
     ).evaluate(
         load_generated_query_records(retrieval_config.input_path),
         concurrency=retrieval_config.concurrency,
+        progress=True,
     )
     retrieval_artifact = build_retrieval_artifact(
         retrieval_records,

@@ -75,6 +75,10 @@ In `all` mode, `query_generation.output_path` is always used as the retrieval
 input for that run, ensuring retrieval consumes the queries just generated.
 The final result is written to `retrieval.output_path`.
 
+命令行运行时会在终端实时显示当前阶段的完成数、百分比、成功数和失败数；
+进度信息输出到 stderr，最终汇总输出到 stdout。作为 Python 库调用时，
+`progress` 默认关闭，可按需传入 `progress=True`。
+
 Use another settings file with `--config`, or override a specific setting for
 one stage:
 
