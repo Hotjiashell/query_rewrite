@@ -10,10 +10,10 @@ retrieval service. The first strategy is a one-shot baseline using
 pip install -r requirements.txt
 ```
 
-## Configure and run the baseline
+## Configure the two stages
 
-Edit [config.json](config.json) before running. It contains the model URL and
-name, retrieval URL and timeout, input path, output path, and concurrency:
+Edit [config.json](config.json) before running. Query generation and retrieval
+are independent stages, with independent input/output paths and concurrency:
 
 ```json
 {
@@ -22,14 +22,17 @@ name, retrieval URL and timeout, input path, output path, and concurrency:
     "model_name": "your-model-name",
     "api_key_env": "OPENAI_API_KEY"
   },
-  "retrieval": {
-    "url": "http://10.67.43.14:8276/run_case_retrieval",
-    "timeout": 30
-  },
-  "evaluation": {
+  "query_generation": {
     "input_path": "data/dialog_example.json",
-    "output_path": "results/baseline.json",
+    "output_path": "results/generated_queries.json",
     "concurrency": 4
+  },
+  "retrieval": {
+    "input_path": "results/generated_queries.json",
+    "output_path": "results/baseline.json",
+    "url": "http://10.67.43.14:8276/run_case_retrieval",
+    "timeout": 30,
+    "concurrency": 8
   }
 }
 ```
@@ -39,28 +42,43 @@ By default the key is read from the environment variable named by
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
-python evaluate.py
+python generate_queries.py
+python retrieve_cases.py
 ```
+
+The first command only calls the LLM and writes
+`query_generation.output_path`. The second command reads only
+`retrieval.input_path`, calls the retrieval service, and writes the final
+evaluation. It never calls the LLM, so you can rerun retrieval with a new URL,
+timeout, or concurrency without regenerating queries.
 
 For a short-lived local setup, `llm.api_key` is also supported, but keeping a
 secret in the configuration file is not recommended. Regardless of its source,
 the API key is never written to the result artifact.
 
-Use another settings file with `--config`, or override a specific setting for
-one run:
+The same stages are also exposed as subcommands:
 
 ```bash
-python evaluate.py --config configs/experiment-a.json
-python evaluate.py --concurrency 8 --output results/experiment-a.json
+python evaluate.py generate
+python evaluate.py retrieve
 ```
 
-Resolution priority is command-line option, then config-file value, then
-environment variable. The baseline includes
+Use another settings file with `--config`, or override a specific setting for
+one stage:
+
+```bash
+python generate_queries.py --config configs/experiment-a.json --concurrency 4
+python retrieve_cases.py --concurrency 8 --output results/experiment-a.json
+```
+
+For the LLM settings, resolution priority is command-line option, then
+config-file value, then environment variable. The baseline includes
 `extra_body={"chat_template_kwargs": {"enable_thinking": false}}` on every
 model request.
 
-The current retrieval service URL comes from `search.py`. `retrieval.timeout`
-applies to each retrieval request.
+`query_generation.concurrency` limits concurrent LLM calls, while
+`retrieval.concurrency` limits concurrent retrieval calls.
+`retrieval.timeout` applies to each retrieval request.
 
 No external request is made by installing dependencies or running tests. An
 evaluation run does call both the configured LLM and the retrieval endpoint.
@@ -80,16 +98,29 @@ The input must be a JSON array with these required fields per item:
 `call_sno` is optional metadata. `caseID` is the ground-truth ID used to
 calculate Recall@1, Recall@3, Recall@5, and Recall@10.
 
-## Result artifact
+## Query artifact
 
-The output is a JSON object containing a sanitized configuration, aggregate
-metrics, and one record per input sample. API keys and full case content are
-never written. Each record stores:
+The first stage writes a `generated_queries` JSON artifact with a record for
+every input item. Each record retains `sample_index`, `call_sno`,
+`expected_case_id`, `query`, `status`, and `error`. It does not write the full
+dialogue or API key.
+
+An input or model error marks only that record as `failed`; all other samples
+continue. The second stage reads this artifact. Failed query records are kept
+in the final output with `retrieval_status: "skipped"` and count as a miss;
+they do not cause a new model call.
+
+## Retrieval artifact
+
+The second-stage output is a JSON object containing a sanitized configuration,
+aggregate metrics, and one record per query artifact entry. API keys and full
+case content are never written. Each record stores:
 
 - the generated `query`;
 - ordered `retrieval_trace` entries with only `rank`, `case_id`, and
   `case_title`;
-- `matched_rank`, `status`, and any per-sample error.
+- `query_status`, `retrieval_status`, `matched_rank`, and any per-sample
+  query/retrieval error.
 
 The retriever collects every numbered key (`top1`, `top2`, and so on) in
 numeric order. It does not assume a fixed result count, so a response with 5,
@@ -111,9 +142,9 @@ class ImprovedQueryGenerator(QueryGenerator):
         return "query for case retrieval"
 ```
 
-Pass the instance to `Evaluator(generator=..., retriever=...)` in
-`evaluate.py`. The dataset loading, concurrent execution, retrieval tracing,
-artifact persistence, and Recall@K calculation can all remain unchanged.
+The generation command uses the implementation automatically. The dataset
+loading, query-file persistence, retrieval tracing, and Recall@K calculation
+can all remain unchanged.
 
 ## Tests
 

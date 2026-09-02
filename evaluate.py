@@ -1,7 +1,13 @@
-"""Run and persist query-rewrite retrieval evaluations.
+"""Two-stage query rewrite evaluation.
 
-The default ``config.json`` carries normal run settings. Command-line options
-can override individual settings for one-off experiments.
+Run the stages independently:
+
+    python evaluate.py generate
+    python evaluate.py retrieve
+
+The first command calls the LLM and writes a generated-query artifact. The
+second command reads that artifact, calls only the retrieval service, and
+writes retrieval traces and Recall@K metrics.
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from gen_query import BaselineQueryGenerator, LLMConfig, QueryGenerator
 from search import DEFAULT_RETRIEVAL_URL, test_retrieval
@@ -24,23 +30,38 @@ from search import DEFAULT_RETRIEVAL_URL, test_retrieval
 
 METRIC_CUTOFFS = (1, 3, 5, 10)
 TOP_KEY_PATTERN = re.compile(r"^top(\d+)$", re.IGNORECASE)
+QUERY_ARTIFACT_TYPE = "generated_queries"
+RETRIEVAL_ARTIFACT_TYPE = "retrieval_evaluation"
 
 
 class Retriever(Protocol):
-    """Retrieval dependency for the evaluator."""
+    """Retrieval dependency used by the second stage."""
 
     def retrieve(self, query: str) -> Mapping[str, Any]:
-        """Return the raw retrieval response for a query."""
+        """Return the raw retrieval response for one query."""
 
 
 @dataclass(frozen=True)
 class DialogueSample:
-    """Minimal data needed for a labeled retrieval evaluation sample."""
+    """A source dialogue, including any error isolated during input parsing."""
 
     index: int
     call_sno: str | None
-    dialogue: str
-    expected_case_id: str
+    dialogue: str | None
+    expected_case_id: str | None
+    input_error: str | None = None
+
+
+@dataclass(frozen=True)
+class GeneratedQueryRecord:
+    """The portable result of query generation for one input sample."""
+
+    sample_index: int
+    call_sno: str | None
+    expected_case_id: str | None
+    query: str | None
+    status: str
+    error: str | None
 
 
 @dataclass(frozen=True)
@@ -53,14 +74,23 @@ class RetrievedCase:
 
 
 @dataclass(frozen=True)
-class RunConfig:
-    """All resolved settings needed to execute one evaluation run."""
+class QueryGenerationConfig:
+    """Resolved settings for the LLM-backed query-generation stage."""
 
     input_path: str
     output_path: str
     llm: LLMConfig
-    retrieval_url: str
-    retrieval_timeout: float
+    concurrency: int
+
+
+@dataclass(frozen=True)
+class RetrievalConfig:
+    """Resolved settings for the retrieval and metric-calculation stage."""
+
+    input_path: str
+    output_path: str
+    url: str
+    timeout: float
     concurrency: int
 
 
@@ -75,50 +105,210 @@ class SearchRetriever:
         return test_retrieval(query, url=self._url, timeout=self._timeout)
 
 
-def load_dialogue_samples(path: str | Path) -> list[DialogueSample]:
-    """Load the documented list-shaped dialogue dataset and validate labels."""
-
-    input_path = Path(path)
+def _load_json(path: str | Path, description: str) -> Any:
+    source_path = Path(path)
     try:
-        payload = json.loads(input_path.read_text(encoding="utf-8"))
+        return json.loads(source_path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise ValueError(f"input file does not exist: {input_path}") from exc
+        raise ValueError(f"{description} does not exist: {source_path}") from exc
+    except OSError as exc:
+        raise ValueError(f"could not read {description}: {source_path}: {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise ValueError(f"input file is not valid JSON: {input_path}: {exc}") from exc
+        raise ValueError(f"{description} is not valid JSON: {source_path}: {exc}") from exc
 
+
+def _normalise_optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalised = str(value).strip()
+    return normalised or None
+
+
+def load_dialogue_samples(path: str | Path) -> list[DialogueSample]:
+    """Load source data and isolate malformed entries rather than aborting a run."""
+
+    payload = _load_json(path, "input file")
     if not isinstance(payload, list):
         raise ValueError("input JSON must be a list of dialogue objects")
 
     samples: list[DialogueSample] = []
     for index, item in enumerate(payload):
-        if not isinstance(item, dict):
-            raise ValueError(f"sample {index} must be a JSON object")
+        if not isinstance(item, Mapping):
+            samples.append(
+                DialogueSample(
+                    index=index,
+                    call_sno=None,
+                    dialogue=None,
+                    expected_case_id=None,
+                    input_error="InvalidInput: sample must be a JSON object",
+                )
+            )
+            continue
+
         dialogue = item.get("chat_content")
-        case_id = item.get("caseID")
+        case_id = _normalise_optional_string(item.get("caseID"))
+        errors: list[str] = []
         if not isinstance(dialogue, str) or not dialogue.strip():
-            raise ValueError(f"sample {index} has empty or missing 'chat_content'")
-        if case_id is None or not str(case_id).strip():
-            raise ValueError(f"sample {index} has empty or missing 'caseID'")
-        call_sno = item.get("call_sno")
+            dialogue = None
+            errors.append("empty or missing 'chat_content'")
+        if case_id is None:
+            errors.append("empty or missing 'caseID'")
         samples.append(
             DialogueSample(
                 index=index,
-                call_sno=str(call_sno) if call_sno is not None else None,
+                call_sno=_normalise_optional_string(item.get("call_sno")),
                 dialogue=dialogue,
-                expected_case_id=str(case_id),
+                expected_case_id=case_id,
+                input_error=f"InvalidInput: {'; '.join(errors)}" if errors else None,
             )
         )
     return samples
 
 
-def extract_retrieval_trace(response: Mapping[str, Any]) -> list[RetrievedCase]:
-    """Extract every numbered ``top*`` entry in numeric rank order.
+class QueryGenerationRunner:
+    """First-stage runner that produces a query artifact without retrieval."""
 
-    The service may return 5, 7, 10, or another number of candidates.  This
-    walks all keys in ``retrieval_result`` rather than trusting a declared N or
-    assuming a fixed response length.  Full case content and scores are not
-    written to the artifact by design.
-    """
+    def __init__(self, generator: QueryGenerator) -> None:
+        self._generator = generator
+
+    def generate_sample(self, sample: DialogueSample) -> GeneratedQueryRecord:
+        if sample.input_error:
+            return GeneratedQueryRecord(
+                sample_index=sample.index,
+                call_sno=sample.call_sno,
+                expected_case_id=sample.expected_case_id,
+                query=None,
+                status="failed",
+                error=sample.input_error,
+            )
+
+        try:
+            query = self._generator.generate(sample.dialogue or "")
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError("query generator returned an empty query")
+            return GeneratedQueryRecord(
+                sample_index=sample.index,
+                call_sno=sample.call_sno,
+                expected_case_id=sample.expected_case_id,
+                query=query.strip(),
+                status="success",
+                error=None,
+            )
+        except Exception as exc:  # A model failure must not stop other samples.
+            return GeneratedQueryRecord(
+                sample_index=sample.index,
+                call_sno=sample.call_sno,
+                expected_case_id=sample.expected_case_id,
+                query=None,
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def generate(self, samples: Sequence[DialogueSample], concurrency: int = 1) -> list[GeneratedQueryRecord]:
+        if concurrency < 1:
+            raise ValueError("concurrency must be at least 1")
+        if concurrency == 1:
+            return [self.generate_sample(sample) for sample in samples]
+
+        records: list[GeneratedQueryRecord] = []
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(self.generate_sample, sample) for sample in samples]
+            for future in as_completed(futures):
+                records.append(future.result())
+        return sorted(records, key=lambda record: record.sample_index)
+
+
+def calculate_stage_summary(records: Sequence[GeneratedQueryRecord]) -> dict[str, int]:
+    """Summarise first-stage records without treating failures as successes."""
+
+    successful = sum(record.status == "success" for record in records)
+    return {
+        "total_samples": len(records),
+        "successful_samples": successful,
+        "failed_samples": len(records) - successful,
+    }
+
+
+def build_query_artifact(
+    records: Sequence[GeneratedQueryRecord],
+    *,
+    input_path: str | Path,
+    model_name: str,
+    concurrency: int,
+) -> dict[str, Any]:
+    """Build the first-stage artifact, deliberately excluding dialogue and keys."""
+
+    return {
+        "schema_version": 1,
+        "artifact_type": QUERY_ARTIFACT_TYPE,
+        "created_at": datetime.now(UTC).isoformat(),
+        "configuration": {
+            "generator": "baseline",
+            "model_name": model_name,
+            "input_path": str(input_path),
+            "concurrency": concurrency,
+        },
+        "summary": calculate_stage_summary(records),
+        "records": [asdict(record) for record in records],
+    }
+
+
+def load_generated_query_records(path: str | Path) -> list[GeneratedQueryRecord]:
+    """Load a query artifact and isolate malformed records for the next stage."""
+
+    payload = _load_json(path, "query artifact")
+    if not isinstance(payload, Mapping):
+        raise ValueError("query artifact root must be a JSON object")
+    if payload.get("artifact_type") != QUERY_ARTIFACT_TYPE:
+        raise ValueError(f"input is not a '{QUERY_ARTIFACT_TYPE}' artifact")
+    raw_records = payload.get("records")
+    if not isinstance(raw_records, list):
+        raise ValueError("query artifact 'records' must be a JSON array")
+
+    records: list[GeneratedQueryRecord] = []
+    for position, item in enumerate(raw_records):
+        if not isinstance(item, Mapping):
+            records.append(
+                GeneratedQueryRecord(
+                    sample_index=position,
+                    call_sno=None,
+                    expected_case_id=None,
+                    query=None,
+                    status="failed",
+                    error="InvalidQueryArtifact: record must be a JSON object",
+                )
+            )
+            continue
+
+        raw_index = item.get("sample_index")
+        sample_index = raw_index if isinstance(raw_index, int) and not isinstance(raw_index, bool) else position
+        expected_case_id = _normalise_optional_string(item.get("expected_case_id"))
+        query = item.get("query")
+        query = query.strip() if isinstance(query, str) and query.strip() else None
+        source_status = item.get("status")
+        source_error = _normalise_optional_string(item.get("error"))
+        errors: list[str] = []
+        if source_status != "success":
+            errors.append(source_error or "query generation did not succeed")
+        if query is None:
+            errors.append("missing or empty query")
+        if expected_case_id is None:
+            errors.append("missing expected_case_id")
+        records.append(
+            GeneratedQueryRecord(
+                sample_index=sample_index,
+                call_sno=_normalise_optional_string(item.get("call_sno")),
+                expected_case_id=expected_case_id,
+                query=query,
+                status="failed" if errors else "success",
+                error="; ".join(dict.fromkeys(errors)) or None,
+            )
+        )
+    return records
+
+
+def extract_retrieval_trace(response: Mapping[str, Any]) -> list[RetrievedCase]:
+    """Extract every numbered ``top*`` entry in numeric rank order."""
 
     retrieval_result = response.get("retrieval_result")
     if not isinstance(retrieval_result, Mapping):
@@ -130,18 +320,16 @@ def extract_retrieval_trace(response: Mapping[str, Any]) -> list[RetrievedCase]:
         if match and isinstance(value, Mapping):
             numbered_cases.append((int(match.group(1)), value))
 
-    numbered_cases.sort(key=lambda item: item[0])
     trace: list[RetrievedCase] = []
-    for rank, case in numbered_cases:
+    for rank, case in sorted(numbered_cases, key=lambda item: item[0]):
         case_id = case.get("case_id")
-        case_title = case.get("case_title")
         if case_id is None:
             continue
         trace.append(
             RetrievedCase(
                 rank=rank,
                 case_id=str(case_id),
-                case_title=str(case_title) if case_title is not None else "",
+                case_title=str(case.get("case_title") or ""),
             )
         )
     return trace
@@ -154,67 +342,95 @@ def _matched_rank(expected_case_id: str, trace: Sequence[RetrievedCase]) -> int 
     return None
 
 
-class Evaluator:
-    """Evaluate any query generator against a retrieval service."""
+class RetrievalEvaluator:
+    """Second-stage runner that consumes generated queries without using an LLM."""
 
-    def __init__(self, generator: QueryGenerator, retriever: Retriever) -> None:
-        self._generator = generator
+    def __init__(self, retriever: Retriever) -> None:
         self._retriever = retriever
 
-    def evaluate_sample(self, sample: DialogueSample) -> dict[str, Any]:
-        """Return a persistable record; per-sample failures do not abort a run."""
-
+    def evaluate_query(self, query_record: GeneratedQueryRecord) -> dict[str, Any]:
         record: dict[str, Any] = {
-            "sample_index": sample.index,
-            "call_sno": sample.call_sno,
-            "expected_case_id": sample.expected_case_id,
-            "query": None,
+            "sample_index": query_record.sample_index,
+            "call_sno": query_record.call_sno,
+            "expected_case_id": query_record.expected_case_id,
+            "query": query_record.query,
+            "query_status": query_record.status,
+            "query_error": query_record.error,
+            "retrieval_status": "skipped",
+            "retrieval_error": None,
             "retrieval_trace": [],
             "matched_rank": None,
             "status": "failed",
-            "error": None,
+            "error": query_record.error,
         }
+        if query_record.status != "success" or not query_record.query or not query_record.expected_case_id:
+            record["retrieval_error"] = "not attempted because query generation did not succeed"
+            return record
+
         try:
-            query = self._generator.generate(sample.dialogue)
-            trace = extract_retrieval_trace(self._retriever.retrieve(query))
-            matched_rank = _matched_rank(sample.expected_case_id, trace)
+            trace = extract_retrieval_trace(self._retriever.retrieve(query_record.query))
             record.update(
                 {
-                    "query": query,
+                    "retrieval_status": "success",
                     "retrieval_trace": [asdict(case) for case in trace],
-                    "matched_rank": matched_rank,
+                    "matched_rank": _matched_rank(query_record.expected_case_id, trace),
                     "status": "success",
+                    "error": None,
                 }
             )
-        except Exception as exc:  # Record API and parsing errors per example.
-            record["error"] = f"{type(exc).__name__}: {exc}"
+        except Exception as exc:  # One retrieval failure must not stop other queries.
+            error = f"{type(exc).__name__}: {exc}"
+            record.update(
+                {
+                    "retrieval_status": "failed",
+                    "retrieval_error": error,
+                    "error": error,
+                }
+            )
         return record
 
-    def evaluate(self, samples: Sequence[DialogueSample], concurrency: int = 1) -> list[dict[str, Any]]:
+    def evaluate(
+        self,
+        query_records: Sequence[GeneratedQueryRecord],
+        concurrency: int = 1,
+    ) -> list[dict[str, Any]]:
         if concurrency < 1:
             raise ValueError("concurrency must be at least 1")
         if concurrency == 1:
-            return [self.evaluate_sample(sample) for sample in samples]
+            return [self.evaluate_query(record) for record in query_records]
 
         records: list[dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = {executor.submit(self.evaluate_sample, sample): sample.index for sample in samples}
+            futures = [executor.submit(self.evaluate_query, record) for record in query_records]
             for future in as_completed(futures):
                 records.append(future.result())
         return sorted(records, key=lambda record: int(record["sample_index"]))
 
 
-def calculate_metrics(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
-    """Calculate Recall@K with every input record as the denominator.
+class Evaluator:
+    """Compatibility helper for in-process callers that want both stages.
 
-    Failed generation/retrieval attempts count as misses, preventing request
-    failures from inflating recall.  ``successful_samples`` exposes the health
-    of the run alongside the retrieval metrics.
+    CLI use should prefer the separate ``generate`` and ``retrieve`` commands,
+    which persist the query artifact between the two API-bound operations.
     """
 
-    materialized = list(records)
-    total = len(materialized)
-    successful = sum(record.get("status") == "success" for record in materialized)
+    def __init__(self, generator: QueryGenerator, retriever: Retriever) -> None:
+        self._query_runner = QueryGenerationRunner(generator)
+        self._retrieval_evaluator = RetrievalEvaluator(retriever)
+
+    def evaluate_sample(self, sample: DialogueSample) -> dict[str, Any]:
+        return self._retrieval_evaluator.evaluate_query(self._query_runner.generate_sample(sample))
+
+    def evaluate(self, samples: Sequence[DialogueSample], concurrency: int = 1) -> list[dict[str, Any]]:
+        generated_queries = self._query_runner.generate(samples, concurrency=concurrency)
+        return self._retrieval_evaluator.evaluate(generated_queries, concurrency=concurrency)
+
+
+def calculate_metrics(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Calculate Recall@K using every query-artifact record as the denominator."""
+
+    total = len(records)
+    successful = sum(record.get("status") == "success" for record in records)
     metrics: dict[str, Any] = {
         "total_samples": total,
         "successful_samples": successful,
@@ -225,32 +441,32 @@ def calculate_metrics(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             record.get("status") == "success"
             and isinstance(record.get("matched_rank"), int)
             and record["matched_rank"] <= cutoff
-            for record in materialized
+            for record in records
         )
         metrics[f"recall_at_{cutoff}"] = hits / total if total else 0.0
         metrics[f"hits_at_{cutoff}"] = hits
     return metrics
 
 
-def build_artifact(
+def build_retrieval_artifact(
     records: Sequence[Mapping[str, Any]],
     *,
     input_path: str | Path,
-    model_name: str,
     retrieval_url: str,
+    timeout: float,
     concurrency: int,
 ) -> dict[str, Any]:
-    """Create the complete JSON evaluation artifact without exposing API keys."""
+    """Build the final artifact containing traces and recall metrics."""
 
     return {
         "schema_version": 1,
+        "artifact_type": RETRIEVAL_ARTIFACT_TYPE,
         "created_at": datetime.now(UTC).isoformat(),
         "configuration": {
-            "generator": "baseline",
-            "model_name": model_name,
+            "source_query_path": str(input_path),
             "retrieval_url": retrieval_url,
+            "timeout": timeout,
             "concurrency": concurrency,
-            "input_path": str(input_path),
         },
         "metrics": calculate_metrics(records),
         "records": list(records),
@@ -261,31 +477,28 @@ def write_json_atomically(payload: Mapping[str, Any], output_path: str | Path) -
     """Write a complete artifact, leaving no partial JSON after interruption."""
 
     target = Path(output_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=target.parent,
-        prefix=f".{target.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as temporary_file:
-        json.dump(payload, temporary_file, ensure_ascii=False, indent=2)
-        temporary_file.write("\n")
-        temporary_path = Path(temporary_file.name)
-    temporary_path.replace(target)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            json.dump(payload, temporary_file, ensure_ascii=False, indent=2)
+            temporary_file.write("\n")
+            temporary_path = Path(temporary_file.name)
+        temporary_path.replace(target)
+    except OSError as exc:
+        raise RuntimeError(f"could not write result file: {target}: {exc}") from exc
 
 
 def load_config_file(path: str | Path) -> Mapping[str, Any]:
-    """Read a JSON config file and ensure its root is an object."""
+    """Read a JSON configuration file and ensure its root is an object."""
 
-    config_path = Path(path)
-    try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise ValueError(f"configuration file does not exist: {config_path}") from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"configuration file is not valid JSON: {config_path}: {exc}") from exc
+    payload = _load_json(path, "configuration file")
     if not isinstance(payload, Mapping):
         raise ValueError("configuration file root must be a JSON object")
     return payload
@@ -299,8 +512,6 @@ def _config_section(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
 
 
 def _first_defined(*values: Any) -> Any:
-    """Return the first value that was explicitly provided and is not empty."""
-
     for value in values:
         if value is not None and value != "":
             return value
@@ -325,26 +536,15 @@ def _positive_number_setting(name: str, value: Any) -> float:
     return float(value)
 
 
-def resolve_run_config(args: argparse.Namespace) -> RunConfig:
-    """Merge CLI arguments, config JSON, and environment variables.
-
-    Precedence is CLI argument, config-file value, then environment variable.
-    The retrieval URL, timeout, and concurrency have safe defaults.
-    """
-
-    config = load_config_file(args.config)
+def _resolve_llm_config(args: argparse.Namespace, config: Mapping[str, Any]) -> LLMConfig:
     llm_section = _config_section(config, "llm")
-    retrieval_section = _config_section(config, "retrieval")
-    evaluation_section = _config_section(config, "evaluation")
-
     configured_key_env = llm_section.get("api_key_env")
     if configured_key_env is not None and (
         not isinstance(configured_key_env, str) or not configured_key_env.strip()
     ):
         raise ValueError("configuration value 'llm.api_key_env' must be a non-empty string")
     configured_key = os.getenv(configured_key_env.strip()) if configured_key_env else None
-
-    llm = LLMConfig(
+    return LLMConfig(
         base_url=_string_setting(
             "llm.base_url",
             _first_defined(args.base_url, llm_section.get("base_url"), os.getenv("OPENAI_BASE_URL")),
@@ -358,84 +558,140 @@ def resolve_run_config(args: argparse.Namespace) -> RunConfig:
             _first_defined(args.api_key, llm_section.get("api_key"), configured_key, os.getenv("OPENAI_API_KEY")),
         ),
     )
-    return RunConfig(
+
+
+def resolve_query_generation_config(args: argparse.Namespace) -> QueryGenerationConfig:
+    """Resolve settings for ``generate`` with CLI taking precedence over JSON."""
+
+    config = load_config_file(args.config)
+    generation_section = _config_section(config, "query_generation")
+    return QueryGenerationConfig(
         input_path=_string_setting(
-            "evaluation.input_path",
-            _first_defined(args.input, evaluation_section.get("input_path")),
+            "query_generation.input_path",
+            _first_defined(args.input, generation_section.get("input_path")),
         ),
         output_path=_string_setting(
-            "evaluation.output_path",
-            _first_defined(args.output, evaluation_section.get("output_path")),
+            "query_generation.output_path",
+            _first_defined(args.output, generation_section.get("output_path")),
         ),
-        llm=llm,
-        retrieval_url=_string_setting(
+        llm=_resolve_llm_config(args, config),
+        concurrency=_integer_setting(
+            "query_generation.concurrency",
+            _first_defined(args.concurrency, generation_section.get("concurrency"), 1),
+        ),
+    )
+
+
+def resolve_retrieval_config(args: argparse.Namespace) -> RetrievalConfig:
+    """Resolve settings for ``retrieve`` with CLI taking precedence over JSON."""
+
+    config = load_config_file(args.config)
+    retrieval_section = _config_section(config, "retrieval")
+    return RetrievalConfig(
+        input_path=_string_setting(
+            "retrieval.input_path",
+            _first_defined(args.input, retrieval_section.get("input_path")),
+        ),
+        output_path=_string_setting(
+            "retrieval.output_path",
+            _first_defined(args.output, retrieval_section.get("output_path")),
+        ),
+        url=_string_setting(
             "retrieval.url",
             _first_defined(args.retrieval_url, retrieval_section.get("url"), DEFAULT_RETRIEVAL_URL),
         ),
-        retrieval_timeout=_positive_number_setting(
+        timeout=_positive_number_setting(
             "retrieval.timeout",
             _first_defined(args.timeout, retrieval_section.get("timeout"), 30.0),
         ),
         concurrency=_integer_setting(
-            "evaluation.concurrency",
-            _first_defined(args.concurrency, evaluation_section.get("concurrency"), 1),
+            "retrieval.concurrency",
+            _first_defined(args.concurrency, retrieval_section.get("concurrency"), 1),
         ),
     )
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate the one-shot query-rewrite baseline.")
+def parse_args(
+    argv: Sequence[str] | None = None,
+    *,
+    forced_stage: str | None = None,
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run one stage of query-rewrite evaluation.")
+    if forced_stage is None:
+        parser.add_argument("stage", choices=("generate", "retrieve"), help="Stage to run")
     parser.add_argument("--config", default="config.json", help="Run configuration JSON (default: config.json)")
-    parser.add_argument("--input", help="Override evaluation.input_path")
-    parser.add_argument("--output", help="Override evaluation.output_path")
-    parser.add_argument("--base-url", help="OpenAI-compatible base URL (or OPENAI_BASE_URL)")
-    parser.add_argument("--model", help="Model name (or OPENAI_MODEL)")
-    parser.add_argument("--api-key", help="API key (or OPENAI_API_KEY)")
-    parser.add_argument(
-        "--retrieval-url",
-        help=f"Override retrieval.url (default: {DEFAULT_RETRIEVAL_URL})",
+    parser.add_argument("--input", help="Override the current stage input path")
+    parser.add_argument("--output", help="Override the current stage output path")
+    parser.add_argument("--concurrency", type=int, help="Override the current stage concurrency")
+    parser.add_argument("--base-url", help="Override llm.base_url for the generate stage")
+    parser.add_argument("--model", help="Override llm.model_name for the generate stage")
+    parser.add_argument("--api-key", help="Override llm.api_key for the generate stage")
+    parser.add_argument("--retrieval-url", help="Override retrieval.url for the retrieve stage")
+    parser.add_argument("--timeout", type=float, help="Override retrieval.timeout for the retrieve stage")
+    args = parser.parse_args(argv)
+    if forced_stage is not None:
+        args.stage = forced_stage
+    return args
+
+
+def _run_generate(args: argparse.Namespace) -> int:
+    config = resolve_query_generation_config(args)
+    config.llm.validate()
+    records = QueryGenerationRunner(BaselineQueryGenerator.from_config(config.llm)).generate(
+        load_dialogue_samples(config.input_path),
+        concurrency=config.concurrency,
     )
-    parser.add_argument("--concurrency", type=int, help="Override evaluation.concurrency")
-    parser.add_argument("--timeout", type=float, help="Override retrieval.timeout in seconds")
-    return parser.parse_args(argv)
+    artifact = build_query_artifact(
+        records,
+        input_path=config.input_path,
+        model_name=config.llm.model_name,
+        concurrency=config.concurrency,
+    )
+    write_json_atomically(artifact, config.output_path)
+    summary = artifact["summary"]
+    print(
+        "Query generation complete: "
+        f"total={summary['total_samples']} success={summary['successful_samples']} "
+        f"failed={summary['failed_samples']} output={config.output_path}"
+    )
+    return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    try:
-        run_config = resolve_run_config(args)
-        run_config.llm.validate()
-        samples = load_dialogue_samples(run_config.input_path)
-        evaluator = Evaluator(
-            generator=BaselineQueryGenerator.from_config(run_config.llm),
-            retriever=SearchRetriever(
-                url=run_config.retrieval_url,
-                timeout=run_config.retrieval_timeout,
-            ),
-        )
-        records = evaluator.evaluate(samples, concurrency=run_config.concurrency)
-        artifact = build_artifact(
-            records,
-            input_path=run_config.input_path,
-            model_name=run_config.llm.model_name,
-            retrieval_url=run_config.retrieval_url,
-            concurrency=run_config.concurrency,
-        )
-        write_json_atomically(artifact, run_config.output_path)
-    except (ValueError, RuntimeError) as exc:
-        print(f"Evaluation setup failed: {exc}", file=sys.stderr)
-        return 2
-
+def _run_retrieve(args: argparse.Namespace) -> int:
+    config = resolve_retrieval_config(args)
+    records = RetrievalEvaluator(SearchRetriever(config.url, config.timeout)).evaluate(
+        load_generated_query_records(config.input_path),
+        concurrency=config.concurrency,
+    )
+    artifact = build_retrieval_artifact(
+        records,
+        input_path=config.input_path,
+        retrieval_url=config.url,
+        timeout=config.timeout,
+        concurrency=config.concurrency,
+    )
+    write_json_atomically(artifact, config.output_path)
     metrics = artifact["metrics"]
     print(
-        "Evaluation complete: "
+        "Retrieval evaluation complete: "
         f"total={metrics['total_samples']} success={metrics['successful_samples']} "
         f"R@1={metrics['recall_at_1']:.4f} "
         f"R@3={metrics['recall_at_3']:.4f} "
         f"R@5={metrics['recall_at_5']:.4f} "
-        f"R@10={metrics['recall_at_10']:.4f}"
+        f"R@10={metrics['recall_at_10']:.4f} output={config.output_path}"
     )
     return 0
+
+
+def main(argv: Sequence[str] | None = None, *, forced_stage: str | None = None) -> int:
+    args = parse_args(argv, forced_stage=forced_stage)
+    try:
+        if args.stage == "generate":
+            return _run_generate(args)
+        return _run_retrieve(args)
+    except (ValueError, RuntimeError) as exc:
+        print(f"{args.stage.capitalize()} stage failed to start or save results: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

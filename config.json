@@ -5,13 +5,16 @@
     "api_key": "",
     "api_key_env": "OPENAI_API_KEY"
   },
-  "retrieval": {
-    "url": "http://10.67.43.14:8276/run_case_retrieval",
-    "timeout": 30
-  },
-  "evaluation": {
+  "query_generation": {
     "input_path": "data/dialog_example.json",
+    "output_path": "results/generated_queries.json",
+    "concurrency": 1
+  },
+  "retrieval": {
+    "input_path": "results/generated_queries.json",
     "output_path": "results/baseline.json",
+    "url": "http://10.67.43.14:8276/run_case_retrieval",
+    "timeout": 30,
     "concurrency": 1
   }
 }
