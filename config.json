@@ -6,6 +6,7 @@
     "api_key_env": "OPENAI_API_KEY"
   },
   "query_generation": {
+    "method": "baseline",
     "input_path": "data/dialog_example.json",
     "output_path": "results/generated_queries.json",
     "concurrency": 1

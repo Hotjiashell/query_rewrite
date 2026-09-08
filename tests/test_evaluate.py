@@ -70,11 +70,14 @@ class EvaluationTests(unittest.TestCase):
                     input_path="dialogs.json",
                     model_name="test-model",
                     concurrency=2,
+                    method="method_v1",
                 ),
                 query_path,
             )
             persisted_queries = json.loads(query_path.read_text(encoding="utf-8"))
             self.assertEqual(persisted_queries["artifact_type"], QUERY_ARTIFACT_TYPE)
+            self.assertEqual(persisted_queries["configuration"]["method"], "method_v1")
+            self.assertEqual(persisted_queries["configuration"]["generator"], "method_v1")
             self.assertNotIn("dialogue", persisted_queries["records"][0])
 
             loaded_queries = load_generated_query_records(query_path)
@@ -173,6 +176,7 @@ class EvaluationTests(unittest.TestCase):
                             "api_key": "test-key",
                         },
                         "query_generation": {
+                            "method": "method_v1",
                             "input_path": "dialogs.json",
                             "output_path": "queries.json",
                             "concurrency": 3,
@@ -201,6 +205,7 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(generation_config.llm.model_name, "model-from-cli")
         self.assertEqual(generation_config.input_path, "dialogs.json")
         self.assertEqual(generation_config.output_path, "queries.json")
+        self.assertEqual(generation_config.method, "method_v1")
         self.assertEqual(generation_config.concurrency, 5)
         self.assertEqual(retrieval_config.input_path, "queries.json")
         self.assertEqual(retrieval_config.output_path, "other-results.json")
@@ -221,6 +226,38 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(args.stage, "all")
         self.assertEqual(args.query_concurrency, 4)
         self.assertEqual(args.retrieval_concurrency, 9)
+
+    def test_method_cli_override_takes_precedence_over_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "llm": {
+                            "base_url": "http://model",
+                            "model_name": "model-a",
+                            "api_key": "test-key",
+                        },
+                        "query_generation": {
+                            "method": "baseline",
+                            "input_path": "dialogs.json",
+                            "output_path": "queries.json",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = parse_args(
+                ["generate", "--config", str(config_path), "--method", "method_v1"]
+            )
+            resolved = resolve_query_generation_config(args)
+
+        self.assertEqual(resolved.method, "method_v1")
+
+    def test_method_cli_accepts_prompt_constant_alias(self):
+        args = parse_args(["generate", "--method", "METHOD_V1_PROMPT"])
+
+        self.assertEqual(args.method, "method_v1")
 
 
 if __name__ == "__main__":

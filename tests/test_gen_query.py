@@ -1,6 +1,15 @@
 import unittest
+from unittest.mock import patch
 
-from gen_query import BaselineQueryGenerator, QueryGenerationError, extract_query
+from gen_query import (
+    BaselineQueryGenerator,
+    MethodV1QueryGenerator,
+    QueryGenerationError,
+    LLMConfig,
+    create_query_generator,
+    normalize_query_method,
+    extract_query,
+)
 
 
 class _FakeCompletions:
@@ -40,6 +49,38 @@ class QueryParsingTests(unittest.TestCase):
             {"chat_template_kwargs": {"enable_thinking": False}},
         )
         self.assertIn("怎么预定会议", call["messages"][0]["content"])
+
+    def test_method_v1_uses_improved_prompt_and_disables_thinking(self):
+        client = _FakeClient()
+        generator = MethodV1QueryGenerator(client, "test-model")
+
+        self.assertEqual(generator.generate("客服：请问您使用哪个软件？\n用户：企业微信"), "会议室预订流程")
+        call = client.completions.calls[0]
+        self.assertEqual(generator.method, "method_v1")
+        self.assertEqual(
+            call["extra_body"],
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        prompt = call["messages"][0]["content"]
+        self.assertIn("你是企业内部智能客服", prompt)
+        self.assertIn("充分理解用户问题", prompt)
+        self.assertIn("企业微信", prompt)
+
+    def test_query_method_aliases_are_normalized(self):
+        self.assertEqual(normalize_query_method("METHOD_V1"), "method_v1")
+        self.assertEqual(normalize_query_method("METHOD_V1_PROMPT"), "method_v1")
+        self.assertEqual(normalize_query_method("method-v1"), "method_v1")
+        with self.assertRaises(ValueError):
+            normalize_query_method("unknown")
+
+    def test_factory_selects_configured_method_without_network_call(self):
+        client = _FakeClient()
+        config = LLMConfig("http://model", "test-model", "test-key")
+        with patch("gen_query.build_openai_client", return_value=client) as build_client:
+            generator = create_query_generator(config, "method_v1")
+
+        self.assertEqual(generator.method, "method_v1")
+        build_client.assert_called_once_with(config)
 
 
 if __name__ == "__main__":

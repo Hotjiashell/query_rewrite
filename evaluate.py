@@ -24,7 +24,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
-from gen_query import BaselineQueryGenerator, LLMConfig, QueryGenerator
+from gen_query import (
+    SUPPORTED_QUERY_METHODS,
+    LLMConfig,
+    QueryGenerator,
+    create_query_generator,
+    normalize_query_method,
+)
 from search import DEFAULT_RETRIEVAL_URL, test_retrieval
 
 
@@ -80,6 +86,7 @@ class QueryGenerationConfig:
     input_path: str
     output_path: str
     llm: LLMConfig
+    method: str
     concurrency: int
 
 
@@ -281,15 +288,20 @@ def build_query_artifact(
     input_path: str | Path,
     model_name: str,
     concurrency: int,
+    method: str = "baseline",
 ) -> dict[str, Any]:
     """Build the first-stage artifact, deliberately excluding dialogue and keys."""
 
+    canonical_method = normalize_query_method(method)
     return {
         "schema_version": 1,
         "artifact_type": QUERY_ARTIFACT_TYPE,
         "created_at": datetime.now(UTC).isoformat(),
         "configuration": {
-            "generator": "baseline",
+            # ``generator`` is retained for compatibility with earlier query
+            # artifacts; ``method`` makes the configured prompt explicit.
+            "generator": canonical_method,
+            "method": canonical_method,
             "model_name": model_name,
             "input_path": str(input_path),
             "concurrency": concurrency,
@@ -632,6 +644,9 @@ def resolve_query_generation_config(args: argparse.Namespace) -> QueryGeneration
 
     config = load_config_file(args.config)
     generation_section = _config_section(config, "query_generation")
+    method = normalize_query_method(
+        _first_defined(args.method, generation_section.get("method"), "baseline")
+    )
     return QueryGenerationConfig(
         input_path=_string_setting(
             "query_generation.input_path",
@@ -642,6 +657,7 @@ def resolve_query_generation_config(args: argparse.Namespace) -> QueryGeneration
             _first_defined(args.output, generation_section.get("output_path")),
         ),
         llm=_resolve_llm_config(args, config),
+        method=method,
         concurrency=_integer_setting(
             "query_generation.concurrency",
             _first_defined(args.concurrency, generation_section.get("concurrency"), 1),
@@ -707,6 +723,12 @@ def parse_args(
     parser.add_argument("--base-url", help="Override llm.base_url for the generate stage")
     parser.add_argument("--model", help="Override llm.model_name for the generate stage")
     parser.add_argument("--api-key", help="Override llm.api_key for the generate stage")
+    parser.add_argument(
+        "--method",
+        type=normalize_query_method,
+        choices=SUPPORTED_QUERY_METHODS,
+        help="Override query_generation.method for the generate stage (baseline or method_v1)",
+    )
     parser.add_argument("--retrieval-url", help="Override retrieval.url for the retrieve stage")
     parser.add_argument("--timeout", type=float, help="Override retrieval.timeout for the retrieve stage")
     args = parser.parse_args(argv)
@@ -718,7 +740,7 @@ def parse_args(
 def _run_generate(args: argparse.Namespace) -> int:
     config = resolve_query_generation_config(args)
     config.llm.validate()
-    records = QueryGenerationRunner(BaselineQueryGenerator.from_config(config.llm)).generate(
+    records = QueryGenerationRunner(create_query_generator(config.llm, config.method)).generate(
         load_dialogue_samples(config.input_path),
         concurrency=config.concurrency,
         progress=True,
@@ -728,11 +750,13 @@ def _run_generate(args: argparse.Namespace) -> int:
         input_path=config.input_path,
         model_name=config.llm.model_name,
         concurrency=config.concurrency,
+        method=config.method,
     )
     write_json_atomically(artifact, config.output_path)
     summary = artifact["summary"]
     print(
         "Query generation complete: "
+        f"method={config.method} "
         f"total={summary['total_samples']} success={summary['successful_samples']} "
         f"failed={summary['failed_samples']} output={config.output_path}"
     )
@@ -778,7 +802,7 @@ def _run_all(args: argparse.Namespace) -> int:
     generation_config = resolve_query_generation_config(generation_args)
     generation_config.llm.validate()
     generated_records = QueryGenerationRunner(
-        BaselineQueryGenerator.from_config(generation_config.llm)
+        create_query_generator(generation_config.llm, generation_config.method)
     ).generate(
         load_dialogue_samples(generation_config.input_path),
         concurrency=generation_config.concurrency,
@@ -789,6 +813,7 @@ def _run_all(args: argparse.Namespace) -> int:
         input_path=generation_config.input_path,
         model_name=generation_config.llm.model_name,
         concurrency=generation_config.concurrency,
+        method=generation_config.method,
     )
     write_json_atomically(query_artifact, generation_config.output_path)
 
@@ -824,6 +849,7 @@ def _run_all(args: argparse.Namespace) -> int:
     retrieval_metrics = retrieval_artifact["metrics"]
     print(
         "All stages complete: "
+        f"method={generation_config.method} "
         f"generated={generation_summary['successful_samples']}/{generation_summary['total_samples']} "
         f"retrieved={retrieval_metrics['successful_samples']}/{retrieval_metrics['total_samples']} "
         f"R@1={retrieval_metrics['recall_at_1']:.4f} "

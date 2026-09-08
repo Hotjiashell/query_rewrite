@@ -1,4 +1,4 @@
-"""Query-generation contracts and the first baseline implementation.
+"""Query-generation contracts and prompt-based query rewriting methods.
 
 To add a query rewriting approach, implement ``QueryGenerator.generate`` and
 pass the instance to ``Evaluator``.  The evaluation and retrieval code does
@@ -13,7 +13,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from prompt import BASELINE_PROMPT
+from prompt import BASELINE_PROMPT, METHOD_V1_PROMPT
+
+
+PROMPT_TEMPLATES = {
+    "baseline": BASELINE_PROMPT,
+    "method_v1": METHOD_V1_PROMPT,
+}
+SUPPORTED_QUERY_METHODS = tuple(PROMPT_TEMPLATES)
 
 
 class QueryGenerationError(RuntimeError):
@@ -72,6 +79,24 @@ def build_openai_client(config: LLMConfig) -> ChatCompletionsClient:
     return OpenAI(api_key=config.api_key, base_url=config.base_url)
 
 
+def normalize_query_method(method: str) -> str:
+    """Return the canonical name for a configured prompt method.
+
+    ``METHOD_V1`` and ``METHOD_V1_PROMPT`` are accepted as convenient aliases
+    for the constant in ``prompt.py``; artifacts always use ``method_v1``.
+    """
+
+    if not isinstance(method, str) or not method.strip():
+        raise ValueError("query method must be a non-empty string")
+    normalized = method.strip().lower().replace("-", "_")
+    if normalized.endswith("_prompt"):
+        normalized = normalized[: -len("_prompt")]
+    if normalized not in PROMPT_TEMPLATES:
+        supported = ", ".join(SUPPORTED_QUERY_METHODS)
+        raise ValueError(f"unsupported query method '{method}'; supported methods: {supported}")
+    return normalized
+
+
 def extract_query(model_content: str) -> str:
     """Extract ``query`` from the JSON response required by ``BASELINE_PROMPT``.
 
@@ -103,18 +128,27 @@ def extract_query(model_content: str) -> str:
     raise QueryGenerationError("model response must contain a non-empty JSON 'query'")
 
 
-class BaselineQueryGenerator(QueryGenerator):
-    """One-shot baseline defined by ``prompt.BASELINE_PROMPT``."""
+class PromptQueryGenerator(QueryGenerator):
+    """One-shot generator backed by one named prompt template."""
 
-    def __init__(self, client: ChatCompletionsClient, model_name: str) -> None:
+    def __init__(
+        self,
+        client: ChatCompletionsClient,
+        model_name: str,
+        method: str,
+    ) -> None:
         if not model_name or not model_name.strip():
             raise ValueError("model_name must not be empty")
         self._client = client
         self._model_name = model_name
+        self._method = normalize_query_method(method)
+        self._prompt_template = PROMPT_TEMPLATES[self._method]
 
-    @classmethod
-    def from_config(cls, config: LLMConfig) -> "BaselineQueryGenerator":
-        return cls(build_openai_client(config), config.model_name)
+    @property
+    def method(self) -> str:
+        """Canonical method name used to create this generator."""
+
+        return self._method
 
     def generate(self, dialogue: str) -> str:
         if not dialogue or not dialogue.strip():
@@ -122,7 +156,7 @@ class BaselineQueryGenerator(QueryGenerator):
 
         # The prompt includes a literal JSON example, whose braces must not be
         # interpreted as ``str.format`` fields.
-        prompt = BASELINE_PROMPT.replace("{dialogue}", dialogue)
+        prompt = self._prompt_template.replace("{dialogue}", dialogue)
         response = self._client.chat.completions.create(
             model=self._model_name,
             messages=[{"role": "user", "content": prompt}],
@@ -135,3 +169,37 @@ class BaselineQueryGenerator(QueryGenerator):
         except (AttributeError, IndexError, TypeError) as exc:
             raise QueryGenerationError("model response has no first message content") from exc
         return extract_query(content)
+
+
+class BaselineQueryGenerator(PromptQueryGenerator):
+    """One-shot baseline defined by ``prompt.BASELINE_PROMPT``."""
+
+    def __init__(self, client: ChatCompletionsClient, model_name: str) -> None:
+        super().__init__(client, model_name, "baseline")
+
+    @classmethod
+    def from_config(cls, config: LLMConfig) -> "BaselineQueryGenerator":
+        return cls(build_openai_client(config), config.model_name)
+
+
+class MethodV1QueryGenerator(PromptQueryGenerator):
+    """Prompt-improved query generator defined by ``prompt.METHOD_V1_PROMPT``."""
+
+    def __init__(self, client: ChatCompletionsClient, model_name: str) -> None:
+        super().__init__(client, model_name, "method_v1")
+
+    @classmethod
+    def from_config(cls, config: LLMConfig) -> "MethodV1QueryGenerator":
+        return cls(build_openai_client(config), config.model_name)
+
+
+def create_query_generator(config: LLMConfig, method: str) -> PromptQueryGenerator:
+    """Create a supported prompt method from LLM configuration.
+
+    Future prompt-only methods need only be added to ``PROMPT_TEMPLATES``;
+    the two-stage evaluation code remains unchanged.
+    """
+
+    normalized = normalize_query_method(method)
+    client = build_openai_client(config)
+    return PromptQueryGenerator(client, config.model_name, normalized)

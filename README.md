@@ -1,8 +1,10 @@
-# Query Rewrite Baseline Evaluation
+# Query Rewrite Evaluation
 
 This repository evaluates a query rewriting strategy against the case
-retrieval service. The first strategy is a one-shot baseline using
-`prompt.BASELINE_PROMPT`.
+retrieval service. It currently includes two prompt methods:
+
+- `baseline`: one-shot generation using `prompt.BASELINE_PROMPT`;
+- `method_v1`: the improved prompt in `prompt.METHOD_V1_PROMPT`.
 
 ## Installation
 
@@ -23,6 +25,7 @@ are independent stages, with independent input/output paths and concurrency:
     "api_key_env": "OPENAI_API_KEY"
   },
   "query_generation": {
+    "method": "baseline",
     "input_path": "data/dialog_example.json",
     "output_path": "results/generated_queries.json",
     "concurrency": 4
@@ -88,9 +91,45 @@ python retrieve_cases.py --concurrency 8 --output results/experiment-a.json
 ```
 
 For the LLM settings, resolution priority is command-line option, then
-config-file value, then environment variable. The baseline includes
+config-file value, then environment variable. Both prompt methods include
 `extra_body={"chat_template_kwargs": {"enable_thinking": false}}` on every
 model request.
+
+## Compare baseline and METHOD_V1
+
+Select the prompt method in `query_generation.method`, or override it for one
+run with `--method`:
+
+```bash
+python evaluate.py all --method method_v1
+```
+
+For a clean comparison, write the two runs to different artifacts so that the
+generated queries and retrieval traces remain available:
+
+```bash
+python evaluate.py all \
+  --method baseline \
+  --query-output results/baseline_queries.json \
+  --retrieval-output results/baseline.json
+
+python evaluate.py all \
+  --method method_v1 \
+  --query-output results/method_v1_queries.json \
+  --retrieval-output results/method_v1.json
+```
+
+The query artifact records the canonical method under
+`configuration.method` (and the backwards-compatible `configuration.generator`)
+so each output can be identified later. Compare the final artifacts' values
+under `metrics.recall_at_1`, `metrics.recall_at_3`, `metrics.recall_at_5`, and
+`metrics.recall_at_10`.
+
+The convenience entry point accepts the same option:
+
+```bash
+python generate_queries.py --method method_v1
+```
 
 `query_generation.concurrency` limits concurrent LLM calls, while
 `retrieval.concurrency` limits concurrent retrieval calls.
