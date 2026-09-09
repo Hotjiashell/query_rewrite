@@ -148,6 +148,13 @@ def compare_result_artifacts(
     first_records = _index_records(first_payload, first_path)
     second_records = _index_records(second_payload, second_path)
 
+    def artifact_method(payload: Mapping[str, Any]) -> str | None:
+        configuration = payload.get("configuration")
+        if not isinstance(configuration, Mapping):
+            return None
+        method = configuration.get("method") or configuration.get("generator")
+        return str(method) if method is not None else None
+
     all_keys = list(first_records)
     all_keys.extend(key for key in second_records if key not in first_records)
     target_records: list[dict[str, Any]] = []
@@ -183,6 +190,8 @@ def compare_result_artifacts(
         "configuration": {
             "first_path": str(first_path),
             "second_path": str(second_path),
+            "first_method": artifact_method(first_payload),
+            "second_method": artifact_method(second_payload),
             "cutoff": cutoff,
         },
         "summary": {
@@ -200,6 +209,17 @@ def compare_result_artifacts(
         },
         "records": target_records,
     }
+
+
+def compare_results(
+    first_path: str | Path,
+    second_path: str | Path,
+    *,
+    cutoff: int = DEFAULT_CUTOFF,
+) -> dict[str, Any]:
+    """Convenience alias for callers importing this tool as a Python module."""
+
+    return compare_result_artifacts(first_path, second_path, cutoff=cutoff)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -243,7 +263,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"expected_case_id={item['expected_case_id']} "
                 f"first_rank={item['first']['matched_rank']} "
                 f"second_rank={item['second']['matched_rank']} "
-                f"first_query={item['first']['query']!r}"
+                f"first_query={item['first']['query']!r} "
+                f"second_query={item['second']['query']!r}"
             )
         return 0
     except (ValueError, RuntimeError) as exc:
