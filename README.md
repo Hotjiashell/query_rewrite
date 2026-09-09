@@ -131,6 +131,27 @@ The convenience entry point accepts the same option:
 python generate_queries.py --method method_v1
 ```
 
+## Compare two existing result files
+
+To inspect cases that the first method recalls but the second method misses,
+use `compare_results.py`. It aligns records by `sample_index` and compares the
+ground-truth `matched_rank` at the requested cutoff (Recall@10 by default):
+
+```bash
+python compare_results.py \
+  results/baseline.json \
+  results/method_v1.json \
+  --cutoff 10 \
+  --output results/baseline_only.json
+```
+
+The command prints a summary and one line per difference. The optional JSON
+report's `records` array contains only samples where the first file has a hit
+within the cutoff and the second file does not. Each record includes both
+methods' query, status, matched rank, errors, and retrieval trace; trace entries
+are limited to `rank`, `case_id`, and `case_title`. Use `--cutoff 1`, `--cutoff 3`,
+or `--cutoff 5` to compare the corresponding recall window.
+
 `query_generation.concurrency` limits concurrent LLM calls, while
 `retrieval.concurrency` limits concurrent retrieval calls.
 `retrieval.timeout` applies to each retrieval request.
