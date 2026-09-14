@@ -2,11 +2,12 @@
 from __future__ import annotations
 import inspect
 import json, os, re
+import argparse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Any
 import requests
-from search import test_retrieval
+from search import DEFAULT_RETRIEVAL_URL, test_retrieval
 
 from .prompt import INITIAL_PROMPT, ANALYZER_PROMPT, OPTIMIZER_PROMPT
 
@@ -108,3 +109,65 @@ class PromptEov:
 
 def run_evolution(dataset_path, initial_prompt, **kwargs):
     data=json.load(open(dataset_path,encoding='utf-8')); return PromptEov(initial_prompt,data,**kwargs).run()
+
+
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description='Run promptEov prompt evolution.')
+    parser.add_argument('--dataset', required=True, help='JSON dataset containing chat_content and caseID')
+    parser.add_argument('--initial-prompt-file', help='File containing the initial query-generation prompt')
+    parser.add_argument('--iterations', type=int, default=3)
+    parser.add_argument('--output-dir', default='promptEov/runs')
+    parser.add_argument('--model', required=True, help='LLM model name')
+    parser.add_argument('--base-url', required=True, help='OpenAI-compatible API base URL')
+    parser.add_argument('--api-key', help='API key; defaults to the configured environment variable')
+    parser.add_argument('--api-key-env', default='OPENAI_API_KEY')
+    parser.add_argument('--temperature', type=float, default=0.0, help='LLM temperature from 0 to 2')
+    parser.add_argument('--retrieval-url', default=DEFAULT_RETRIEVAL_URL)
+    parser.add_argument('--retrieval-timeout', type=float, default=30.0)
+    parser.add_argument('--analysis-concurrency', type=int, default=4)
+    return parser
+
+
+def cli(argv=None) -> int:
+    args = _build_cli_parser().parse_args(argv)
+    if args.iterations < 1:
+        raise ValueError('iterations must be at least 1')
+    api_key = args.api_key or os.getenv(args.api_key_env)
+    if not api_key:
+        raise ValueError(f'missing API key; pass --api-key or set {args.api_key_env}')
+    initial_prompt = INITIAL_PROMPT
+    if args.initial_prompt_file:
+        initial_prompt = Path(args.initial_prompt_file).read_text(encoding='utf-8').strip()
+        if not initial_prompt:
+            raise ValueError('initial prompt file must not be empty')
+
+    def llm(prompt, *, temperature=args.temperature):
+        return _llm(
+            prompt,
+            model=args.model,
+            base_url=args.base_url,
+            api_key=api_key,
+            temperature=temperature,
+        )
+
+    history = run_evolution(
+        args.dataset,
+        initial_prompt,
+        llm=llm,
+        retrieve=lambda query: test_retrieval(
+            query, url=args.retrieval_url, timeout=args.retrieval_timeout
+        ),
+        iterations=args.iterations,
+        output_dir=args.output_dir,
+        temperature=args.temperature,
+        analysis_concurrency=args.analysis_concurrency,
+    )
+    print(f'完成 {len(history)} 轮迭代，结果已写入: {args.output_dir}')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(cli())
+    except (OSError, ValueError, requests.RequestException) as exc:
+        raise SystemExit(f'错误: {exc}')
