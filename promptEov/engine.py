@@ -55,12 +55,14 @@ def _llm(prompt, *, model, base_url, api_key, temperature=0.0, timeout=60):
     r.raise_for_status(); return r.json()['choices'][0]['message']['content']
 
 class PromptEov:
-    def __init__(self, initial_prompt:str = INITIAL_PROMPT, dataset:list[dict] = None, *, analyzer_prompt=DEFAULT_ANALYZER, optimizer_prompt=DEFAULT_OPTIMIZER, generate_query:Callable[[str,str],str]|None=None, retrieve:Callable[[str],dict]=test_retrieval, llm:Callable[[str],str]|None=None, temperature:float=0.0, analysis_concurrency:int=4):
+    def __init__(self, initial_prompt:str = INITIAL_PROMPT, dataset:list[dict] = None, *, analyzer_prompt=DEFAULT_ANALYZER, optimizer_prompt=DEFAULT_OPTIMIZER, generate_query:Callable[[str,str],str]|None=None, retrieve:Callable[[str],dict]=test_retrieval, llm:Callable[[str],str]|None=None, temperature:float=0.0, concurrency:int=1, analysis_concurrency:int=4):
         if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
             raise ValueError('temperature must be between 0 and 2')
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+            raise ValueError('concurrency must be at least 1')
         if isinstance(analysis_concurrency, bool) or not isinstance(analysis_concurrency, int) or analysis_concurrency < 1:
             raise ValueError('analysis_concurrency must be at least 1')
-        self.initial_prompt,self.dataset=initial_prompt,dataset or []; self.analyzer_prompt,self.optimizer_prompt=analyzer_prompt,optimizer_prompt; self.generate_query=generate_query; self.retrieve=retrieve; self.llm=llm; self.temperature=temperature; self.analysis_concurrency=analysis_concurrency
+        self.initial_prompt,self.dataset=initial_prompt,dataset or []; self.analyzer_prompt,self.optimizer_prompt=analyzer_prompt,optimizer_prompt; self.generate_query=generate_query; self.retrieve=retrieve; self.llm=llm; self.temperature=temperature; self.concurrency=concurrency; self.analysis_concurrency=analysis_concurrency
     def _call_llm(self, prompt):
         """Call injected LLMs with temperature when their signature supports it."""
         if not self.llm: raise ValueError('provide generate_query or llm')
@@ -110,24 +112,43 @@ class PromptEov:
             f"### Badcase {index}\n{analysis}"
             for index, analysis in enumerate(analyses, start=1)
         )
+    def _process_row(self, row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        try:
+            q=self._gen(self._current_prompt,row['chat_content'])
+            result=self.retrieve(q)
+            ranked=_retrieval_items(result)
+            top10=ranked[:10]
+            ids=[value.get('case_id') for _, value in top10 if value.get('case_id')]
+            titles=[value.get('case_title') for _, value in top10 if value.get('case_title')]
+            hit=row.get('caseID') in ids
+        except Exception as e: q=''; ids=[]; titles=[]; hit=False; result={'error':str(e)}
+        return ({**row,'query':q,'extract_query':q,'top10_case_ids':ids,'top_10titles':titles,'gt_caseId':row.get('caseID'),'gt_caseId_title':row.get('case_title', row.get('caseID')),'hit':hit,'retrieval':result}, hit)
     def run(self, iterations=3, output_dir='promptEov/runs', *, progress=True):
         Path(output_dir).mkdir(parents=True,exist_ok=True); prompt=self.initial_prompt; history=[]
         for i in range(1,iterations+1):
             snap=[]; bad=[]
-            for sample_index, row in enumerate(self.dataset, start=1):
-                try:
-                    q=self._gen(prompt,row['chat_content'])
-                    result=self.retrieve(q)
-                    ranked=_retrieval_items(result)
-                    top10=ranked[:10]
-                    ids=[value.get('case_id') for _, value in top10 if value.get('case_id')]
-                    titles=[value.get('case_title') for _, value in top10 if value.get('case_title')]
-                    hit=row.get('caseID') in ids
-                except Exception as e: q=''; ids=[]; titles=[]; hit=False; result={'error':str(e)}
-                item={**row,'query':q,'extract_query':q,'top10_case_ids':ids,'top_10titles':titles,'gt_caseId':row.get('caseID'),'gt_caseId_title':row.get('case_title', row.get('caseID')),'hit':hit,'retrieval':result}; snap.append(item)
-                if not hit: bad.append(item)
-                if progress:
-                    _print_progress('生成 query + 检索', sample_index, len(self.dataset), iteration=i)
+            self._current_prompt = prompt
+            if self.concurrency == 1:
+                processed = []
+                for sample_index, row in enumerate(self.dataset, start=1):
+                    processed.append(self._process_row(row))
+                    if progress:
+                        _print_progress('生成 query + 检索', sample_index, len(self.dataset), iteration=i)
+            else:
+                with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+                    futures = [executor.submit(self._process_row, row) for row in self.dataset]
+                    processed = [None] * len(futures)
+                    future_indexes = {future: index for index, future in enumerate(futures)}
+                    completed = 0
+                    for future in as_completed(futures):
+                        processed[future_indexes[future]] = future.result()
+                        completed += 1
+                        if progress:
+                            _print_progress('生成 query + 检索', completed, len(futures), iteration=i)
+            for item, hit in processed:
+                snap.append(item)
+                if not hit:
+                    bad.append(item)
             analysis=self._analyze_badcases(bad, iteration=i, progress=progress)
             if progress and self.llm:
                 print(f"[PromptEov][第 {i} 轮] 正在优化 prompt...", file=sys.stderr, flush=True)
@@ -170,6 +191,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument('--temperature', type=float, help='Override llm.temperature (0 to 2)')
     parser.add_argument('--retrieval-url', help='Override retrieval.url')
     parser.add_argument('--retrieval-timeout', type=float, help='Override retrieval.timeout')
+    parser.add_argument('--concurrency', type=int, help='Concurrent query-generation and retrieval workers')
     parser.add_argument('--analysis-concurrency', type=int, default=4)
     return parser
 
@@ -191,6 +213,7 @@ def cli(argv=None) -> int:
     iterations = args.iterations if args.iterations != 3 else evolution_config.get('iterations', 3)
     output_dir = args.output_dir if args.output_dir != 'promptEov/runs' else evolution_config.get('output_dir', 'promptEov/runs')
     analysis_concurrency = args.analysis_concurrency if args.analysis_concurrency != 4 else evolution_config.get('analysis_concurrency', 4)
+    concurrency = args.concurrency if args.concurrency is not None else query_config.get('concurrency', 1)
     if iterations < 1:
         raise ValueError('iterations must be at least 1')
     dataset = args.dataset or query_config.get('input_path')
@@ -232,6 +255,7 @@ def cli(argv=None) -> int:
         iterations=iterations,
         output_dir=output_dir,
         temperature=temperature,
+        concurrency=concurrency,
         analysis_concurrency=analysis_concurrency,
     )
     print(f'完成 {len(history)} 轮迭代，结果已写入: {output_dir}')
