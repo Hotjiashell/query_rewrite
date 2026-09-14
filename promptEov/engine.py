@@ -69,7 +69,23 @@ def _configure_logger(output_dir: Path) -> logging.Logger:
 def _llm(prompt, *, model, base_url, api_key, temperature=0.0, timeout=60):
     if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
         raise ValueError('temperature must be between 0 and 2')
-    r=requests.post(base_url.rstrip('/')+'/chat/completions', headers={'Authorization':f'Bearer {api_key}'}, json={'model':model,'messages':[{'role':'user','content':prompt}], 'temperature':temperature}, timeout=timeout)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise ValueError('llm timeout must be greater than 0')
+    try:
+        r=requests.post(
+            base_url.rstrip('/') + '/chat/completions',
+            headers={'Authorization': f'Bearer {api_key}'},
+            json={
+                'model': model,
+                'messages': [{'role': 'user', 'content': prompt}],
+                'temperature': temperature,
+            },
+            timeout=float(timeout),
+        )
+    except requests.Timeout as exc:
+        raise requests.Timeout(
+            f'LLM request timed out after {timeout:g} seconds'
+        ) from exc
     r.raise_for_status(); return r.json()['choices'][0]['message']['content']
 
 class PromptEov:
@@ -334,6 +350,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument('--api-key', help='API key; defaults to the configured environment variable')
     parser.add_argument('--api-key-env', help='Override llm.api_key_env')
     parser.add_argument('--temperature', type=float, help='Override llm.temperature (0 to 2)')
+    parser.add_argument('--llm-timeout', type=float,
+                        help='LLM request timeout in seconds; overrides llm.timeout')
     parser.add_argument('--retrieval-url', help='Override retrieval.url')
     parser.add_argument('--retrieval-timeout', type=float, help='Override retrieval.timeout')
     parser.add_argument('--concurrency', type=int, help='Concurrent query-generation and retrieval workers')
@@ -370,6 +388,7 @@ def cli(argv=None) -> int:
     api_key_env = args.api_key_env or llm_config.get('api_key_env') or 'OPENAI_API_KEY'
     api_key = args.api_key or llm_config.get('api_key') or os.getenv(api_key_env)
     temperature = args.temperature if args.temperature is not None else llm_config.get('temperature', 0.0)
+    llm_timeout = args.llm_timeout if args.llm_timeout is not None else llm_config.get('timeout', 60.0)
     retrieval_url = args.retrieval_url or retrieval_config.get('url') or DEFAULT_RETRIEVAL_URL
     retrieval_timeout = args.retrieval_timeout if args.retrieval_timeout is not None else retrieval_config.get('timeout', 30.0)
     if not dataset:
@@ -391,6 +410,7 @@ def cli(argv=None) -> int:
             base_url=base_url,
             api_key=api_key,
             temperature=temperature,
+            timeout=llm_timeout,
         )
 
     history = run_evolution(
