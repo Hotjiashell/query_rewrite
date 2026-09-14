@@ -4,6 +4,8 @@ import inspect
 import json, os, re
 import sys
 import argparse
+import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Any
@@ -48,6 +50,22 @@ def _print_progress(stage: str, completed: int, total: int, *, iteration: int) -
     if completed >= total:
         print(file=sys.stderr)
 
+
+def _configure_logger(output_dir: Path) -> logging.Logger:
+    """Create a per-run logger without duplicating handlers across repeated runs."""
+    logger = logging.getLogger(f"promptEov.{output_dir.resolve()}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = logging.FileHandler(output_dir / "evolution.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logger.addHandler(handler)
+    return logger
+
+
 def _llm(prompt, *, model, base_url, api_key, temperature=0.0, timeout=60):
     if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
         raise ValueError('temperature must be between 0 and 2')
@@ -55,17 +73,25 @@ def _llm(prompt, *, model, base_url, api_key, temperature=0.0, timeout=60):
     r.raise_for_status(); return r.json()['choices'][0]['message']['content']
 
 class PromptEov:
-    def __init__(self, initial_prompt:str = INITIAL_PROMPT, dataset:list[dict] = None, *, analyzer_prompt=DEFAULT_ANALYZER, optimizer_prompt=DEFAULT_OPTIMIZER, generate_query:Callable[[str,str],str]|None=None, retrieve:Callable[[str],dict]=test_retrieval, llm:Callable[[str],str]|None=None, temperature:float=0.0, concurrency:int=1, analysis_concurrency:int=4):
+    def __init__(self, initial_prompt:str = INITIAL_PROMPT, dataset:list[dict] = None, *, analyzer_prompt=DEFAULT_ANALYZER, optimizer_prompt=DEFAULT_OPTIMIZER, generate_query:Callable[[str,str],str]|None=None, retrieve:Callable[[str],dict]=test_retrieval, llm:Callable[[str],str]|None=None, temperature:float=0.0, concurrency:int=1, analysis_concurrency:int=4, analysis_batch_size:int=50):
         if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
             raise ValueError('temperature must be between 0 and 2')
         if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
             raise ValueError('concurrency must be at least 1')
         if isinstance(analysis_concurrency, bool) or not isinstance(analysis_concurrency, int) or analysis_concurrency < 1:
             raise ValueError('analysis_concurrency must be at least 1')
-        self.initial_prompt,self.dataset=initial_prompt,dataset or []; self.analyzer_prompt,self.optimizer_prompt=analyzer_prompt,optimizer_prompt; self.generate_query=generate_query; self.retrieve=retrieve; self.llm=llm; self.temperature=temperature; self.concurrency=concurrency; self.analysis_concurrency=analysis_concurrency
+        if isinstance(analysis_batch_size, bool) or not isinstance(analysis_batch_size, int) or analysis_batch_size < 1:
+            raise ValueError('analysis_batch_size must be at least 1')
+        self.initial_prompt,self.dataset=initial_prompt,dataset or []
+        self.analyzer_prompt,self.optimizer_prompt=analyzer_prompt,optimizer_prompt
+        self.generate_query=generate_query; self.retrieve=retrieve; self.llm=llm
+        self.temperature=temperature; self.concurrency=concurrency
+        self.analysis_concurrency=analysis_concurrency; self.analysis_batch_size=analysis_batch_size
+        self._logger = logging.getLogger("promptEov.unconfigured")
     def _call_llm(self, prompt):
         """Call injected LLMs with temperature when their signature supports it."""
         if not self.llm: raise ValueError('provide generate_query or llm')
+        started = time.monotonic()
         try:
             parameters = inspect.signature(self.llm).parameters
         except (TypeError, ValueError):
@@ -74,9 +100,22 @@ class PromptEov:
             parameter.kind == inspect.Parameter.VAR_KEYWORD
             for parameter in parameters.values()
         )
-        if accepts_temperature:
-            return self.llm(prompt, temperature=float(self.temperature))
-        return self.llm(prompt)
+        try:
+            if accepts_temperature:
+                result = self.llm(prompt, temperature=float(self.temperature))
+            else:
+                result = self.llm(prompt)
+        except Exception:
+            self._logger.exception(
+                "llm_call_failed prompt_chars=%d elapsed_ms=%d",
+                len(prompt), int((time.monotonic() - started) * 1000),
+            )
+            raise
+        self._logger.info(
+            "llm_call_succeeded prompt_chars=%d response_chars=%d elapsed_ms=%d",
+            len(prompt), len(result or ""), int((time.monotonic() - started) * 1000),
+        )
+        return result
     def _gen(self, prompt, dialogue):
         if self.generate_query: return self.generate_query(prompt, dialogue)
         out=self._call_llm(_format_prompt(prompt, dialogue=dialogue)); m=re.search(r'"query"\s*:\s*"(.*?)"',out,re.S); return m.group(1) if m else out.strip()
@@ -88,11 +127,16 @@ class PromptEov:
         try:
             return self._call_llm(prompt).strip()
         except Exception as exc:
+            self._logger.warning("badcase_analysis_failed error=%s", exc)
             return f"分析失败: {type(exc).__name__}: {exc}"
 
-    def _analyze_badcases(self, badcases: list[dict[str, Any]], *, iteration: int, progress: bool) -> str:
+    def _analyze_badcases(self, badcases: list[dict[str, Any]], *, iteration: int, batch: int, progress: bool) -> str:
         if not self.llm or not badcases:
             return ''
+        self._logger.info(
+            "analysis_started iteration=%d batch=%d badcases=%d concurrency=%d",
+            iteration, batch, len(badcases), self.analysis_concurrency,
+        )
         if len(badcases) == 1:
             analyses = [self._analyze_badcase(badcases[0])]
             if progress:
@@ -108,10 +152,54 @@ class PromptEov:
                     completed += 1
                     if progress:
                         _print_progress('分析 badcase', completed, len(futures), iteration=iteration)
-        return '\n\n'.join(
+        analysis = '\n\n'.join(
             f"### Badcase {index}\n{analysis}"
             for index, analysis in enumerate(analyses, start=1)
         )
+        self._logger.info(
+            "analysis_finished iteration=%d batch=%d analyses=%d chars=%d",
+            iteration, batch, len(analyses), len(analysis),
+        )
+        return analysis
+
+    @staticmethod
+    def _extract_optimized_prompt(response: str) -> tuple[str, bool]:
+        """Read the optimizer contract while tolerating an imperfect model response."""
+        match = re.search(r"<result>\s*(.*?)\s*</result>", response or "", re.S | re.I)
+        if match:
+            return match.group(1).strip(), True
+        return (response or "").strip(), False
+
+    def _optimize_prompt(self, prompt: str, analysis: str, *, iteration: int, batch: int) -> str:
+        if not self.llm:
+            return prompt
+        optimizer_input = _format_prompt(
+            self.optimizer_prompt,
+            initial_prompt=prompt,
+            analysis=analysis,
+        )
+        self._logger.info(
+            "optimization_started iteration=%d batch=%d analysis_chars=%d prompt_chars=%d",
+            iteration, batch, len(analysis), len(prompt),
+        )
+        response = self._call_llm(optimizer_input)
+        optimized, tagged = self._extract_optimized_prompt(response)
+        if not tagged:
+            self._logger.warning(
+                "optimization_missing_result_tag iteration=%d batch=%d response_chars=%d",
+                iteration, batch, len(response or ""),
+            )
+        if not optimized:
+            self._logger.warning(
+                "optimization_empty_result iteration=%d batch=%d; keeping_previous_prompt",
+                iteration, batch,
+            )
+            return prompt
+        self._logger.info(
+            "optimization_finished iteration=%d batch=%d tagged=%s new_prompt_chars=%d",
+            iteration, batch, tagged, len(optimized),
+        )
+        return optimized
     def _process_row(self, row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         try:
             q=self._gen(self._current_prompt,row['chat_content'])
@@ -124,9 +212,20 @@ class PromptEov:
         except Exception as e: q=''; ids=[]; titles=[]; hit=False; result={'error':str(e)}
         return ({**row,'query':q,'extract_query':q,'top10_case_ids':ids,'top_10titles':titles,'gt_caseId':row.get('caseID'),'gt_caseId_title':row.get('case_title', row.get('caseID')),'hit':hit,'retrieval':result}, hit)
     def run(self, iterations=3, output_dir='promptEov/runs', *, progress=True):
-        Path(output_dir).mkdir(parents=True,exist_ok=True); prompt=self.initial_prompt; history=[]
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        self._logger = _configure_logger(output_path)
+        self._logger.info(
+            "run_started iterations=%d dataset=%d analysis_batch_size=%d "
+            "concurrency=%d analysis_concurrency=%d",
+            iterations, len(self.dataset), self.analysis_batch_size,
+            self.concurrency, self.analysis_concurrency,
+        )
+        prompt=self.initial_prompt; history=[]
         for i in range(1,iterations+1):
             snap=[]; bad=[]
+            iteration_started = time.monotonic()
+            self._logger.info("iteration_started iteration=%d prompt_chars=%d", i, len(prompt))
             self._current_prompt = prompt
             if self.concurrency == 1:
                 processed = []
@@ -149,13 +248,59 @@ class PromptEov:
                 snap.append(item)
                 if not hit:
                     bad.append(item)
-            analysis=self._analyze_badcases(bad, iteration=i, progress=progress)
-            if progress and self.llm:
-                print(f"[PromptEov][第 {i} 轮] 正在优化 prompt...", file=sys.stderr, flush=True)
-            new_prompt=self._call_llm(_format_prompt(self.optimizer_prompt, initial_prompt=prompt, analysis=analysis)) if self.llm else prompt
+            batch_records = []
+            current_prompt = prompt
+            batches = [
+                bad[start:start + self.analysis_batch_size]
+                for start in range(0, len(bad), self.analysis_batch_size)
+            ]
+            for batch_index, bad_batch in enumerate(batches, start=1):
+                analysis = self._analyze_badcases(
+                    bad_batch, iteration=i, batch=batch_index, progress=progress,
+                )
+                if progress and self.llm:
+                    print(
+                        f"[PromptEov][第 {i} 轮][批次 {batch_index}/{len(batches)}] "
+                        f"正在优化 prompt（{len(bad_batch)} 条分析）...",
+                        file=sys.stderr, flush=True,
+                    )
+                optimized_prompt = self._optimize_prompt(
+                    current_prompt, analysis, iteration=i, batch=batch_index,
+                )
+                batch_records.append({
+                    'batch': batch_index,
+                    'bad_case_count': len(bad_batch),
+                    'analysis': analysis,
+                    'prompt_before': current_prompt,
+                    'new_prompt': optimized_prompt,
+                })
+                current_prompt = optimized_prompt
+            new_prompt = current_prompt
+            if not batches and self.llm:
+                self._logger.info("optimization_skipped iteration=%d reason=no_badcases", i)
             if progress:
                 print(f"[PromptEov][第 {i} 轮] 完成，badcase={len(bad)}", file=sys.stderr, flush=True)
-            record={'iteration':i,'prompt':prompt,'snapshot':snap,'bad_cases':bad,'analysis':analysis,'new_prompt':new_prompt}; json.dump(record,open(Path(output_dir)/f'iteration_{i}.json','w'),ensure_ascii=False,indent=2); history.append(record); prompt=new_prompt
+            record={
+                'iteration': i,
+                'prompt': prompt,
+                'snapshot': snap,
+                'bad_cases': bad,
+                'analysis_batch_size': self.analysis_batch_size,
+                'optimization_batches': batch_records,
+                'analysis': '\n\n'.join(item['analysis'] for item in batch_records),
+                'new_prompt': new_prompt,
+            }
+            with (output_path / f'iteration_{i}.json').open('w', encoding='utf-8') as record_file:
+                json.dump(record, record_file, ensure_ascii=False, indent=2)
+            history.append(record)
+            self._logger.info(
+                "iteration_finished iteration=%d badcases=%d optimization_batches=%d "
+                "prompt_chars=%d elapsed_ms=%d",
+                i, len(bad), len(batch_records), len(new_prompt),
+                int((time.monotonic() - iteration_started) * 1000),
+            )
+            prompt=new_prompt
+        self._logger.info("run_finished iterations=%d", len(history))
         return history
 
 def run_evolution(
@@ -193,6 +338,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument('--retrieval-timeout', type=float, help='Override retrieval.timeout')
     parser.add_argument('--concurrency', type=int, help='Concurrent query-generation and retrieval workers')
     parser.add_argument('--analysis-concurrency', type=int, default=4)
+    parser.add_argument('--analysis-batch-size', type=int, default=50,
+                        help='Number of badcases analyzed before optimizing the prompt')
     return parser
 
 
@@ -213,6 +360,7 @@ def cli(argv=None) -> int:
     iterations = args.iterations if args.iterations != 3 else evolution_config.get('iterations', 3)
     output_dir = args.output_dir if args.output_dir != 'promptEov/runs' else evolution_config.get('output_dir', 'promptEov/runs')
     analysis_concurrency = args.analysis_concurrency if args.analysis_concurrency != 4 else evolution_config.get('analysis_concurrency', 4)
+    analysis_batch_size = args.analysis_batch_size if args.analysis_batch_size != 50 else evolution_config.get('analysis_batch_size', 50)
     concurrency = args.concurrency if args.concurrency is not None else query_config.get('concurrency', 1)
     if iterations < 1:
         raise ValueError('iterations must be at least 1')
@@ -257,6 +405,7 @@ def cli(argv=None) -> int:
         temperature=temperature,
         concurrency=concurrency,
         analysis_concurrency=analysis_concurrency,
+        analysis_batch_size=analysis_batch_size,
     )
     print(f'完成 {len(history)} 轮迭代，结果已写入: {output_dir}')
     return 0
