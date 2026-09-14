@@ -50,6 +50,7 @@ class LLMConfig:
     base_url: str
     model_name: str
     api_key: str
+    temperature: float = 0.0
 
     def validate(self) -> None:
         missing = [
@@ -136,12 +137,16 @@ class PromptQueryGenerator(QueryGenerator):
         client: ChatCompletionsClient,
         model_name: str,
         method: str,
+        temperature: float = 0.0,
     ) -> None:
         if not model_name or not model_name.strip():
             raise ValueError("model_name must not be empty")
         self._client = client
         self._model_name = model_name
         self._method = normalize_query_method(method)
+        if not isinstance(temperature, (int, float)) or isinstance(temperature, bool) or not 0 <= temperature <= 2:
+            raise ValueError("temperature must be between 0 and 2")
+        self._temperature = float(temperature)
         self._prompt_template = PROMPT_TEMPLATES[self._method]
 
     @property
@@ -160,6 +165,7 @@ class PromptQueryGenerator(QueryGenerator):
         response = self._client.chat.completions.create(
             model=self._model_name,
             messages=[{"role": "user", "content": prompt}],
+            temperature=self._temperature,
             extra_body={
                 "chat_template_kwargs": {"enable_thinking": False},
             },

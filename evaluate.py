@@ -615,6 +615,12 @@ def _positive_number_setting(name: str, value: Any) -> float:
     return float(value)
 
 
+def _temperature_setting(name: str, value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 2:
+        raise ValueError(f"configuration value '{name}' must be between 0 and 2")
+    return float(value)
+
+
 def _resolve_llm_config(args: argparse.Namespace, config: Mapping[str, Any]) -> LLMConfig:
     llm_section = _config_section(config, "llm")
     configured_key_env = llm_section.get("api_key_env")
@@ -631,6 +637,10 @@ def _resolve_llm_config(args: argparse.Namespace, config: Mapping[str, Any]) -> 
         model_name=_string_setting(
             "llm.model_name",
             _first_defined(args.model, llm_section.get("model_name"), os.getenv("OPENAI_MODEL")),
+        ),
+        temperature=_temperature_setting(
+            "llm.temperature",
+            _first_defined(args.temperature, llm_section.get("temperature"), 0.0),
         ),
         api_key=_string_setting(
             "llm.api_key",
@@ -723,6 +733,7 @@ def parse_args(
     parser.add_argument("--base-url", help="Override llm.base_url for the generate stage")
     parser.add_argument("--model", help="Override llm.model_name for the generate stage")
     parser.add_argument("--api-key", help="Override llm.api_key for the generate stage")
+    parser.add_argument("--temperature", type=float, help="Override llm.temperature (0 to 2) for the generate stage")
     parser.add_argument(
         "--method",
         type=normalize_query_method,
