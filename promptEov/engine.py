@@ -2,8 +2,9 @@
 from __future__ import annotations
 import inspect
 import json, os, re
+import sys
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Any
 import requests
@@ -33,6 +34,19 @@ def _retrieval_items(payload: Any) -> list[tuple[str, dict[str, Any]]]:
         return (int(match.group(1)) if match else 10**9, entry[0])
 
     return [(key, value) for key, value in sorted(results.items(), key=rank) if isinstance(value, dict)]
+
+
+def _print_progress(stage: str, completed: int, total: int, *, iteration: int) -> None:
+    percentage = 100.0 if total == 0 else completed / total * 100
+    print(
+        f"\r[PromptEov][第 {iteration} 轮][{stage}] "
+        f"{completed}/{total} ({percentage:5.1f}%)",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
+    if completed >= total:
+        print(file=sys.stderr)
 
 def _llm(prompt, *, model, base_url, api_key, temperature=0.0, timeout=60):
     if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
@@ -74,23 +88,33 @@ class PromptEov:
         except Exception as exc:
             return f"分析失败: {type(exc).__name__}: {exc}"
 
-    def _analyze_badcases(self, badcases: list[dict[str, Any]]) -> str:
+    def _analyze_badcases(self, badcases: list[dict[str, Any]], *, iteration: int, progress: bool) -> str:
         if not self.llm or not badcases:
             return ''
         if len(badcases) == 1:
             analyses = [self._analyze_badcase(badcases[0])]
+            if progress:
+                _print_progress('分析 badcase', 1, 1, iteration=iteration)
         else:
             with ThreadPoolExecutor(max_workers=min(self.analysis_concurrency, len(badcases))) as executor:
-                analyses = list(executor.map(self._analyze_badcase, badcases))
+                futures = [executor.submit(self._analyze_badcase, badcase) for badcase in badcases]
+                analyses = [''] * len(futures)
+                completed = 0
+                future_indexes = {future: index for index, future in enumerate(futures)}
+                for future in as_completed(futures):
+                    analyses[future_indexes[future]] = future.result()
+                    completed += 1
+                    if progress:
+                        _print_progress('分析 badcase', completed, len(futures), iteration=iteration)
         return '\n\n'.join(
             f"### Badcase {index}\n{analysis}"
             for index, analysis in enumerate(analyses, start=1)
         )
-    def run(self, iterations=3, output_dir='promptEov/runs'):
+    def run(self, iterations=3, output_dir='promptEov/runs', *, progress=True):
         Path(output_dir).mkdir(parents=True,exist_ok=True); prompt=self.initial_prompt; history=[]
         for i in range(1,iterations+1):
             snap=[]; bad=[]
-            for row in self.dataset:
+            for sample_index, row in enumerate(self.dataset, start=1):
                 try:
                     q=self._gen(prompt,row['chat_content'])
                     result=self.retrieve(q)
@@ -102,8 +126,14 @@ class PromptEov:
                 except Exception as e: q=''; ids=[]; titles=[]; hit=False; result={'error':str(e)}
                 item={**row,'query':q,'extract_query':q,'top10_case_ids':ids,'top_10titles':titles,'gt_caseId':row.get('caseID'),'gt_caseId_title':row.get('case_title', row.get('caseID')),'hit':hit,'retrieval':result}; snap.append(item)
                 if not hit: bad.append(item)
-            analysis=self._analyze_badcases(bad)
+                if progress:
+                    _print_progress('生成 query + 检索', sample_index, len(self.dataset), iteration=i)
+            analysis=self._analyze_badcases(bad, iteration=i, progress=progress)
+            if progress and self.llm:
+                print(f"[PromptEov][第 {i} 轮] 正在优化 prompt...", file=sys.stderr, flush=True)
             new_prompt=self._call_llm(_format_prompt(self.optimizer_prompt, initial_prompt=prompt, analysis=analysis)) if self.llm else prompt
+            if progress:
+                print(f"[PromptEov][第 {i} 轮] 完成，badcase={len(bad)}", file=sys.stderr, flush=True)
             record={'iteration':i,'prompt':prompt,'snapshot':snap,'bad_cases':bad,'analysis':analysis,'new_prompt':new_prompt}; json.dump(record,open(Path(output_dir)/f'iteration_{i}.json','w'),ensure_ascii=False,indent=2); history.append(record); prompt=new_prompt
         return history
 
