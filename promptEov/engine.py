@@ -113,28 +113,55 @@ def run_evolution(dataset_path, initial_prompt, **kwargs):
 
 def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Run promptEov prompt evolution.')
-    parser.add_argument('--dataset', required=True, help='JSON dataset containing chat_content and caseID')
+    parser.add_argument('--config', default='config.json', help='JSON config file (default: config.json)')
+    parser.add_argument('--dataset', help='JSON dataset containing chat_content and caseID')
     parser.add_argument('--initial-prompt-file', help='File containing the initial query-generation prompt')
     parser.add_argument('--iterations', type=int, default=3)
     parser.add_argument('--output-dir', default='promptEov/runs')
-    parser.add_argument('--model', required=True, help='LLM model name')
-    parser.add_argument('--base-url', required=True, help='OpenAI-compatible API base URL')
+    parser.add_argument('--model', help='Override llm.model_name')
+    parser.add_argument('--base-url', help='Override llm.base_url')
     parser.add_argument('--api-key', help='API key; defaults to the configured environment variable')
-    parser.add_argument('--api-key-env', default='OPENAI_API_KEY')
-    parser.add_argument('--temperature', type=float, default=0.0, help='LLM temperature from 0 to 2')
-    parser.add_argument('--retrieval-url', default=DEFAULT_RETRIEVAL_URL)
-    parser.add_argument('--retrieval-timeout', type=float, default=30.0)
+    parser.add_argument('--api-key-env', help='Override llm.api_key_env')
+    parser.add_argument('--temperature', type=float, help='Override llm.temperature (0 to 2)')
+    parser.add_argument('--retrieval-url', help='Override retrieval.url')
+    parser.add_argument('--retrieval-timeout', type=float, help='Override retrieval.timeout')
     parser.add_argument('--analysis-concurrency', type=int, default=4)
     return parser
 
 
 def cli(argv=None) -> int:
     args = _build_cli_parser().parse_args(argv)
-    if args.iterations < 1:
+    config_path = Path(args.config)
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    if not isinstance(config, dict):
+        raise ValueError('config file root must be an object')
+    llm_config = config.get('llm', {})
+    retrieval_config = config.get('retrieval', {})
+    query_config = config.get('query_generation', {})
+    evolution_config = config.get('prompt_evolution', {})
+    if not isinstance(evolution_config, dict):
+        raise ValueError('config section prompt_evolution must be an object')
+    if not all(isinstance(section, dict) for section in (llm_config, retrieval_config, query_config)):
+        raise ValueError('config sections llm, retrieval, and query_generation must be objects')
+    iterations = args.iterations if args.iterations != 3 else evolution_config.get('iterations', 3)
+    output_dir = args.output_dir if args.output_dir != 'promptEov/runs' else evolution_config.get('output_dir', 'promptEov/runs')
+    analysis_concurrency = args.analysis_concurrency if args.analysis_concurrency != 4 else evolution_config.get('analysis_concurrency', 4)
+    if iterations < 1:
         raise ValueError('iterations must be at least 1')
-    api_key = args.api_key or os.getenv(args.api_key_env)
+    dataset = args.dataset or query_config.get('input_path')
+    model = args.model or llm_config.get('model_name')
+    base_url = args.base_url or llm_config.get('base_url')
+    api_key_env = args.api_key_env or llm_config.get('api_key_env') or 'OPENAI_API_KEY'
+    api_key = args.api_key or llm_config.get('api_key') or os.getenv(api_key_env)
+    temperature = args.temperature if args.temperature is not None else llm_config.get('temperature', 0.0)
+    retrieval_url = args.retrieval_url or retrieval_config.get('url') or DEFAULT_RETRIEVAL_URL
+    retrieval_timeout = args.retrieval_timeout if args.retrieval_timeout is not None else retrieval_config.get('timeout', 30.0)
+    if not dataset:
+        raise ValueError('missing dataset; pass --dataset or set query_generation.input_path')
+    if not model or not base_url:
+        raise ValueError('missing LLM config; set llm.model_name and llm.base_url or pass CLI overrides')
     if not api_key:
-        raise ValueError(f'missing API key; pass --api-key or set {args.api_key_env}')
+        raise ValueError(f'missing API key; pass --api-key or set {api_key_env}')
     initial_prompt = INITIAL_PROMPT
     if args.initial_prompt_file:
         initial_prompt = Path(args.initial_prompt_file).read_text(encoding='utf-8').strip()
@@ -144,25 +171,25 @@ def cli(argv=None) -> int:
     def llm(prompt, *, temperature=args.temperature):
         return _llm(
             prompt,
-            model=args.model,
-            base_url=args.base_url,
+            model=model,
+            base_url=base_url,
             api_key=api_key,
             temperature=temperature,
         )
 
     history = run_evolution(
-        args.dataset,
+        dataset,
         initial_prompt,
         llm=llm,
         retrieve=lambda query: test_retrieval(
-            query, url=args.retrieval_url, timeout=args.retrieval_timeout
+            query, url=retrieval_url, timeout=retrieval_timeout
         ),
-        iterations=args.iterations,
-        output_dir=args.output_dir,
-        temperature=args.temperature,
-        analysis_concurrency=args.analysis_concurrency,
+        iterations=iterations,
+        output_dir=output_dir,
+        temperature=temperature,
+        analysis_concurrency=analysis_concurrency,
     )
-    print(f'完成 {len(history)} 轮迭代，结果已写入: {args.output_dir}')
+    print(f'完成 {len(history)} 轮迭代，结果已写入: {output_dir}')
     return 0
 
 
