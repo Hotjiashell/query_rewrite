@@ -68,6 +68,7 @@ class GeneratedQueryRecord:
     query: str | None
     status: str
     error: str | None
+    chat_content: str | None = None
 
 
 @dataclass(frozen=True)
@@ -208,6 +209,7 @@ class QueryGenerationRunner:
                 query=None,
                 status="failed",
                 error=sample.input_error,
+                chat_content=sample.dialogue,
             )
 
         try:
@@ -221,6 +223,7 @@ class QueryGenerationRunner:
                 query=query.strip(),
                 status="success",
                 error=None,
+                chat_content=sample.dialogue,
             )
         except Exception as exc:  # A model failure must not stop other samples.
             return GeneratedQueryRecord(
@@ -230,6 +233,7 @@ class QueryGenerationRunner:
                 query=None,
                 status="failed",
                 error=f"{type(exc).__name__}: {exc}",
+                chat_content=sample.dialogue,
             )
 
     def generate(
@@ -334,6 +338,7 @@ def load_generated_query_records(path: str | Path) -> list[GeneratedQueryRecord]
                     query=None,
                     status="failed",
                     error="InvalidQueryArtifact: record must be a JSON object",
+                    chat_content=None,
                 )
             )
             continue
@@ -360,6 +365,7 @@ def load_generated_query_records(path: str | Path) -> list[GeneratedQueryRecord]
                 query=query,
                 status="failed" if errors else "success",
                 error="; ".join(dict.fromkeys(errors)) or None,
+                chat_content=_normalise_optional_string(item.get("chat_content")),
             )
         )
     return records
@@ -411,6 +417,8 @@ class RetrievalEvaluator:
             "sample_index": query_record.sample_index,
             "call_sno": query_record.call_sno,
             "expected_case_id": query_record.expected_case_id,
+            "chat_content": query_record.chat_content,
+            "gt_case_title": None,
             "query": query_record.query,
             "query_status": query_record.status,
             "query_error": query_record.error,
@@ -427,11 +435,16 @@ class RetrievalEvaluator:
 
         try:
             trace = extract_retrieval_trace(self._retriever.retrieve(query_record.query))
+            gt_case_title = next(
+                (case.case_title for case in trace if case.case_id == query_record.expected_case_id),
+                None,
+            )
             record.update(
                 {
                     "retrieval_status": "success",
                     "retrieval_trace": [asdict(case) for case in trace],
                     "matched_rank": _matched_rank(query_record.expected_case_id, trace),
+                    "gt_case_title": gt_case_title,
                     "status": "success",
                     "error": None,
                 }
