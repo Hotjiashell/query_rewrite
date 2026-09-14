@@ -137,8 +137,23 @@ class PromptEov:
             record={'iteration':i,'prompt':prompt,'snapshot':snap,'bad_cases':bad,'analysis':analysis,'new_prompt':new_prompt}; json.dump(record,open(Path(output_dir)/f'iteration_{i}.json','w'),ensure_ascii=False,indent=2); history.append(record); prompt=new_prompt
         return history
 
-def run_evolution(dataset_path, initial_prompt, **kwargs):
-    data=json.load(open(dataset_path,encoding='utf-8')); return PromptEov(initial_prompt,data,**kwargs).run()
+def run_evolution(
+    dataset_path,
+    initial_prompt,
+    *,
+    iterations=3,
+    output_dir='promptEov/runs',
+    progress=True,
+    **kwargs,
+):
+    """Load a dataset, configure the evolver, and run the requested iterations."""
+    with open(dataset_path, encoding='utf-8') as dataset_file:
+        data = json.load(dataset_file)
+    return PromptEov(initial_prompt, data, **kwargs).run(
+        iterations=iterations,
+        output_dir=output_dir,
+        progress=progress,
+    )
 
 
 def _build_cli_parser() -> argparse.ArgumentParser:
