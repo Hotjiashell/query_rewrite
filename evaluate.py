@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 from gen_query import (
-    CUSTOM_METHOD,
+    CUSTOM_METHODS,
     SUPPORTED_QUERY_METHODS,
     LLMConfig,
     MultiQueryGenerator,
@@ -809,8 +809,8 @@ def resolve_query_generation_config(args: argparse.Namespace) -> QueryGeneration
         _first_defined(args.method, generation_section.get("method"), "baseline")
     )
     prompt_file = _first_defined(args.prompt_file, generation_section.get("prompt_file"))
-    if method == CUSTOM_METHOD and not prompt_file:
-        raise ValueError("query_generation.prompt_file is required when method is 'custom'")
+    if method in CUSTOM_METHODS and not prompt_file:
+        raise ValueError(f"query_generation.prompt_file is required when method is '{method}'")
     return QueryGenerationConfig(
         input_path=_string_setting(
             "query_generation.input_path",
@@ -901,11 +901,14 @@ def parse_args(
         "--method",
         type=normalize_query_method,
         choices=SUPPORTED_QUERY_METHODS,
-        help="Override query_generation.method for the generate stage (baseline, method_v1, multi_query, or custom)",
+        help=(
+            "Override query_generation.method for the generate stage "
+            "(baseline, method_v1, multi_query, custom, or custom_multi)"
+        ),
     )
     parser.add_argument(
         "--prompt-file",
-        help="Path to a custom prompt template (required when --method custom is used)",
+        help="Path to a custom prompt template (required when --method custom or custom_multi is used)",
     )
     parser.add_argument("--retrieval-url", help="Override retrieval.url for the retrieve stage")
     parser.add_argument("--timeout", type=float, help="Override retrieval.timeout for the retrieve stage")

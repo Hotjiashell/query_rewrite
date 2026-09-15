@@ -23,7 +23,9 @@ PROMPT_TEMPLATES = {
     "multi_query": MULTI_QUERY_PROMPT,
 }
 CUSTOM_METHOD = "custom"
-SUPPORTED_QUERY_METHODS = tuple(PROMPT_TEMPLATES) + (CUSTOM_METHOD,)
+CUSTOM_MULTI_METHOD = "custom_multi"
+CUSTOM_METHODS = (CUSTOM_METHOD, CUSTOM_MULTI_METHOD)
+SUPPORTED_QUERY_METHODS = tuple(PROMPT_TEMPLATES) + CUSTOM_METHODS
 MAX_MULTI_QUERIES = 3
 DIALOGUE_PLACEHOLDER = "{dialogue}"
 
@@ -257,9 +259,9 @@ class _PromptGeneratorBase:
         if not isinstance(temperature, (int, float)) or isinstance(temperature, bool) or not 0 <= temperature <= 2:
             raise ValueError("temperature must be between 0 and 2")
         self._temperature = float(temperature)
-        if self._method == CUSTOM_METHOD:
+        if self._method in CUSTOM_METHODS:
             if not prompt_template or not prompt_template.strip():
-                raise ValueError("prompt_template is required for the 'custom' method")
+                raise ValueError(f"prompt_template is required for the '{self._method}' method")
             self._prompt_template = prompt_template
         else:
             self._prompt_template = PROMPT_TEMPLATES[self._method]
@@ -326,17 +328,22 @@ def create_query_generator(
 ) -> QueryGenerator:
     """Create a supported prompt method from LLM configuration.
 
-    ``prompt_file`` is required when ``method`` normalizes to ``custom`` and
-    ignored otherwise. Future prompt-only methods need only be added to
-    ``PROMPT_TEMPLATES``; the two-stage evaluation code remains unchanged.
+    ``prompt_file`` is required when ``method`` normalizes to ``custom`` or
+    ``custom_multi`` and ignored otherwise. Future prompt-only methods need
+    only be added to ``PROMPT_TEMPLATES``; the two-stage evaluation code
+    remains unchanged.
     """
 
     normalized = normalize_query_method(method)
     client = build_openai_client(config)
-    if normalized == CUSTOM_METHOD:
+    if normalized in CUSTOM_METHODS:
         if not prompt_file or not prompt_file.strip():
-            raise ValueError("prompt_file is required for the 'custom' method")
+            raise ValueError(f"prompt_file is required for the '{normalized}' method")
         prompt_template = load_prompt_template(prompt_file)
+        if normalized == CUSTOM_MULTI_METHOD:
+            return PromptMultiQueryGenerator(
+                client, config.model_name, normalized, prompt_template=prompt_template
+            )
         return PromptQueryGenerator(
             client, config.model_name, normalized, prompt_template=prompt_template
         )

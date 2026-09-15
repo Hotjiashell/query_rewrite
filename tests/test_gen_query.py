@@ -188,6 +188,38 @@ class QueryParsingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 create_query_generator(config, "custom")
 
+    def test_custom_multi_method_uses_loaded_prompt_template_and_returns_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prompt_path = Path(directory) / "prompt.txt"
+            prompt_path.write_text(
+                '自定义多query提示词，对话如下：\n{dialogue}\n输出```json\n{"query": [...]}\n```',
+                encoding="utf-8",
+            )
+            client = _FakeClient('```json\n{"query": ["自定义结果1", "自定义结果2"]}\n```')
+            config = LLMConfig("http://model", "test-model", "test-key")
+            with patch("gen_query.build_openai_client", return_value=client):
+                generator = create_query_generator(config, "custom_multi", prompt_file=str(prompt_path))
+
+        self.assertIsInstance(generator, PromptMultiQueryGenerator)
+        self.assertEqual(generator.method, "custom_multi")
+        self.assertEqual(
+            generator.generate_queries("用户：你好"),
+            ["自定义结果1", "自定义结果2"],
+        )
+        call = client.completions.calls[0]
+        self.assertIn("用户：你好", call["messages"][0]["content"])
+        self.assertIn("自定义多query提示词", call["messages"][0]["content"])
+        self.assertEqual(
+            call["extra_body"],
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        )
+
+    def test_custom_multi_method_requires_prompt_file(self):
+        config = LLMConfig("http://model", "test-model", "test-key")
+        with patch("gen_query.build_openai_client", return_value=_FakeClient()):
+            with self.assertRaises(ValueError):
+                create_query_generator(config, "custom_multi")
+
 
 if __name__ == "__main__":
     unittest.main()

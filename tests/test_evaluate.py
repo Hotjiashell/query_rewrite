@@ -327,6 +327,58 @@ class EvaluationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resolve_query_generation_config(args)
 
+    def test_custom_multi_method_resolves_prompt_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "llm": {
+                            "base_url": "http://model",
+                            "model_name": "model-a",
+                            "api_key": "test-key",
+                        },
+                        "query_generation": {
+                            "method": "custom_multi",
+                            "input_path": "dialogs.json",
+                            "output_path": "queries.json",
+                            "prompt_file": "prompts/multi.txt",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            resolved = resolve_query_generation_config(
+                parse_args(["generate", "--config", str(config_path)])
+            )
+
+        self.assertEqual(resolved.method, "custom_multi")
+        self.assertEqual(resolved.prompt_file, "prompts/multi.txt")
+
+    def test_custom_multi_method_without_prompt_file_raises(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "llm": {
+                            "base_url": "http://model",
+                            "model_name": "model-a",
+                            "api_key": "test-key",
+                        },
+                        "query_generation": {
+                            "method": "custom_multi",
+                            "input_path": "dialogs.json",
+                            "output_path": "queries.json",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = parse_args(["generate", "--config", str(config_path)])
+            with self.assertRaises(ValueError):
+                resolve_query_generation_config(args)
+
 
 def _case(case_id, rank, score=None, title=""):
     return RetrievedCase(rank=rank, case_id=case_id, case_title=title, score=score)

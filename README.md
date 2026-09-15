@@ -1,7 +1,7 @@
 # Query Rewrite Evaluation
 
 This repository evaluates a query rewriting strategy against the case
-retrieval service. It currently includes four prompt methods:
+retrieval service. It currently includes five prompt methods:
 
 - `baseline`: one-shot generation using `prompt.BASELINE_PROMPT`;
 - `method_v1`: the improved prompt in `prompt.METHOD_V1_PROMPT`;
@@ -9,6 +9,10 @@ retrieval service. It currently includes four prompt methods:
   `prompt.MULTI_QUERY_PROMPT`, retrieves each in parallel, and fuses the
   results (see [Multi-query retrieval fusion](#multi-query-retrieval-fusion));
 - `custom`: a one-shot method backed by your own prompt template file (see
+  [Using a custom prompt file](#using-a-custom-prompt-file));
+- `custom_multi`: the multi-query counterpart of `custom` — your own prompt
+  template file, but expected to return up to three queries and fused the
+  same way as `multi_query` (see
   [Using a custom prompt file](#using-a-custom-prompt-file)).
 
 ## Installation
@@ -137,8 +141,9 @@ query for a sample fails is the sample marked `retrieval_status: "failed"`.
 ## Using a custom prompt file
 
 To try a prompt without editing `prompt.py`, set `query_generation.method` to
-`custom` and point `query_generation.prompt_file` (or `--prompt-file`) at a
-text file:
+`custom` (single query) or `custom_multi` (up to three queries, fused like
+`multi_query`) and point `query_generation.prompt_file` (or `--prompt-file`)
+at a text file:
 
 ```json
 {
@@ -154,25 +159,38 @@ text file:
 
 ```bash
 python generate_queries.py --method custom --prompt-file prompts/my_experiment.txt
+python generate_queries.py --method custom_multi --prompt-file prompts/my_multi_experiment.txt
 ```
 
 The file must contain the literal `{dialogue}` placeholder, which is replaced
 with the dialogue text before the request is sent (the same substitution used
-by `BASELINE_PROMPT`, `METHOD_V1_PROMPT`, and `MULTI_QUERY_PROMPT`), and it
-must produce the single-query JSON format that `baseline` and `method_v1`
-use, wrapped in a ```` ```json ```` fence or returned directly:
+by `BASELINE_PROMPT`, `METHOD_V1_PROMPT`, and `MULTI_QUERY_PROMPT`).
+
+For `custom`, the file must produce the single-query JSON format that
+`baseline` and `method_v1` use, wrapped in a ```` ```json ```` fence or
+returned directly:
 
 ```json
 {"query": "your retrieval query"}
 ```
 
+For `custom_multi`, the file must produce the `MULTI_QUERY_PROMPT` array
+format instead (a bare string is also accepted and treated as one query):
+
+```json
+{"query": ["query angle 1", "query angle 2"]}
+```
+
 `custom` always goes through the single-query path, so retrieval and fusion
-behave exactly as they do for `baseline`/`method_v1`. `--prompt-file` takes
-precedence over `query_generation.prompt_file` when both are set; missing it
-for the `custom` method is an error before any model call is made. The
-resolved path is recorded (not its contents) under
-`configuration.prompt_file` in the query artifact, so you can tell which
-prompt file produced a given run.
+behave exactly as they do for `baseline`/`method_v1`. `custom_multi` behaves
+exactly as `multi_query` does: its generated queries are retrieved
+concurrently and fused per `retrieval.fusion_method`/`retrieval.top_k` (see
+[Multi-query retrieval fusion](#multi-query-retrieval-fusion)).
+`--prompt-file` takes precedence over `query_generation.prompt_file` when
+both are set; missing it for `custom` or `custom_multi` is an error before
+any model call is made. The resolved path is recorded (not its contents)
+under `configuration.prompt_file` in the query artifact, so you can tell
+which prompt file produced a given run.
 
 ## Compare baseline and METHOD_V1
 
@@ -237,6 +255,34 @@ or `--cutoff 5` to compare the corresponding recall window.
 records, a sample's own queries are always retrieved concurrently with each
 other regardless of `retrieval.concurrency`, which only limits how many
 samples are processed at once.
+
+## Collect badcases
+
+To review every sample that missed within top-K, use `collect_badcases.py`.
+It reads a `retrieval_evaluation` artifact plus a case summary file (a JSON
+object mapping `case_id` to `{"case_name": ..., "text": ...}`, as in
+[data/case_example.json](data/case_example.json)) and fills in each miss's
+ground-truth case title from the summary file — useful because the
+evaluation artifact's own `gt_case_title` is only populated when the
+ground-truth case happens to appear in the retrieval trace:
+
+```bash
+python collect_badcases.py \
+  results/method_v1.json \
+  data/case_example.json \
+  --cutoff 10 \
+  --output results/badcases.json
+```
+
+A badcase is a sample whose query generation and retrieval both succeeded but
+whose `matched_rank` is `None` or falls outside `--cutoff` (default `10`).
+Samples where `status` is `"failed"` (an LLM or retrieval error) are excluded,
+since those are infrastructure failures rather than retrieval misses. Each
+report record keeps `sample_index`, `call_sno`, `chat_content`,
+`expected_case_id`, `query`/`queries`, `matched_rank`, and `retrieval_trace`,
+plus the resolved `gt_case_title` and a `gt_case_found` flag (`false` when the
+`expected_case_id` has no entry in the case summary file, so you can spot
+missing case metadata instead of a silent `null`).
 
 No external request is made by installing dependencies or running tests. An
 evaluation run does call both the configured LLM and the retrieval endpoint.
