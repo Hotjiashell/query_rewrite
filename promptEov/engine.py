@@ -52,17 +52,23 @@ def _print_progress(stage: str, completed: int, total: int, *, iteration: int) -
 
 
 def _configure_logger(output_dir: Path) -> logging.Logger:
-    """Create a per-run logger without duplicating handlers across repeated runs."""
+    """Return a logger without creating a file on disk.
+
+    Prompt evolution used to write a verbose ``evolution.log`` file.  The
+    per-iteration artifacts are now persisted incrementally, so a file logger
+    is both redundant and easy to leave stale after an interrupted run.
+    """
     logger = logging.getLogger(f"promptEov.{output_dir.resolve()}")
     logger.setLevel(logging.INFO)
     logger.propagate = False
+    for handler in list(logger.handlers):
+        if isinstance(handler, logging.FileHandler):
+            logger.removeHandler(handler)
+            handler.close()
+    # Keep internal diagnostics available to library users that attach their
+    # own handler, while never creating ``evolution.log`` ourselves.
     if not logger.handlers:
-        handler = logging.FileHandler(output_dir / "evolution.log", encoding="utf-8")
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)s %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        ))
-        logger.addHandler(handler)
+        logger.addHandler(logging.NullHandler())
     return logger
 
 
@@ -136,15 +142,48 @@ class PromptEov:
         if self.generate_query: return self.generate_query(prompt, dialogue)
         out=self._call_llm(_format_prompt(prompt, dialogue=dialogue)); m=re.search(r'"query"\s*:\s*"(.*?)"',out,re.S); return m.group(1) if m else out.strip()
     def _analyze_badcase(self, badcase: dict[str, Any]) -> str:
+        # Keep the analyzer context focused on the fields described by its
+        # prompt.  Retrieval payloads and other bookkeeping fields can be
+        # large/noisy and are still available in snapshot.json for inspection.
+        analyzer_case = {
+            key: badcase.get(key)
+            for key in ('chat_content', 'gt_caseId_title', 'extract_query', 'top_10titles')
+        }
         prompt = _format_prompt(
             self.analyzer_prompt,
-            bad_cases=json.dumps(badcase, ensure_ascii=False, indent=2),
+            bad_cases=json.dumps(analyzer_case, ensure_ascii=False, indent=2),
         )
         try:
-            return self._call_llm(prompt).strip()
+            response = self._call_llm(prompt).strip()
+            # The analyzer is asked for JSON, but tolerate markdown fences or
+            # a surrounding explanation and always persist one stable schema.
+            candidate = response
+            fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", response, re.S | re.I)
+            if fenced:
+                candidate = fenced.group(1)
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                parsed = {}
+            if not isinstance(parsed, dict):
+                parsed = {}
+            report = {
+                'chat_content': badcase.get('chat_content'),
+                'extract_query': badcase.get('extract_query'),
+                'gt_caseTitle': badcase.get('gt_caseId_title'),
+                'category': parsed.get('category', ''),
+                'reason': parsed.get('reason', response),
+            }
+            return json.dumps(report, ensure_ascii=False, indent=2)
         except Exception as exc:
             self._logger.warning("badcase_analysis_failed error=%s", exc)
-            return f"分析失败: {type(exc).__name__}: {exc}"
+            return json.dumps({
+                'chat_content': badcase.get('chat_content'),
+                'extract_query': badcase.get('extract_query'),
+                'gt_caseTitle': badcase.get('gt_caseId_title'),
+                'category': '分析失败',
+                'reason': f'{type(exc).__name__}: {exc}',
+            }, ensure_ascii=False, indent=2)
 
     def _analyze_badcases(self, badcases: list[dict[str, Any]], *, iteration: int, batch: int, progress: bool) -> str:
         if not self.llm or not badcases:
@@ -224,9 +263,29 @@ class PromptEov:
             top10=ranked[:10]
             ids=[value.get('case_id') for _, value in top10 if value.get('case_id')]
             titles=[value.get('case_title') for _, value in top10 if value.get('case_title')]
-            hit=row.get('caseID') in ids
-        except Exception as e: q=''; ids=[]; titles=[]; hit=False; result={'error':str(e)}
-        return ({**row,'query':q,'extract_query':q,'top10_case_ids':ids,'top_10titles':titles,'gt_caseId':row.get('caseID'),'gt_caseId_title':row.get('case_title', row.get('caseID')),'hit':hit,'retrieval':result}, hit)
+            matched_rank = next((index for index, case_id in enumerate(ids, start=1)
+                                 if case_id == row.get('caseID')), None)
+            hit = matched_rank is not None
+        except Exception as e: q=''; ids=[]; titles=[]; matched_rank=None; hit=False; result={'error':str(e)}
+        return ({**row,'query':q,'extract_query':q,'top10_case_ids':ids,'top_10titles':titles,
+                 'gt_caseId':row.get('caseID'),'gt_caseId_title':row.get('case_title', row.get('caseID')),
+                 'matched_rank':matched_rank,'hit':hit,'retrieval':result}, hit)
+
+    @staticmethod
+    def _metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
+        """Calculate recall using all dataset rows as the denominator."""
+        total = len(records)
+        metrics = {'total_samples': total}
+        for cutoff in (1, 3, 5, 10):
+            hits = sum(isinstance(row.get('matched_rank'), int)
+                       and row['matched_rank'] <= cutoff for row in records)
+            metrics[f'hits_at_{cutoff}'] = hits
+            metrics[f'recall_at_{cutoff}'] = hits / total if total else 0.0
+        return metrics
+
+    @staticmethod
+    def _write_json(path: Path, payload: Any) -> None:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     def run(self, iterations=3, output_dir='promptEov/runs', *, progress=True):
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -239,6 +298,8 @@ class PromptEov:
         )
         prompt=self.initial_prompt; history=[]
         for i in range(1,iterations+1):
+            iteration_path = output_path / f'iteration_{i}'
+            iteration_path.mkdir(parents=True, exist_ok=True)
             snap=[]; bad=[]
             iteration_started = time.monotonic()
             self._logger.info("iteration_started iteration=%d prompt_chars=%d", i, len(prompt))
@@ -264,6 +325,12 @@ class PromptEov:
                 snap.append(item)
                 if not hit:
                     bad.append(item)
+            # Persist the expensive retrieval stage immediately, before any
+            # analyzer/optimizer request, so an interrupted run is inspectable.
+            self._write_json(iteration_path / 'snapshot.json', snap)
+            self._write_json(iteration_path / 'bad_cases.json', bad)
+            (iteration_path / 'prompt.txt').write_text(prompt, encoding='utf-8')
+            self._write_json(iteration_path / 'metrics.json', self._metrics(snap))
             batch_records = []
             current_prompt = prompt
             batches = [
@@ -291,6 +358,7 @@ class PromptEov:
                     'new_prompt': optimized_prompt,
                 })
                 current_prompt = optimized_prompt
+                self._write_json(iteration_path / f'analysis_batch_{batch_index}.json', batch_records[-1])
             new_prompt = current_prompt
             if not batches and self.llm:
                 self._logger.info("optimization_skipped iteration=%d reason=no_badcases", i)
@@ -305,9 +373,15 @@ class PromptEov:
                 'optimization_batches': batch_records,
                 'analysis': '\n\n'.join(item['analysis'] for item in batch_records),
                 'new_prompt': new_prompt,
+                'metrics': self._metrics(snap),
             }
-            with (output_path / f'iteration_{i}.json').open('w', encoding='utf-8') as record_file:
-                json.dump(record, record_file, ensure_ascii=False, indent=2)
+            self._write_json(iteration_path / 'optimization_batches.json', batch_records)
+            (iteration_path / 'analysis.txt').write_text(record['analysis'], encoding='utf-8')
+            (iteration_path / 'new_prompt.txt').write_text(new_prompt, encoding='utf-8')
+            self._write_json(iteration_path / 'manifest.json', {
+                'iteration': i, 'analysis_batch_size': self.analysis_batch_size,
+                'metrics': record['metrics'], 'optimization_batch_count': len(batch_records),
+            })
             history.append(record)
             self._logger.info(
                 "iteration_finished iteration=%d badcases=%d optimization_batches=%d "

@@ -34,7 +34,7 @@ python -m promptEov --config config.json
 
 命令行参数会覆盖配置文件中的同名设置。`embedding` 如果由检索服务内部使用，PromptEov 不会直接调用它；若配置文件中存在 `embedding` 段，会由检索服务自行处理，客户端无需额外传参。
 
-运行时会在 stderr 显示每轮的样本处理、badcase 分析和 prompt 优化进度，同时在输出目录写入 `evolution.log`。日志包含运行、迭代、批次、LLM 调用耗时和异常信息。作为 Python 库调用时默认也显示进度；如需关闭，可传入 `progress=False`：
+运行时会在 stderr 显示每轮的样本处理、badcase 分析和 prompt 优化进度，不再生成单独的日志文件。作为 Python 库调用时默认也显示进度；如需关闭，可传入 `progress=False`：
 
 ```python
 run_evolution(..., progress=False)
@@ -54,4 +54,4 @@ LLM 请求默认超时为 60 秒，分析器和优化器请求共用这个设置
 
 命令行参数 `--llm-timeout 180` 会覆盖配置文件。`retrieval.timeout` 只控制检索请求，不影响 prompt 分析和优化请求。需要注意：该参数只能放宽客户端等待时间；如果 LLM 网关、反向代理或服务端自身有更短的超时，仍然需要同时调整服务端配置。由于每批默认会将 50 条分析汇总后交给优化器，优化请求通常比单条分析更慢；如果仍然超时，可先将 `analysis_batch_size` 调小，例如 20 或 10。
 
-每轮在 `promptEov/runs/iteration_N.json` 保存 prompt、逐条检索结果、top-10 命中标记、bad cases、分批分析报告和新 prompt。badcase 按 `analysis_batch_size` 分批，默认每累计 50 条分析就优化一次 prompt；最后不足 50 条的尾批也会执行。每个 badcase 单独调用一次分析器，批内多个 badcase 的分析会并行执行，再按原顺序汇总后交给优化器；可通过 `analysis_concurrency` 和 `analysis_batch_size` 调整并行度。优化器提示词要求将结果放在 `<result></result>` 中，引擎会提取标签内的 prompt；未带标签时兼容使用完整返回文本。可通过 `generate_query(dialogue_prompt, dialogue)` 与 `retrieve(query)` 注入自定义实现。
+每轮会写入独立目录 `promptEov/runs/iteration_N/`，包括 `snapshot.json`（逐条检索结果）、`bad_cases.json`、`metrics.json`（Recall@1/3/5/10 及命中数）、`prompt.txt`、`analysis_batch_N.json`、`optimization_batches.json`、`analysis.txt`、`new_prompt.txt` 和 `manifest.json`。检索阶段完成后会先保存快照和指标，再进行分析与优化，便于中断后查看已完成内容。每条记录还包含 `matched_rank`（1-based 命中排名）和 `hit`。badcase 按 `analysis_batch_size` 分批，默认每累计 50 条分析就优化一次 prompt；最后不足 50 条的尾批也会执行。每个 badcase 单独调用一次分析器，批内多个 badcase 的分析会并行执行，再按原顺序汇总后交给优化器；可通过 `analysis_concurrency` 和 `analysis_batch_size` 调整并行度。优化器提示词要求将结果放在 `<result></result>` 中，引擎会提取标签内的 prompt；未带标签时兼容使用完整返回文本。可通过 `generate_query(dialogue_prompt, dialogue)` 与 `retrieve(query)` 注入自定义实现。
