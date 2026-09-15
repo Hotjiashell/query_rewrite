@@ -25,13 +25,15 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 from gen_query import (
+    CUSTOM_METHOD,
     SUPPORTED_QUERY_METHODS,
     LLMConfig,
+    MultiQueryGenerator,
     QueryGenerator,
     create_query_generator,
     normalize_query_method,
 )
-from search import DEFAULT_RETRIEVAL_URL, test_retrieval
+from search import DEFAULT_RETRIEVAL_URL, RetrievalRequestError, test_retrieval
 
 
 METRIC_CUTOFFS = (1, 3, 5, 10)
@@ -69,6 +71,7 @@ class GeneratedQueryRecord:
     status: str
     error: str | None
     chat_content: str | None = None
+    queries: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,7 @@ class RetrievedCase:
     rank: int
     case_id: str
     case_title: str
+    score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,7 @@ class QueryGenerationConfig:
     llm: LLMConfig
     method: str
     concurrency: int
+    prompt_file: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +105,8 @@ class RetrievalConfig:
     url: str
     timeout: float
     concurrency: int
+    fusion_method: str
+    top_k: int
 
 
 class SearchRetriever:
@@ -213,9 +220,17 @@ class QueryGenerationRunner:
             )
 
         try:
-            query = self._generator.generate(sample.dialogue or "")
-            if not isinstance(query, str) or not query.strip():
-                raise ValueError("query generator returned an empty query")
+            queries: list[str] | None = None
+            if isinstance(self._generator, MultiQueryGenerator):
+                generated = self._generator.generate_queries(sample.dialogue or "")
+                if not generated or not isinstance(generated[0], str) or not generated[0].strip():
+                    raise ValueError("query generator returned an empty query")
+                queries = [item.strip() for item in generated if isinstance(item, str) and item.strip()]
+                query = queries[0]
+            else:
+                query = self._generator.generate(sample.dialogue or "")
+                if not isinstance(query, str) or not query.strip():
+                    raise ValueError("query generator returned an empty query")
             return GeneratedQueryRecord(
                 sample_index=sample.index,
                 call_sno=sample.call_sno,
@@ -224,6 +239,7 @@ class QueryGenerationRunner:
                 status="success",
                 error=None,
                 chat_content=sample.dialogue,
+                queries=queries,
             )
         except Exception as exc:  # A model failure must not stop other samples.
             return GeneratedQueryRecord(
@@ -293,6 +309,7 @@ def build_query_artifact(
     model_name: str,
     concurrency: int,
     method: str = "baseline",
+    prompt_file: str | None = None,
 ) -> dict[str, Any]:
     """Build the first-stage artifact, deliberately excluding dialogue and keys."""
 
@@ -309,6 +326,7 @@ def build_query_artifact(
             "model_name": model_name,
             "input_path": str(input_path),
             "concurrency": concurrency,
+            "prompt_file": prompt_file,
         },
         "summary": calculate_stage_summary(records),
         "records": [asdict(record) for record in records],
@@ -348,6 +366,11 @@ def load_generated_query_records(path: str | Path) -> list[GeneratedQueryRecord]
         expected_case_id = _normalise_optional_string(item.get("expected_case_id"))
         query = item.get("query")
         query = query.strip() if isinstance(query, str) and query.strip() else None
+        raw_queries = item.get("queries")
+        queries: list[str] | None = None
+        if isinstance(raw_queries, list):
+            cleaned = [value.strip() for value in raw_queries if isinstance(value, str) and value.strip()]
+            queries = cleaned or None
         source_status = item.get("status")
         source_error = _normalise_optional_string(item.get("error"))
         errors: list[str] = []
@@ -366,6 +389,7 @@ def load_generated_query_records(path: str | Path) -> list[GeneratedQueryRecord]
                 status="failed" if errors else "success",
                 error="; ".join(dict.fromkeys(errors)) or None,
                 chat_content=_normalise_optional_string(item.get("chat_content")),
+                queries=queries,
             )
         )
     return records
@@ -389,11 +413,14 @@ def extract_retrieval_trace(response: Mapping[str, Any]) -> list[RetrievedCase]:
         case_id = case.get("case_id")
         if case_id is None:
             continue
+        raw_score = case.get("score")
+        score = float(raw_score) if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool) else None
         trace.append(
             RetrievedCase(
                 rank=rank,
                 case_id=str(case_id),
                 case_title=str(case.get("case_title") or ""),
+                score=score,
             )
         )
     return trace
@@ -406,11 +433,89 @@ def _matched_rank(expected_case_id: str, trace: Sequence[RetrievedCase]) -> int 
     return None
 
 
+def fuse_round_robin(traces: Sequence[Sequence[RetrievedCase]], top_k: int) -> list[RetrievedCase]:
+    """Interleave per-query traces in their original rank order, deduplicated by case_id."""
+
+    seen: set[str] = set()
+    fused: list[RetrievedCase] = []
+    cursors = [0] * len(traces)
+    remaining = True
+    while remaining and len(fused) < top_k:
+        remaining = False
+        for trace_index, trace in enumerate(traces):
+            cursor = cursors[trace_index]
+            while cursor < len(trace):
+                case = trace[cursor]
+                cursor += 1
+                if case.case_id in seen:
+                    continue
+                seen.add(case.case_id)
+                fused.append(case)
+                remaining = True
+                break
+            cursors[trace_index] = cursor
+            if len(fused) >= top_k:
+                break
+    return [replace(case, rank=index + 1) for index, case in enumerate(fused[:top_k])]
+
+
+def fuse_by_score(traces: Sequence[Sequence[RetrievedCase]], top_k: int) -> list[RetrievedCase]:
+    """Deduplicate by case_id keeping the highest score, then sort by score descending."""
+
+    best: dict[str, RetrievedCase] = {}
+    for trace in traces:
+        for case in trace:
+            current = best.get(case.case_id)
+            if current is None or (case.score or float("-inf")) > (current.score or float("-inf")):
+                best[case.case_id] = case
+    ordered = sorted(best.values(), key=lambda case: case.score if case.score is not None else float("-inf"), reverse=True)
+    return [replace(case, rank=index + 1) for index, case in enumerate(ordered[:top_k])]
+
+
+FUSION_METHODS = {
+    "round_robin": fuse_round_robin,
+    "score": fuse_by_score,
+}
+DEFAULT_FUSION_METHOD = "round_robin"
+DEFAULT_TOP_K = 10
+
+
 class RetrievalEvaluator:
     """Second-stage runner that consumes generated queries without using an LLM."""
 
-    def __init__(self, retriever: Retriever) -> None:
+    def __init__(
+        self,
+        retriever: Retriever,
+        *,
+        fusion_method: str = DEFAULT_FUSION_METHOD,
+        top_k: int = DEFAULT_TOP_K,
+    ) -> None:
+        if fusion_method not in FUSION_METHODS:
+            supported = ", ".join(sorted(FUSION_METHODS))
+            raise ValueError(f"unsupported fusion method '{fusion_method}'; supported methods: {supported}")
+        if top_k < 1:
+            raise ValueError("top_k must be at least 1")
         self._retriever = retriever
+        self._fusion_method = fusion_method
+        self._top_k = top_k
+
+    def _retrieve_many(self, queries: Sequence[str]) -> tuple[list[list[RetrievedCase]], list[str]]:
+        """Concurrently retrieve every query for one sample, tolerating partial failure."""
+
+        results: list[list[RetrievedCase] | None] = [None] * len(queries)
+        errors: list[str] = []
+        with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+            future_to_index = {
+                executor.submit(self._retriever.retrieve, query): index for index, query in enumerate(queries)
+            }
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    results[index] = extract_retrieval_trace(future.result())
+                except Exception as exc:
+                    errors.append(f"{queries[index]!r}: {type(exc).__name__}: {exc}")
+        traces = [trace for trace in results if trace is not None]
+        return traces, errors
 
     def evaluate_query(self, query_record: GeneratedQueryRecord) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -433,15 +538,27 @@ class RetrievalEvaluator:
             record["retrieval_error"] = "not attempted because query generation did not succeed"
             return record
 
+        queries = query_record.queries
         try:
-            trace = extract_retrieval_trace(self._retriever.retrieve(query_record.query))
+            if queries and len(queries) > 1:
+                traces, retrieval_errors = self._retrieve_many(queries)
+                if not traces:
+                    raise RetrievalRequestError(f"all queries failed: {'; '.join(retrieval_errors)}")
+                trace = FUSION_METHODS[self._fusion_method](traces, self._top_k)
+                retrieval_status = "partial_success" if retrieval_errors else "success"
+                retrieval_error = "; ".join(retrieval_errors) or None
+            else:
+                trace = extract_retrieval_trace(self._retriever.retrieve(query_record.query))
+                retrieval_status = "success"
+                retrieval_error = None
             gt_case_title = next(
                 (case.case_title for case in trace if case.case_id == query_record.expected_case_id),
                 None,
             )
             record.update(
                 {
-                    "retrieval_status": "success",
+                    "retrieval_status": retrieval_status,
+                    "retrieval_error": retrieval_error,
                     "retrieval_trace": [asdict(case) for case in trace],
                     "matched_rank": _matched_rank(query_record.expected_case_id, trace),
                     "gt_case_title": gt_case_title,
@@ -506,9 +623,16 @@ class Evaluator:
     which persist the query artifact between the two API-bound operations.
     """
 
-    def __init__(self, generator: QueryGenerator, retriever: Retriever) -> None:
+    def __init__(
+        self,
+        generator: QueryGenerator,
+        retriever: Retriever,
+        *,
+        fusion_method: str = DEFAULT_FUSION_METHOD,
+        top_k: int = DEFAULT_TOP_K,
+    ) -> None:
         self._query_runner = QueryGenerationRunner(generator)
-        self._retrieval_evaluator = RetrievalEvaluator(retriever)
+        self._retrieval_evaluator = RetrievalEvaluator(retriever, fusion_method=fusion_method, top_k=top_k)
 
     def evaluate_sample(self, sample: DialogueSample) -> dict[str, Any]:
         return self._retrieval_evaluator.evaluate_query(self._query_runner.generate_sample(sample))
@@ -547,6 +671,8 @@ def build_retrieval_artifact(
     retrieval_url: str,
     timeout: float,
     concurrency: int,
+    fusion_method: str = DEFAULT_FUSION_METHOD,
+    top_k: int = DEFAULT_TOP_K,
 ) -> dict[str, Any]:
     """Build the final artifact containing traces and recall metrics."""
 
@@ -559,6 +685,8 @@ def build_retrieval_artifact(
             "retrieval_url": retrieval_url,
             "timeout": timeout,
             "concurrency": concurrency,
+            "fusion_method": fusion_method,
+            "top_k": top_k,
         },
         "metrics": calculate_metrics(records),
         "records": list(records),
@@ -634,6 +762,16 @@ def _temperature_setting(name: str, value: Any) -> float:
     return float(value)
 
 
+def _fusion_method_setting(name: str, value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"configuration value '{name}' must be a non-empty string")
+    normalized = value.strip().lower()
+    if normalized not in FUSION_METHODS:
+        supported = ", ".join(sorted(FUSION_METHODS))
+        raise ValueError(f"configuration value '{name}' must be one of: {supported}")
+    return normalized
+
+
 def _resolve_llm_config(args: argparse.Namespace, config: Mapping[str, Any]) -> LLMConfig:
     llm_section = _config_section(config, "llm")
     configured_key_env = llm_section.get("api_key_env")
@@ -670,6 +808,9 @@ def resolve_query_generation_config(args: argparse.Namespace) -> QueryGeneration
     method = normalize_query_method(
         _first_defined(args.method, generation_section.get("method"), "baseline")
     )
+    prompt_file = _first_defined(args.prompt_file, generation_section.get("prompt_file"))
+    if method == CUSTOM_METHOD and not prompt_file:
+        raise ValueError("query_generation.prompt_file is required when method is 'custom'")
     return QueryGenerationConfig(
         input_path=_string_setting(
             "query_generation.input_path",
@@ -685,6 +826,7 @@ def resolve_query_generation_config(args: argparse.Namespace) -> QueryGeneration
             "query_generation.concurrency",
             _first_defined(args.concurrency, generation_section.get("concurrency"), 1),
         ),
+        prompt_file=prompt_file,
     )
 
 
@@ -713,6 +855,14 @@ def resolve_retrieval_config(args: argparse.Namespace) -> RetrievalConfig:
         concurrency=_integer_setting(
             "retrieval.concurrency",
             _first_defined(args.concurrency, retrieval_section.get("concurrency"), 1),
+        ),
+        fusion_method=_fusion_method_setting(
+            "retrieval.fusion_method",
+            _first_defined(args.fusion_method, retrieval_section.get("fusion_method"), DEFAULT_FUSION_METHOD),
+        ),
+        top_k=_integer_setting(
+            "retrieval.top_k",
+            _first_defined(args.top_k, retrieval_section.get("top_k"), DEFAULT_TOP_K),
         ),
     )
 
@@ -751,10 +901,24 @@ def parse_args(
         "--method",
         type=normalize_query_method,
         choices=SUPPORTED_QUERY_METHODS,
-        help="Override query_generation.method for the generate stage (baseline or method_v1)",
+        help="Override query_generation.method for the generate stage (baseline, method_v1, multi_query, or custom)",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        help="Path to a custom prompt template (required when --method custom is used)",
     )
     parser.add_argument("--retrieval-url", help="Override retrieval.url for the retrieve stage")
     parser.add_argument("--timeout", type=float, help="Override retrieval.timeout for the retrieve stage")
+    parser.add_argument(
+        "--fusion-method",
+        choices=sorted(FUSION_METHODS),
+        help="Override retrieval.fusion_method for the retrieve stage (round_robin or score)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        help="Override retrieval.top_k for the retrieve stage",
+    )
     args = parser.parse_args(argv)
     if forced_stage is not None:
         args.stage = forced_stage
@@ -764,7 +928,8 @@ def parse_args(
 def _run_generate(args: argparse.Namespace) -> int:
     config = resolve_query_generation_config(args)
     config.llm.validate()
-    records = QueryGenerationRunner(create_query_generator(config.llm, config.method)).generate(
+    generator = create_query_generator(config.llm, config.method, prompt_file=config.prompt_file)
+    records = QueryGenerationRunner(generator).generate(
         load_dialogue_samples(config.input_path),
         concurrency=config.concurrency,
         progress=True,
@@ -775,6 +940,7 @@ def _run_generate(args: argparse.Namespace) -> int:
         model_name=config.llm.model_name,
         concurrency=config.concurrency,
         method=config.method,
+        prompt_file=config.prompt_file,
     )
     write_json_atomically(artifact, config.output_path)
     summary = artifact["summary"]
@@ -789,7 +955,11 @@ def _run_generate(args: argparse.Namespace) -> int:
 
 def _run_retrieve(args: argparse.Namespace) -> int:
     config = resolve_retrieval_config(args)
-    records = RetrievalEvaluator(SearchRetriever(config.url, config.timeout)).evaluate(
+    records = RetrievalEvaluator(
+        SearchRetriever(config.url, config.timeout),
+        fusion_method=config.fusion_method,
+        top_k=config.top_k,
+    ).evaluate(
         load_generated_query_records(config.input_path),
         concurrency=config.concurrency,
         progress=True,
@@ -800,6 +970,8 @@ def _run_retrieve(args: argparse.Namespace) -> int:
         retrieval_url=config.url,
         timeout=config.timeout,
         concurrency=config.concurrency,
+        fusion_method=config.fusion_method,
+        top_k=config.top_k,
     )
     write_json_atomically(artifact, config.output_path)
     metrics = artifact["metrics"]
@@ -826,7 +998,9 @@ def _run_all(args: argparse.Namespace) -> int:
     generation_config = resolve_query_generation_config(generation_args)
     generation_config.llm.validate()
     generated_records = QueryGenerationRunner(
-        create_query_generator(generation_config.llm, generation_config.method)
+        create_query_generator(
+            generation_config.llm, generation_config.method, prompt_file=generation_config.prompt_file
+        )
     ).generate(
         load_dialogue_samples(generation_config.input_path),
         concurrency=generation_config.concurrency,
@@ -838,6 +1012,7 @@ def _run_all(args: argparse.Namespace) -> int:
         model_name=generation_config.llm.model_name,
         concurrency=generation_config.concurrency,
         method=generation_config.method,
+        prompt_file=generation_config.prompt_file,
     )
     write_json_atomically(query_artifact, generation_config.output_path)
 
@@ -854,7 +1029,9 @@ def _run_all(args: argparse.Namespace) -> int:
         input_path=generation_config.output_path,
     )
     retrieval_records = RetrievalEvaluator(
-        SearchRetriever(retrieval_config.url, retrieval_config.timeout)
+        SearchRetriever(retrieval_config.url, retrieval_config.timeout),
+        fusion_method=retrieval_config.fusion_method,
+        top_k=retrieval_config.top_k,
     ).evaluate(
         load_generated_query_records(retrieval_config.input_path),
         concurrency=retrieval_config.concurrency,
@@ -866,6 +1043,8 @@ def _run_all(args: argparse.Namespace) -> int:
         retrieval_url=retrieval_config.url,
         timeout=retrieval_config.timeout,
         concurrency=retrieval_config.concurrency,
+        fusion_method=retrieval_config.fusion_method,
+        top_k=retrieval_config.top_k,
     )
     write_json_atomically(retrieval_artifact, retrieval_config.output_path)
 

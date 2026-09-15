@@ -1,10 +1,15 @@
 # Query Rewrite Evaluation
 
 This repository evaluates a query rewriting strategy against the case
-retrieval service. It currently includes two prompt methods:
+retrieval service. It currently includes four prompt methods:
 
 - `baseline`: one-shot generation using `prompt.BASELINE_PROMPT`;
-- `method_v1`: the improved prompt in `prompt.METHOD_V1_PROMPT`.
+- `method_v1`: the improved prompt in `prompt.METHOD_V1_PROMPT`;
+- `multi_query`: generates up to three queries per dialogue using
+  `prompt.MULTI_QUERY_PROMPT`, retrieves each in parallel, and fuses the
+  results (see [Multi-query retrieval fusion](#multi-query-retrieval-fusion));
+- `custom`: a one-shot method backed by your own prompt template file (see
+  [Using a custom prompt file](#using-a-custom-prompt-file)).
 
 ## Installation
 
@@ -35,10 +40,17 @@ are independent stages, with independent input/output paths and concurrency:
     "output_path": "results/baseline.json",
     "url": "http://10.67.43.14:8276/run_case_retrieval",
     "timeout": 30,
-    "concurrency": 8
+    "concurrency": 8,
+    "fusion_method": "round_robin",
+    "top_k": 10
   }
 }
 ```
+
+`retrieval.fusion_method` and `retrieval.top_k` only take effect for samples
+whose query artifact record has more than one `queries` entry (i.e. generated
+with `multi_query`); single-query records always retrieve and evaluate
+exactly as before.
 
 By default the key is read from the environment variable named by
 `llm.api_key_env`:
@@ -88,12 +100,79 @@ one stage:
 ```bash
 python generate_queries.py --config configs/experiment-a.json --concurrency 4
 python retrieve_cases.py --concurrency 8 --output results/experiment-a.json
+python retrieve_cases.py --fusion-method score --top-k 5
 ```
 
 For the LLM settings, resolution priority is command-line option, then
-config-file value, then environment variable. Both prompt methods include
+config-file value, then environment variable. All three prompt methods include
 `extra_body={"chat_template_kwargs": {"enable_thinking": false}}` on every
 model request.
+
+## Multi-query retrieval fusion
+
+`--method multi_query` asks the model to propose up to three queries per
+dialogue, each focused on a different angle (e.g. "电脑坏了怎么修理" and
+"联系资产管理员" for the same conversation). During retrieval, every query for
+a sample is sent to the retrieval service concurrently, and the resulting
+traces are fused into one `retrieval_trace` before Recall@K is calculated.
+Two fusion strategies are supported via `retrieval.fusion_method`
+(or `--fusion-method`):
+
+- `round_robin` (default): interleaves the per-query traces in their original
+  rank order, taking the next not-yet-seen case from each query's list in
+  turn, until `top_k` results are collected or every list is exhausted. This
+  favors spreading results evenly across the different query angles.
+- `score`: deduplicates by `case_id`, keeping each case's highest `score`
+  across all queries, then sorts the merged list by score descending.
+
+`retrieval.top_k` (default `10`, override with `--top-k`) caps how many fused
+results are kept; ranks in the fused trace are renumbered starting at 1.
+
+If one of a sample's queries fails to retrieve (e.g. a timeout) while at
+least one other succeeds, the sample is still evaluated using the successful
+queries' fused results, and `retrieval_status` is set to `"partial_success"`
+(the failed query's error is kept in `retrieval_error`). Only when every
+query for a sample fails is the sample marked `retrieval_status: "failed"`.
+
+## Using a custom prompt file
+
+To try a prompt without editing `prompt.py`, set `query_generation.method` to
+`custom` and point `query_generation.prompt_file` (or `--prompt-file`) at a
+text file:
+
+```json
+{
+  "query_generation": {
+    "method": "custom",
+    "prompt_file": "prompts/my_experiment.txt",
+    "input_path": "data/dialog_example.json",
+    "output_path": "results/generated_queries.json",
+    "concurrency": 4
+  }
+}
+```
+
+```bash
+python generate_queries.py --method custom --prompt-file prompts/my_experiment.txt
+```
+
+The file must contain the literal `{dialogue}` placeholder, which is replaced
+with the dialogue text before the request is sent (the same substitution used
+by `BASELINE_PROMPT`, `METHOD_V1_PROMPT`, and `MULTI_QUERY_PROMPT`), and it
+must produce the single-query JSON format that `baseline` and `method_v1`
+use, wrapped in a ```` ```json ```` fence or returned directly:
+
+```json
+{"query": "your retrieval query"}
+```
+
+`custom` always goes through the single-query path, so retrieval and fusion
+behave exactly as they do for `baseline`/`method_v1`. `--prompt-file` takes
+precedence over `query_generation.prompt_file` when both are set; missing it
+for the `custom` method is an error before any model call is made. The
+resolved path is recorded (not its contents) under
+`configuration.prompt_file` in the query artifact, so you can tell which
+prompt file produced a given run.
 
 ## Compare baseline and METHOD_V1
 
@@ -154,7 +233,10 @@ or `--cutoff 5` to compare the corresponding recall window.
 
 `query_generation.concurrency` limits concurrent LLM calls, while
 `retrieval.concurrency` limits concurrent retrieval calls.
-`retrieval.timeout` applies to each retrieval request.
+`retrieval.timeout` applies to each retrieval request. For `multi_query`
+records, a sample's own queries are always retrieved concurrently with each
+other regardless of `retrieval.concurrency`, which only limits how many
+samples are processed at once.
 
 No external request is made by installing dependencies or running tests. An
 evaluation run does call both the configured LLM and the retrieval endpoint.
@@ -181,6 +263,10 @@ every input item. Each record retains `sample_index`, `call_sno`,
 `expected_case_id`, `query`, `status`, and `error`. It does not write the full
 dialogue or API key.
 
+For `multi_query`, records also carry a `queries` array (the full list of up
+to three generated queries; `query` is always `queries[0]`, kept for backward
+compatibility). `baseline` and `method_v1` records leave `queries` as `null`.
+
 An input or model error marks only that record as `failed`; all other samples
 continue. The second stage reads this artifact. Failed query records are kept
 in the final output with `retrieval_status: "skipped"` and count as a miss;
@@ -193,10 +279,15 @@ aggregate metrics, and one record per query artifact entry. API keys and full
 case content are never written. Each record stores:
 
 - the generated `query`;
-- ordered `retrieval_trace` entries with only `rank`, `case_id`, and
-  `case_title`;
+- ordered `retrieval_trace` entries with `rank`, `case_id`, `case_title`, and
+  `score` (`null` when the retrieval response omitted it);
 - `query_status`, `retrieval_status`, `matched_rank`, and any per-sample
   query/retrieval error.
+
+`retrieval_status` is `"success"` for a normal single-query retrieval,
+`"partial_success"` when a `multi_query` record fused results from queries
+that partially failed, or `"failed"` when every query for a sample failed
+(see [Multi-query retrieval fusion](#multi-query-retrieval-fusion)).
 
 The retriever collects every numbered key (`top1`, `top2`, and so on) in
 numeric order. It does not assume a fixed result count, so a response with 5,
@@ -206,7 +297,8 @@ model or retrieval requests are retained and count as a miss in recall, while
 
 ## Add an improved strategy
 
-`QueryGenerator` in `gen_query.py` is the sole extension point:
+`QueryGenerator` in `gen_query.py` is the extension point for single-query
+strategies:
 
 ```python
 from gen_query import QueryGenerator
@@ -218,9 +310,25 @@ class ImprovedQueryGenerator(QueryGenerator):
         return "query for case retrieval"
 ```
 
-The generation command uses the implementation automatically. The dataset
-loading, query-file persistence, retrieval tracing, and Recall@K calculation
-can all remain unchanged.
+For strategies that propose several queries per dialogue (like `multi_query`),
+implement `MultiQueryGenerator.generate_queries` instead; `generate()` is
+provided for you and returns the first query:
+
+```python
+from gen_query import MultiQueryGenerator
+
+
+class ImprovedMultiQueryGenerator(MultiQueryGenerator):
+    def generate_queries(self, dialogue: str) -> list[str]:
+        # Call your rewritten-query pipeline here.
+        return ["query angle 1", "query angle 2"]
+```
+
+The generation command uses the implementation automatically: `evaluate.py`
+detects a `MultiQueryGenerator` instance and persists its full `queries` list,
+and the retrieval stage fuses per-query results whenever a record has more
+than one query. The dataset loading, query-file persistence, retrieval
+tracing, and Recall@K calculation can all remain unchanged.
 
 ## Tests
 

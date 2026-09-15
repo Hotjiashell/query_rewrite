@@ -6,12 +6,16 @@ from pathlib import Path
 from evaluate import (
     QUERY_ARTIFACT_TYPE,
     DialogueSample,
+    GeneratedQueryRecord,
     QueryGenerationRunner,
     RetrievalEvaluator,
+    RetrievedCase,
     build_query_artifact,
     build_retrieval_artifact,
     calculate_metrics,
     extract_retrieval_trace,
+    fuse_by_score,
+    fuse_round_robin,
     load_dialogue_samples,
     load_generated_query_records,
     parse_args,
@@ -19,7 +23,7 @@ from evaluate import (
     resolve_retrieval_config,
     write_json_atomically,
 )
-from gen_query import QueryGenerator
+from gen_query import MultiQueryGenerator, QueryGenerator
 
 
 class _StaticGenerator(QueryGenerator):
@@ -89,7 +93,7 @@ class EvaluationTests(unittest.TestCase):
             self.assertIn("service unavailable", records[2]["retrieval_error"])
             self.assertEqual(
                 records[0]["retrieval_trace"][0],
-                {"rank": 1, "case_id": "KT1", "case_title": "第一名"},
+                {"rank": 1, "case_id": "KT1", "case_title": "第一名", "score": None},
             )
 
             artifact = build_retrieval_artifact(
@@ -258,6 +262,330 @@ class EvaluationTests(unittest.TestCase):
         args = parse_args(["generate", "--method", "METHOD_V1_PROMPT"])
 
         self.assertEqual(args.method, "method_v1")
+
+    def test_custom_method_resolves_prompt_file_from_config_and_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "llm": {
+                            "base_url": "http://model",
+                            "model_name": "model-a",
+                            "api_key": "test-key",
+                        },
+                        "query_generation": {
+                            "method": "custom",
+                            "input_path": "dialogs.json",
+                            "output_path": "queries.json",
+                            "prompt_file": "prompts/from_config.txt",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            from_config = resolve_query_generation_config(
+                parse_args(["generate", "--config", str(config_path)])
+            )
+            overridden = resolve_query_generation_config(
+                parse_args(
+                    [
+                        "generate",
+                        "--config",
+                        str(config_path),
+                        "--prompt-file",
+                        "prompts/from_cli.txt",
+                    ]
+                )
+            )
+
+        self.assertEqual(from_config.method, "custom")
+        self.assertEqual(from_config.prompt_file, "prompts/from_config.txt")
+        self.assertEqual(overridden.prompt_file, "prompts/from_cli.txt")
+
+    def test_custom_method_without_prompt_file_raises(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "llm": {
+                            "base_url": "http://model",
+                            "model_name": "model-a",
+                            "api_key": "test-key",
+                        },
+                        "query_generation": {
+                            "method": "custom",
+                            "input_path": "dialogs.json",
+                            "output_path": "queries.json",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = parse_args(["generate", "--config", str(config_path)])
+            with self.assertRaises(ValueError):
+                resolve_query_generation_config(args)
+
+
+def _case(case_id, rank, score=None, title=""):
+    return RetrievedCase(rank=rank, case_id=case_id, case_title=title, score=score)
+
+
+class FusionTests(unittest.TestCase):
+    def test_round_robin_interleaves_and_dedupes(self):
+        traces = [
+            [_case("A", 1), _case("B", 2), _case("C", 3)],
+            [_case("B", 1), _case("D", 2)],
+        ]
+        fused = fuse_round_robin(traces, top_k=10)
+
+        # Round 1: trace0 contributes A, trace1 contributes B.
+        # Round 2: trace0 skips the already-seen B and contributes C, trace1 contributes D.
+        self.assertEqual([case.case_id for case in fused], ["A", "B", "C", "D"])
+        self.assertEqual([case.rank for case in fused], [1, 2, 3, 4])
+
+    def test_round_robin_respects_top_k(self):
+        traces = [[_case("A", 1), _case("B", 2)], [_case("C", 1), _case("D", 2)]]
+        fused = fuse_round_robin(traces, top_k=2)
+
+        self.assertEqual([case.case_id for case in fused], ["A", "C"])
+
+    def test_score_fusion_dedupes_keeping_highest_score_and_sorts_desc(self):
+        traces = [
+            [_case("A", 1, score=0.5), _case("B", 2, score=0.9)],
+            [_case("A", 1, score=0.8), _case("C", 2, score=0.4)],
+        ]
+        fused = fuse_by_score(traces, top_k=10)
+
+        self.assertEqual([case.case_id for case in fused], ["B", "A", "C"])
+        self.assertEqual([case.rank for case in fused], [1, 2, 3])
+        self.assertEqual(next(c for c in fused if c.case_id == "A").score, 0.8)
+
+    def test_score_fusion_treats_missing_score_as_lowest(self):
+        traces = [[_case("A", 1, score=None), _case("B", 2, score=0.1)]]
+        fused = fuse_by_score(traces, top_k=10)
+
+        self.assertEqual([case.case_id for case in fused], ["B", "A"])
+
+    def test_score_fusion_respects_top_k(self):
+        traces = [[_case("A", 1, score=0.9), _case("B", 2, score=0.5), _case("C", 3, score=0.1)]]
+        fused = fuse_by_score(traces, top_k=2)
+
+        self.assertEqual([case.case_id for case in fused], ["A", "B"])
+
+
+class _MultiQueryRetriever:
+    """Retriever whose response depends on which of the known queries was sent."""
+
+    def __init__(self, responses, failing_queries=()):
+        self._responses = responses
+        self._failing_queries = set(failing_queries)
+
+    def retrieve(self, query):
+        if query in self._failing_queries:
+            raise RuntimeError(f"retrieval failed for {query}")
+        return self._responses[query]
+
+
+def _retrieval_response(*cases):
+    return {
+        "retrieval_result": {
+            f"top{rank}": {"case_id": case_id, "case_title": title, "score": score}
+            for rank, (case_id, title, score) in enumerate(cases, start=1)
+        }
+    }
+
+
+class MultiQueryRetrievalTests(unittest.TestCase):
+    def test_evaluate_query_fuses_multiple_queries_with_round_robin(self):
+        retriever = _MultiQueryRetriever(
+            {
+                "q1": _retrieval_response(("KT1", "案例1", 0.9), ("KT2", "案例2", 0.8)),
+                "q2": _retrieval_response(("KT2", "案例2", 0.7), ("KT3", "案例3", 0.6)),
+            }
+        )
+        record = GeneratedQueryRecord(
+            sample_index=0,
+            call_sno="1",
+            expected_case_id="KT3",
+            query="q1",
+            status="success",
+            error=None,
+            queries=["q1", "q2"],
+        )
+        result = RetrievalEvaluator(retriever, fusion_method="round_robin", top_k=10).evaluate_query(record)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["retrieval_status"], "success")
+        self.assertEqual([c["case_id"] for c in result["retrieval_trace"]], ["KT1", "KT2", "KT3"])
+        self.assertEqual(result["matched_rank"], 3)
+
+    def test_evaluate_query_fuses_multiple_queries_with_score(self):
+        retriever = _MultiQueryRetriever(
+            {
+                "q1": _retrieval_response(("KT1", "案例1", 0.5)),
+                "q2": _retrieval_response(("KT2", "案例2", 0.9)),
+            }
+        )
+        record = GeneratedQueryRecord(
+            sample_index=0,
+            call_sno="1",
+            expected_case_id="KT2",
+            query="q1",
+            status="success",
+            error=None,
+            queries=["q1", "q2"],
+        )
+        result = RetrievalEvaluator(retriever, fusion_method="score", top_k=10).evaluate_query(record)
+
+        self.assertEqual([c["case_id"] for c in result["retrieval_trace"]], ["KT2", "KT1"])
+        self.assertEqual(result["matched_rank"], 1)
+
+    def test_evaluate_query_tolerates_partial_query_failure(self):
+        retriever = _MultiQueryRetriever(
+            {"q1": _retrieval_response(("KT1", "案例1", 0.5)), "q2": None},
+            failing_queries=["q2"],
+        )
+        record = GeneratedQueryRecord(
+            sample_index=0,
+            call_sno="1",
+            expected_case_id="KT1",
+            query="q1",
+            status="success",
+            error=None,
+            queries=["q1", "q2"],
+        )
+        result = RetrievalEvaluator(retriever).evaluate_query(record)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["retrieval_status"], "partial_success")
+        self.assertIn("q2", result["retrieval_error"])
+        self.assertEqual(result["matched_rank"], 1)
+
+    def test_evaluate_query_fails_when_all_queries_fail(self):
+        retriever = _MultiQueryRetriever({}, failing_queries=["q1", "q2"])
+        record = GeneratedQueryRecord(
+            sample_index=0,
+            call_sno="1",
+            expected_case_id="KT1",
+            query="q1",
+            status="success",
+            error=None,
+            queries=["q1", "q2"],
+        )
+        result = RetrievalEvaluator(retriever).evaluate_query(record)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["retrieval_status"], "failed")
+
+    def test_single_query_record_behaves_like_before(self):
+        retriever = _MultiQueryRetriever({"q1": _retrieval_response(("KT1", "案例1", 0.5))})
+        record = GeneratedQueryRecord(
+            sample_index=0,
+            call_sno="1",
+            expected_case_id="KT1",
+            query="q1",
+            status="success",
+            error=None,
+            queries=None,
+        )
+        result = RetrievalEvaluator(retriever).evaluate_query(record)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["retrieval_status"], "success")
+        self.assertEqual(result["matched_rank"], 1)
+
+    def test_generation_runner_uses_multi_query_generator_when_available(self):
+        class _StaticMultiGenerator(MultiQueryGenerator):
+            def generate_queries(self, dialogue):
+                return ["q1", "q2"]
+
+        sample = DialogueSample(0, "1", "dialogue", "KT1")
+        record = QueryGenerationRunner(_StaticMultiGenerator()).generate_sample(sample)
+
+        self.assertEqual(record.status, "success")
+        self.assertEqual(record.query, "q1")
+        self.assertEqual(record.queries, ["q1", "q2"])
+
+
+class RetrievalConfigFusionTests(unittest.TestCase):
+    def test_resolve_retrieval_config_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "retrieval": {
+                            "input_path": "queries.json",
+                            "output_path": "results.json",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = parse_args(["retrieve", "--config", str(config_path)])
+            config = resolve_retrieval_config(args)
+
+        self.assertEqual(config.fusion_method, "round_robin")
+        self.assertEqual(config.top_k, 10)
+
+    def test_resolve_retrieval_config_reads_config_and_cli_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "retrieval": {
+                            "input_path": "queries.json",
+                            "output_path": "results.json",
+                            "fusion_method": "score",
+                            "top_k": 5,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            from_config = resolve_retrieval_config(
+                parse_args(["retrieve", "--config", str(config_path)])
+            )
+            overridden = resolve_retrieval_config(
+                parse_args(
+                    [
+                        "retrieve",
+                        "--config",
+                        str(config_path),
+                        "--fusion-method",
+                        "round_robin",
+                        "--top-k",
+                        "3",
+                    ]
+                )
+            )
+
+        self.assertEqual(from_config.fusion_method, "score")
+        self.assertEqual(from_config.top_k, 5)
+        self.assertEqual(overridden.fusion_method, "round_robin")
+        self.assertEqual(overridden.top_k, 3)
+
+    def test_resolve_retrieval_config_rejects_unknown_fusion_method(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "retrieval": {
+                            "input_path": "queries.json",
+                            "output_path": "results.json",
+                            "fusion_method": "unknown",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = parse_args(["retrieve", "--config", str(config_path)])
+            with self.assertRaises(ValueError):
+                resolve_retrieval_config(args)
 
 
 if __name__ == "__main__":
