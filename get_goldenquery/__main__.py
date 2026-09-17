@@ -31,7 +31,7 @@ DEFAULT_GOLDEN_TOP_K = 5
 
 INITIAL_PROMPT = """你是企业知识库检索 query 设计专家。
 请根据【用户对话】和它应命中的【目标案例】，生成一条最可能让检索系统召回该目标案例的中文检索 query。
-query 应保留案例中有区分度的业务对象、故障/诉求、条件和关键术语；不要提及“案例”“caseID”“目标案例”，不要照抄整段对话，也不要输出解释。
+query不要提及“案例”“caseID”“目标案例”，不要照抄整段对话，也不要输出解释。
 
 【用户对话】
 {dialogue}
@@ -39,13 +39,10 @@ query 应保留案例中有区分度的业务对象、故障/诉求、条件和�
 【目标案例标题】
 {case_title}
 
-【目标案例内容】
-{case_content}
-
 只输出 JSON：{{"query": "..."}}"""
 
 RETRY_PROMPT = """你正在为企业知识库检索系统优化 query。当前 query 没有在 Top-{top_k} 中召回目标案例。
-请结合用户对话、目标案例和本次真实检索结果，判断遗漏或混淆的关键检索词，并生成一条不同的、更具体的中文 query。
+请结合用户对话、目标案例和本次真实检索结果，判断遗漏或混淆的关键检索词，并生成一条不同的、更能检索到目标案例的中文 query。
 不要提及“案例”“caseID”“目标案例”，不要输出解释。
 
 【用户对话】
@@ -53,9 +50,6 @@ RETRY_PROMPT = """你正在为企业知识库检索系统优化 query。当前 q
 
 【目标案例标题】
 {case_title}
-
-【目标案例内容】
-{case_content}
 
 【上一轮 query】
 {previous_query}
@@ -75,7 +69,6 @@ class Retriever(Protocol):
 class GoldenCase:
     case_id: str
     title: str
-    content: str
 
 
 @dataclass(frozen=True)
@@ -99,7 +92,7 @@ def _normalise_string(value: Any) -> str | None:
 
 
 def load_cases(path: str | Path) -> dict[str, GoldenCase]:
-    """Load ``{caseID: {case_name, text}}`` data, accepting common aliases."""
+    """Load case IDs and titles, accepting common title-field aliases."""
 
     source = Path(path)
     try:
@@ -125,9 +118,8 @@ def load_cases(path: str | Path) -> dict[str, GoldenCase]:
             continue
         case_id = _normalise_string(raw_id or item.get("caseID") or item.get("case_id"))
         title = _normalise_string(item.get("case_name") or item.get("case_title") or item.get("title"))
-        content = _normalise_string(item.get("text") or item.get("content"))
-        if case_id and title and content:
-            cases[case_id] = GoldenCase(case_id, title, content)
+        if case_id and title:
+            cases[case_id] = GoldenCase(case_id, title)
     return cases
 
 
@@ -148,16 +140,12 @@ def _format_trace(response: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Preserve all returned ranks so final Recall@K is not capped by feedback Top-K."""
 
     trace = extract_retrieval_trace(response)
-    raw_results = response.get("retrieval_result", {})
     records: list[dict[str, Any]] = []
     for item in trace:
-        raw = raw_results.get(f"top{item.rank}", {}) if isinstance(raw_results, Mapping) else {}
         records.append({
             "rank": item.rank,
             "case_id": item.case_id,
             "case_title": item.case_title,
-            "content": str(raw.get("content") or "") if isinstance(raw, Mapping) else "",
-            "score": item.score,
         })
     return records
 
@@ -166,7 +154,7 @@ def _trace_for_prompt(trace: Sequence[Mapping[str, Any]]) -> str:
     if not trace:
         return "（检索服务未返回有效结果）"
     return "\n\n".join(
-        f"Top {item['rank']}\n标题：{item['case_title']}\n内容：{item['content']}\n分数：{item['score']}"
+        f"Top {item['rank']}\n标题：{item['case_title']}"
         for item in trace
     )
 
@@ -192,7 +180,7 @@ class GoldenQueryRunner:
         if sample.input_error:
             return record
         if case is None:
-            record["error"] = f"MissingGoldenCase: no complete case data for {sample.expected_case_id!r}"
+            record["error"] = f"MissingGoldenCase: no case title for {sample.expected_case_id!r}"
             return record
 
         query: str | None = None
@@ -201,13 +189,12 @@ class GoldenQueryRunner:
             try:
                 if attempt_number == 0:
                     prompt = INITIAL_PROMPT.format(
-                        dialogue=sample.dialogue, case_title=case.title, case_content=case.content
+                        dialogue=sample.dialogue, case_title=case.title
                     )
                 else:
                     prompt = RETRY_PROMPT.format(
                         dialogue=sample.dialogue,
                         case_title=case.title,
-                        case_content=case.content,
                         previous_query=query,
                         top_k=self._config.top_k,
                         retrieval_results=_trace_for_prompt(previous_trace),

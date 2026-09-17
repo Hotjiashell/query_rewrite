@@ -72,9 +72,9 @@ class GoldenQueryTests(unittest.TestCase):
             concurrency=1,
         )
         self.sample = DialogueSample(0, "call-1", "用户：无法连接网络", "KT1")
-        self.case = GoldenCase("KT1", "网络无法连接", "检查网络配置和连接状态")
+        self.case = GoldenCase("KT1", "网络无法连接")
 
-    def test_first_query_hit_is_returned_with_trace_content(self):
+    def test_first_query_hit_returns_title_only_trace(self):
         client = _Client(['{"query": "网络连接配置"}'])
         retriever = _Retriever({"网络连接配置": _response("KT1", "KT2")})
 
@@ -84,7 +84,8 @@ class GoldenQueryTests(unittest.TestCase):
         self.assertEqual(record["final_query"], "网络连接配置")
         self.assertEqual(record["matched_rank"], 1)
         self.assertEqual(len(record["attempts"]), 1)
-        self.assertEqual(record["attempts"][0]["retrieval_trace"][0]["content"], "内容 KT1")
+        self.assertEqual(record["attempts"][0]["retrieval_trace"][0]["case_title"], "标题 KT1")
+        self.assertNotIn("content", record["attempts"][0]["retrieval_trace"][0])
 
     def test_retry_receives_actual_top_results_and_can_hit(self):
         client = _Client(['{"query": "网络问题"}', '{"query": "网络连接配置"}'])
@@ -99,17 +100,21 @@ class GoldenQueryTests(unittest.TestCase):
         self.assertEqual(record["matched_rank"], 2)
         self.assertEqual([attempt["query"] for attempt in record["attempts"]], ["网络问题", "网络连接配置"])
         retry_prompt = client.chat.completions.calls[1]["messages"][0]["content"]
+        initial_prompt = client.chat.completions.calls[0]["messages"][0]["content"]
         self.assertIn("标题 KT2", retry_prompt)
-        self.assertIn("内容 KT3", retry_prompt)
+        self.assertIn("标题 KT3", retry_prompt)
         self.assertIn("网络问题", retry_prompt)
+        self.assertNotIn("内容 KT2", retry_prompt)
+        self.assertNotIn("内容 KT3", retry_prompt)
+        self.assertNotIn("内容 KT1", initial_prompt)
 
     def test_load_cases_accepts_mapping_format(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "cases.json"
-            path.write_text(json.dumps({"KT1": {"case_name": "标题", "text": "正文"}}), encoding="utf-8")
+            path.write_text(json.dumps({"KT1": {"case_name": "标题"}}), encoding="utf-8")
             cases = load_cases(path)
 
-        self.assertEqual(cases["KT1"], GoldenCase("KT1", "标题", "正文"))
+        self.assertEqual(cases["KT1"], GoldenCase("KT1", "标题"))
 
     def test_summary_reports_recall_at_all_requested_cutoffs(self):
         summary = calculate_summary([

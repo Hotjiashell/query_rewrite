@@ -1,7 +1,7 @@
 # Golden Query Generation
 
 For every dialogue, this command gives the LLM the dialogue and its labelled
-case's title and content. It retrieves the generated query immediately. When
+case's title only. It retrieves the generated query immediately. When
 the labelled case is absent from Top-5 by default, the exact returned Top-5 cases are
 fed back to the LLM for a revised query, up to `max_retries` revisions.
 
@@ -22,9 +22,10 @@ python -m get_goldenquery \
 The dialogue file follows `evaluate.py` (`chat_content`, `caseID`, and optional
 `call_sno`). The case file may be a mapping such as
 `{"KT000001": {"case_name": "...", "text": "..."}}`, or a list with
-`caseID`/`case_id`, title, and content fields. The result file contains the
-final query and all attempts, including the full Top-K content supplied to the
-retry prompt. A sample succeeds only when its labelled case ID is in Top-K.
+`caseID`/`case_id` and a title field. Case text/content is ignored. The result
+file contains the final query and all attempts, including the Top-K titles
+supplied to the retry prompt. A sample succeeds only when its labelled case ID
+is in Top-K.
 The terminal displays real-time completion, Top-K hits, and failures. The final
 `summary` includes `hits_at_1/3/5/10` and `recall_at_1/3/5/10`, calculated
 from the last query for every input sample.
