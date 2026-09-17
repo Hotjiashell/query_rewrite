@@ -1,0 +1,18 @@
+{
+  "llm": {
+    "base_url": "https://your-llm.example/v1",
+    "model_name": "your-model-name",
+    "api_key_env": "OPENAI_API_KEY",
+    "temperature": 0
+  },
+  "golden_query": {
+    "dialogue_path": "data/dialog_example.json",
+    "case_path": "data/case_example.json",
+    "output_path": "results/golden_queries.json",
+    "retrieval_url": "http://10.67.43.14:8276/run_case_retrieval",
+    "timeout": 30,
+    "max_retries": 3,
+    "top_k": 10,
+    "concurrency": 1
+  }
+}
