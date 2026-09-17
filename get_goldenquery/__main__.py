@@ -21,11 +21,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
-from evaluate import DEFAULT_TOP_K, SearchRetriever, extract_retrieval_trace, load_dialogue_samples, write_json_atomically
+from evaluate import SearchRetriever, extract_retrieval_trace, load_dialogue_samples, write_json_atomically
 from gen_query import LLMConfig, build_openai_client, extract_query
 
 
 ARTIFACT_TYPE = "golden_query_generation"
+METRIC_CUTOFFS = (1, 3, 5, 10)
+DEFAULT_GOLDEN_TOP_K = 5
 
 INITIAL_PROMPT = """你是企业知识库检索 query 设计专家。
 请根据【用户对话】和它应命中的【目标案例】，生成一条最可能让检索系统召回该目标案例的中文检索 query。
@@ -142,8 +144,10 @@ def _call_model(client: Any, config: LLMConfig, prompt: str) -> str:
         raise RuntimeError("model response has no first message content") from exc
 
 
-def _format_trace(response: Mapping[str, Any], top_k: int) -> tuple[list[dict[str, Any]], int | None]:
-    trace = extract_retrieval_trace(response)[:top_k]
+def _format_trace(response: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Preserve all returned ranks so final Recall@K is not capped by feedback Top-K."""
+
+    trace = extract_retrieval_trace(response)
     raw_results = response.get("retrieval_result", {})
     records: list[dict[str, Any]] = []
     for item in trace:
@@ -155,7 +159,7 @@ def _format_trace(response: Mapping[str, Any], top_k: int) -> tuple[list[dict[st
             "content": str(raw.get("content") or "") if isinstance(raw, Mapping) else "",
             "score": item.score,
         })
-    return records, None
+    return records
 
 
 def _trace_for_prompt(trace: Sequence[Mapping[str, Any]]) -> str:
@@ -210,22 +214,25 @@ class GoldenQueryRunner:
                     )
                 query = _call_model(self._client, self._config.llm, prompt)
                 response = self._retriever.retrieve(query)
-                trace, _ = _format_trace(response, self._config.top_k)
-                matched_rank = next((item["rank"] for item in trace if item["case_id"] == case.case_id), None)
+                full_trace = _format_trace(response)
+                feedback_trace = full_trace[: self._config.top_k]
+                matched_rank = next((item["rank"] for item in full_trace if item["case_id"] == case.case_id), None)
+                passed = matched_rank is not None and matched_rank <= self._config.top_k
                 record["attempts"].append({
                     "attempt": attempt_number + 1,
                     "query": query,
-                    "retrieval_trace": trace,
+                    "retrieval_trace": feedback_trace,
+                    "retrieval_matched_rank": matched_rank,
                     "matched_rank": matched_rank,
                     "error": None,
                 })
                 record["final_query"] = query
                 record["matched_rank"] = matched_rank
-                if matched_rank is not None:
+                if passed:
                     record["status"] = "success"
                     record["error"] = None
                     return record
-                previous_trace = trace
+                previous_trace = feedback_trace
             except Exception as exc:
                 record["attempts"].append({
                     "attempt": attempt_number + 1,
@@ -239,14 +246,77 @@ class GoldenQueryRunner:
         record["error"] = f"NotRetrieved: target case was absent from Top-{self._config.top_k} after {self._config.max_retries + 1} attempts"
         return record
 
-    def run(self, samples: Sequence[Any], cases: Mapping[str, GoldenCase]) -> list[dict[str, Any]]:
+    def run(
+        self,
+        samples: Sequence[Any],
+        cases: Mapping[str, GoldenCase],
+        *,
+        progress: bool = False,
+    ) -> list[dict[str, Any]]:
         if self._config.concurrency < 1:
             raise ValueError("concurrency must be at least 1")
+        total = len(samples)
+        completed = 0
+        successful = 0
+        failed = 0
         if self._config.concurrency == 1:
-            return [self.run_sample(sample, cases.get(sample.expected_case_id or "")) for sample in samples]
+            records: list[dict[str, Any]] = []
+            for sample in samples:
+                record = self.run_sample(sample, cases.get(sample.expected_case_id or ""))
+                records.append(record)
+                completed += 1
+                successful += record["status"] == "success"
+                failed += record["status"] != "success"
+                if progress:
+                    _print_progress(completed, total, successful, failed)
+            return records
         with ThreadPoolExecutor(max_workers=self._config.concurrency) as executor:
             futures = [executor.submit(self.run_sample, sample, cases.get(sample.expected_case_id or "")) for sample in samples]
-            return sorted((future.result() for future in as_completed(futures)), key=lambda item: item["sample_index"])
+            records: list[dict[str, Any]] = []
+            for future in as_completed(futures):
+                record = future.result()
+                records.append(record)
+                completed += 1
+                successful += record["status"] == "success"
+                failed += record["status"] != "success"
+                if progress:
+                    _print_progress(completed, total, successful, failed)
+            return sorted(records, key=lambda item: item["sample_index"])
+
+
+def _print_progress(completed: int, total: int, successful: int, failed: int) -> None:
+    """Show batch progress on stderr without adding a progress-bar dependency."""
+
+    percentage = 100.0 if total == 0 else completed / total * 100
+    print(
+        f"\r[golden-query] {completed}/{total} ({percentage:5.1f}%) "
+        f"hit_top_k={successful} failed={failed}",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
+    if completed >= total:
+        print(file=sys.stderr)
+
+
+def calculate_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, int | float]:
+    """Calculate final-query Recall@1/3/5/10 over every input sample."""
+
+    total = len(records)
+    successful = sum(record.get("status") == "success" for record in records)
+    summary: dict[str, int | float] = {
+        "total_samples": total,
+        "successful_samples": successful,
+        "failed_samples": total - successful,
+    }
+    for cutoff in METRIC_CUTOFFS:
+        hits = sum(
+            isinstance(record.get("matched_rank"), int) and record["matched_rank"] <= cutoff
+            for record in records
+        )
+        summary[f"hits_at_{cutoff}"] = hits
+        summary[f"recall_at_{cutoff}"] = hits / total if total else 0.0
+    return summary
 
 
 def _read_config(path: str | None) -> Mapping[str, Any]:
@@ -278,7 +348,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--retrieval-url")
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--max-retries", type=int, help="number of revisions after the initial query")
-    parser.add_argument("--top-k", type=int, help="Top-K used for pass/fail and feedback")
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        help=f"Top-K used for pass/fail and feedback (default: {DEFAULT_GOLDEN_TOP_K})",
+    )
     parser.add_argument("--concurrency", type=int)
     return parser.parse_args(argv)
 
@@ -305,7 +379,7 @@ def resolve_config(args: argparse.Namespace) -> GoldenQueryConfig:
         retrieval_url=str(args.retrieval_url or section.get("retrieval_url") or "http://10.67.43.14:8276/run_case_retrieval"),
         timeout=float(args.timeout if args.timeout is not None else section.get("timeout", 30.0)),
         max_retries=int(args.max_retries if args.max_retries is not None else section.get("max_retries", 3)),
-        top_k=int(args.top_k if args.top_k is not None else section.get("top_k", DEFAULT_TOP_K)),
+        top_k=int(args.top_k if args.top_k is not None else section.get("top_k", DEFAULT_GOLDEN_TOP_K)),
         concurrency=int(args.concurrency if args.concurrency is not None else section.get("concurrency", 1)),
     )
     if cfg.max_retries < 0 or cfg.top_k < 1 or cfg.concurrency < 1 or cfg.timeout <= 0:
@@ -319,8 +393,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = resolve_config(parse_args(argv))
         records = GoldenQueryRunner(
             build_openai_client(config.llm), config, SearchRetriever(config.retrieval_url, config.timeout)
-        ).run(load_dialogue_samples(config.dialogue_path), load_cases(config.case_path))
-        successful = sum(record["status"] == "success" for record in records)
+        ).run(load_dialogue_samples(config.dialogue_path), load_cases(config.case_path), progress=True)
+        summary = calculate_summary(records)
         write_json_atomically({
             "schema_version": 1,
             "artifact_type": ARTIFACT_TYPE,
@@ -331,10 +405,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "max_retries": config.max_retries, "top_k": config.top_k,
                 "concurrency": config.concurrency, "model_name": config.llm.model_name,
             },
-            "summary": {"total_samples": len(records), "successful_samples": successful, "failed_samples": len(records) - successful},
+            "summary": summary,
             "records": records,
         }, config.output_path)
-        print(f"Golden query generation complete: success={successful}/{len(records)} output={config.output_path}")
+        print(
+            "Golden query generation complete: "
+            f"Top-{config.top_k} hit={summary['successful_samples']}/{summary['total_samples']} "
+            f"R@1={summary['recall_at_1']:.4f} "
+            f"R@3={summary['recall_at_3']:.4f} "
+            f"R@5={summary['recall_at_5']:.4f} "
+            f"R@10={summary['recall_at_10']:.4f} "
+            f"output={config.output_path}"
+        )
         return 0
     except (ValueError, RuntimeError, OSError) as exc:
         print(f"Golden query generation failed: {exc}", file=sys.stderr)

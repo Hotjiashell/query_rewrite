@@ -12,7 +12,7 @@
     "retrieval_url": "http://10.67.43.14:8276/run_case_retrieval",
     "timeout": 30,
     "max_retries": 3,
-    "top_k": 10,
+    "top_k": 5,
     "concurrency": 1
   }
 }
