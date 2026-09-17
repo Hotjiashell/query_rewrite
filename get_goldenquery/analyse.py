@@ -28,9 +28,9 @@ DEFAULT_TOP_K = 10
 
 ANALYSIS_PROMPT = """你是企业知识库检索质量分析专家。请分析为什么【普通 query】没有在 Top-{top_k} 召回【GT 案例】，但【golden query】可以召回。
 
-只能依据下方输入做判断，尤其遵守以下定义：
-1. 缺少的关键词：一个有业务意义的词或短语，同时出现在 golden query 和 GT 案例标题中，但没有出现在普通 query 中。不要猜测输入中不存在的词，不要列单字或泛化词。
-2. 多出的噪声词：一个有业务意义的词或短语，不在 golden query 中，却在普通 query 中出现，并且在普通 query 的 Top-{top_k} 候选标题中至少重复出现 2 次或明显主导这些候选。不要把通用词、停用词或 GT 关键词误判为噪声。
+你需要从以下三个方面进行分析
+1. 缺少的关键词：同时出现在 golden query 和 GT 案例标题中，但没有出现在普通 query 中，不一定是字面完全匹配，也可以是语义上相近。不要猜测输入中不存在的词，不要列举通用词。
+2. 多出的噪声词：一个有业务意义的词或短语，不在 golden query 中，却在普通 query 中出现，并且在普通 query 的 Top-{top_k} 候选标题中至少重复出现 2 次或明显主导这些候选。不要把通用词误判为噪声。
 3. 检索不到的理由：用一句简洁中文说明缺失关键词和/或噪声词怎样使普通 query 偏离 GT。若证据不足，对应数组返回空数组，并在理由中明确说明。
 
 【GT 案例标题】
@@ -45,12 +45,16 @@ ANALYSIS_PROMPT = """你是企业知识库检索质量分析专家。请分析�
 【普通 query 的真实 Top-{top_k} 候选标题】
 {top_titles}
 
-只输出 JSON，不要 Markdown 或解释：
+请先分析，然后输出 JSON 文件：
+...(分析)
+```json
 {{
   "reason": "...",
   "missing_keywords": ["..."],
   "noise_keywords": ["..."]
-}}"""
+}}
+```
+"""
 
 
 class Retriever(Protocol):
@@ -125,7 +129,7 @@ def _top_titles_for_prompt(top_titles: Sequence[Mapping[str, Any]]) -> str:
 
 
 def _parse_analysis(content: str) -> dict[str, Any]:
-    """Parse and validate the exact structured analysis expected from the LLM."""
+    """Parse fenced JSON after the prompt asks the model to analyse first."""
 
     if not isinstance(content, str) or not content.strip():
         raise ValueError("model returned empty content")

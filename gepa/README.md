@@ -15,6 +15,13 @@ apart from the task LLM and retrieval service. Every final evaluation artifact
 keeps the generated query, every returned `top<number>` item in numerical order,
 and only each case's `id` and `title`.
 
+When `dataset.golden_query_path` is configured, successful records from
+`get_goldenquery` add an offline-only reference to failed GEPA trajectories:
+the target case title and the golden query. This follows the current golden
+retry/analysis prompts: GEPA can distinguish missing target concepts from
+noise terms that dominate returned titles. These fields are metadata for
+reflection only; `dialogue` remains the predictor's sole runtime input.
+
 The default training objective is `Recall@5`; evaluation always reports
 `Recall@1`, `Recall@3`, `Recall@5`, and `Recall@10`. Keep a held-out validation
 set: GEPA may see training traces to improve the instruction, but it must not
@@ -84,6 +91,16 @@ does not serialize output in precisely the same way as `gen_query.py`.
    attributed to the prompt.
 4. A product decision on the production objective: use `metric_cutoff: 5` for
    coverage, or set it to `1` when first-result precision is the true requirement.
+
+`dataset.golden_query_path` is optional. Generate it first with
+`python -m get_goldenquery`; point it at the resulting
+`golden_query_generation` artifact only when it was produced from the same
+dialogue dataset and its `sample_index` values align. Add it under `dataset`
+only after that artifact exists:
+
+```json
+"golden_query_path": "../results/golden_queries.json"
+```
 
 The case corpus/title file is optional for this first version. Supplying a
 sanitized `caseID -> title` snapshot later would improve failure explanations,

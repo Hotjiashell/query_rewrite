@@ -88,7 +88,10 @@ class GoldenQueryTests(unittest.TestCase):
         self.assertNotIn("content", record["attempts"][0]["retrieval_trace"][0])
 
     def test_retry_receives_actual_top_results_and_can_hit(self):
-        client = _Client(['{"query": "网络问题"}', '{"query": "网络连接配置"}'])
+        client = _Client([
+            '{"query": "网络问题"}',
+            '上一轮缺少网络配置相关关键词。\n```json\n{"query": "网络连接配置"}\n```',
+        ])
         retriever = _Retriever({
             "网络问题": _response("KT2", "KT3"),
             "网络连接配置": _response("KT2", "KT1"),

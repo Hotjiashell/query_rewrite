@@ -8,15 +8,27 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from common import DialogueExample, load_examples, load_settings, split_examples, write_json
+from common import DialogueExample, GoldenReference, load_examples, load_golden_references, load_settings, split_examples, write_json
 from query_program import make_lm, make_program
 from retrieval import CaseRetriever, matched_rank
 
 
-def _dspy_examples(rows: list[DialogueExample]):
+def _dspy_examples(rows: list[DialogueExample], golden_references: dict[int, GoldenReference]):
     import dspy
 
-    return [dspy.Example(dialogue=row.dialogue, expected_case_id=row.expected_case_id, sample_index=row.sample_index).with_inputs("dialogue") for row in rows]
+    examples = []
+    for row in rows:
+        reference = golden_references.get(row.sample_index)
+        examples.append(
+            dspy.Example(
+                dialogue=row.dialogue,
+                expected_case_id=row.expected_case_id,
+                sample_index=row.sample_index,
+                golden_case_title=reference.case_title if reference else None,
+                golden_query=reference.query if reference else None,
+            ).with_inputs("dialogue")
+        )
+    return examples
 
 
 def _metric(retriever: CaseRetriever, cutoff: int):
@@ -47,6 +59,16 @@ def _metric(retriever: CaseRetriever, cutoff: int):
             f"Target rank: {rank if rank is not None else 'not returned'}; required cutoff: top{cutoff}.\n"
             f"Retrieved cases:\n{trace_text or '(no valid topN cases returned)'}"
         )
+        if not value and getattr(example, "golden_case_title", None) and getattr(example, "golden_query", None):
+            feedback += (
+                "\n\nOffline golden reference (use only to improve the instruction, never as a production input):"
+                f"\nTarget case title: {example.golden_case_title}"
+                f"\nGolden query: {example.golden_query}"
+                "\nDiagnose the miss in two dimensions: identify specific terms or semantic concepts "
+                "missing from the generated query by comparing the golden query and target title; "
+                "then identify irrelevant terms in the generated query that are visibly dominating the returned titles. "
+                "Do not blindly copy the golden query; preserve useful dialogue context."
+            )
         return dspy.Prediction(score=value, feedback=feedback)
 
     return score
@@ -66,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     settings = load_settings(args.config)
     rows = load_examples(settings.input_path)
+    golden_references = load_golden_references(settings.golden_query_path)
     train_rows, val_rows = split_examples(rows, settings.train_ratio, settings.split_seed)
     run_dir = settings.output_dir / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -88,8 +111,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     optimized = optimizer.compile(
         student=make_program(),
-        trainset=_dspy_examples(train_rows),
-        valset=_dspy_examples(val_rows),
+        trainset=_dspy_examples(train_rows, golden_references),
+        valset=_dspy_examples(val_rows, golden_references),
     )
     instruction = _program_instruction(optimized)
     (run_dir / "optimized_instruction.txt").write_text(instruction + "\n", encoding="utf-8")
@@ -98,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema_version": 1,
         "train_samples": len(train_rows),
         "validation_samples": len(val_rows),
+        "golden_reference_samples": len(golden_references),
         "metric": f"recall_at_{settings.metric_cutoff}",
         "max_metric_calls": settings.max_metric_calls,
         "optimized_instruction": instruction,

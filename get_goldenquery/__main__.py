@@ -43,7 +43,11 @@ query不要提及“案例”“caseID”“目标案例”，不要照抄整段
 
 RETRY_PROMPT = """你正在为企业知识库检索系统优化 query。当前 query 没有在 Top-{top_k} 中召回目标案例。
 请结合用户对话、目标案例和本次真实检索结果，判断遗漏或混淆的关键检索词，并生成一条不同的、更能检索到目标案例的中文 query。
-不要提及“案例”“caseID”“目标案例”，不要输出解释。
+检索不到目的案例一般包括两个原因：
+1. query 中缺少了目标案例的关键检索词；
+2. query 中包含了与目标案例不相关的干扰词，导致检索结果被干扰。
+你可以从上一轮真实检索结果中分析那些词是干扰词，从目标案例标题里分析那些词是关键词。
+不要提及“案例”“caseID”“目标案例”。请先分析，再输出结果
 
 【用户对话】
 {dialogue}
@@ -57,7 +61,12 @@ RETRY_PROMPT = """你正在为企业知识库检索系统优化 query。当前 q
 【上一轮真实 Top-{top_k} 检索结果】
 {retrieval_results}
 
-只输出 JSON：{{"query": "..."}}"""
+先分析，再输出 JSON：
+...(分析)
+```json
+{{"query": "..."}}
+```
+"""
 
 
 class Retriever(Protocol):
@@ -124,6 +133,8 @@ def load_cases(path: str | Path) -> dict[str, GoldenCase]:
 
 
 def _call_model(client: Any, config: LLMConfig, prompt: str) -> str:
+    """Extract the fenced JSON query after the retry prompt's free-form analysis."""
+
     response = client.chat.completions.create(
         model=config.model_name,
         messages=[{"role": "user", "content": prompt}],

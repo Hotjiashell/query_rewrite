@@ -70,8 +70,9 @@ class GoldenMissAnalysisTests(unittest.TestCase):
 
     def test_analyses_an_ordinary_query_miss_with_title_only_evidence(self):
         client = _Client([
+            '普通 query 没有限定企业微信，且会议词使结果偏向通用会议。\n```json\n'
             '{"reason":"普通 query 缺少企业微信关键词，且会议词使结果偏向通用会议。",'
-            '"missing_keywords":["企业微信"],"noise_keywords":["会议"]}'
+            '"missing_keywords":["企业微信"],"noise_keywords":["会议"]}\n```'
         ])
         retriever = _Retriever({"会议预订": _response("KT2", "KT3", "KT4")})
 
