@@ -1,0 +1,30 @@
+{
+  "task_lm": {
+    "base_url": "https://your-llm.example/v1",
+    "model_name": "your-query-model",
+    "api_key_env": "OPENAI_API_KEY",
+    "temperature": 0.0
+  },
+  "reflection_lm": {
+    "base_url": "https://your-llm.example/v1",
+    "model_name": "your-reflection-model",
+    "api_key_env": "OPENAI_API_KEY",
+    "temperature": 1.0
+  },
+  "retrieval": {
+    "url": "http://10.67.43.14:8276/run_case_retrieval",
+    "timeout": 30,
+    "top_k": 10
+  },
+  "dataset": {
+    "input_path": "../data/dialog_example.json",
+    "train_ratio": 0.8,
+    "split_seed": 42
+  },
+  "optimization": {
+    "metric_cutoff": 5,
+    "max_metric_calls": 100,
+    "num_threads": 4
+  },
+  "output_dir": "runs"
+}

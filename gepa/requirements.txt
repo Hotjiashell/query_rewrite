@@ -1,0 +1,3 @@
+# DSPy includes the GEPA teleprompter. Install from PyPI or your approved mirror.
+dspy-ai>=3.0.0
+openai>=1.0.0

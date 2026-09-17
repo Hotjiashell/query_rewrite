@@ -29,3 +29,27 @@ is in Top-K.
 The terminal displays real-time completion, Top-K hits, and failures. The final
 `summary` includes `hits_at_1/3/5/10` and `recall_at_1/3/5/10`, calculated
 from the last query for every input sample.
+
+## Analyse Misses
+
+Compare a successful golden-query artifact with an `evaluate.py generate`
+query artifact. The ordinary query is retrieved again, and only samples where
+the golden query succeeded but the ordinary query misses the GT case in Top-10
+are sent to the LLM for analysis.
+
+```bash
+python -m get_goldenquery.analyse \
+  --golden results/golden_queries.json \
+  --queries results/generated_queries.json \
+  --output results/golden_query_miss_analysis.json
+```
+
+It also accepts `--config get_goldenquery/config.example.json`; its
+`golden_query_analysis.top_k` defaults to 10.
+
+For each analysed miss, the output has `analysis.reason`,
+`analysis.missing_keywords`, and `analysis.noise_keywords`. Missing keywords
+must occur in both the golden query and GT title but not the ordinary query.
+Noise words must be absent from the golden query, present in the ordinary
+query, and repeatedly appear in the ordinary query's Top-10 titles. Only case
+titles are sent to the model; case content is never sent.
