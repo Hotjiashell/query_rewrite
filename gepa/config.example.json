@@ -24,7 +24,7 @@
   },
   "optimization": {
     "metric_cutoff": 5,
-    "max_metric_calls": 100,
+    "max_metric_calls": 500,
     "reflection_minibatch_size": 10,
     "num_threads": 4
   },
