@@ -2,9 +2,10 @@
 
 This directory is independent of the existing `evaluate.py` pipeline. It uses
 the same input contract: each dialogue needs `chat_content` and the target
-`caseID`. GEPA evolves the DSPy predictor instruction while the metric calls
-the existing `search.py` endpoint and scores whether the target case appears
-within the configured cutoff.
+`caseID`; `dataset.case_path` must map every such ID to its GT case title. GEPA
+evolves the DSPy predictor instruction while the metric calls the existing
+`search.py` endpoint and scores whether the target case appears within the
+configured cutoff.
 
 ## Why this mapping is appropriate
 
@@ -21,6 +22,12 @@ the target case title and the golden query. This follows the current golden
 retry/analysis prompts: GEPA can distinguish missing target concepts from
 noise terms that dominate returned titles. These fields are metadata for
 reflection only; `dialogue` remains the predictor's sole runtime input.
+
+The GT case title does not depend on golden queries. It is always included in
+the feedback built from `dataset.case_path`, so every retrieval miss can be
+diagnosed as missing target concepts and/or query noise. Training fails early
+when any dialogue `caseID` lacks a title, rather than silently producing weak
+feedback for part of the dataset.
 
 The default training objective is `Recall@5`; evaluation always reports
 `Recall@1`, `Recall@3`, `Recall@5`, and `Recall@10`. Keep a held-out validation
@@ -57,6 +64,9 @@ variants. Start around 100 only after the dataset contains at least 50-100
 representative, correctly labelled dialogues. Use a small budget (for example
 10) for connectivity checks. Each run exports the instruction and DSPy program
 for DSPy-side inspection.
+
+`optimization.reflection_minibatch_size` controls how many training trajectories
+the reflection model sees in one prompt-update step. It defaults to `3`.
 
 To keep the current `evaluate.py` production pipeline, export the selected
 instruction to its existing `custom` prompt contract and then run its normal

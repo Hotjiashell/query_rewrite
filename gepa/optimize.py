@@ -8,7 +8,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from common import DialogueExample, GoldenReference, load_examples, load_golden_references, load_settings, split_examples, write_json
+from common import (
+    DialogueExample,
+    GoldenReference,
+    load_case_titles,
+    load_examples,
+    load_golden_references,
+    load_settings,
+    split_examples,
+    write_json,
+)
 from query_program import make_lm, make_program
 from retrieval import CaseRetriever, matched_rank
 
@@ -23,8 +32,8 @@ def _dspy_examples(rows: list[DialogueExample], golden_references: dict[int, Gol
             dspy.Example(
                 dialogue=row.dialogue,
                 expected_case_id=row.expected_case_id,
+                expected_case_title=row.expected_case_title,
                 sample_index=row.sample_index,
-                golden_case_title=reference.case_title if reference else None,
                 golden_query=reference.query if reference else None,
             ).with_inputs("dialogue")
         )
@@ -46,29 +55,51 @@ def _metric(retriever: CaseRetriever, cutoff: int):
 
         query = getattr(prediction, "query", "")
         if not isinstance(query, str) or not query.strip():
-            return dspy.Prediction(score=0.0, feedback="The model returned no usable query. Output one concise retrieval query only.")
+            return dspy.Prediction(
+                score=0.0,
+                feedback=(
+                    f"【用户对话】\n{example.dialogue}\n\n"
+                    "【生成的 query】\n（空）\n\n"
+                    f"【目标案例标题】\n{example.expected_case_title}\n\n"
+                    "【是否命中目标案例】\n否\n\n"
+                    "【实际检索到的案例标题】\n未发起检索，因为生成的 query 为空。"
+                ),
+            )
         try:
             cases = retriever.retrieve(query.strip())
-        except Exception as exc:
-            return dspy.Prediction(score=0.0, feedback=f"Retrieval failed for query {query!r}: {type(exc).__name__}: {exc}")
+        except Exception:
+            return dspy.Prediction(
+                score=0.0,
+                feedback=(
+                    f"【用户对话】\n{example.dialogue}\n\n"
+                    f"【生成的 query】\n{query.strip()}\n\n"
+                    f"【目标案例标题】\n{example.expected_case_title}\n\n"
+                    "【是否命中目标案例】\n否\n\n"
+                    "【实际检索到的案例标题】\n检索请求失败，未返回有效结果。"
+                ),
+            )
         rank = matched_rank(example.expected_case_id, cases)
         value = float(rank is not None and rank <= cutoff)
-        trace_text = "\n".join(f"top{item.rank}: id={item.case_id}; title={item.case_title}" for item in cases)
+        trace_text = "\n".join(f"- {item.case_title}" for item in cases)
         feedback = (
-            f"Expected case ID: {example.expected_case_id}. Generated query: {query.strip()!r}. "
-            f"Target rank: {rank if rank is not None else 'not returned'}; required cutoff: top{cutoff}.\n"
-            f"Retrieved cases:\n{trace_text or '(no valid topN cases returned)'}"
+            f"【用户对话】\n{example.dialogue}\n\n"
+            f"【生成的 query】\n{query.strip()}\n\n"
+            f"【目标案例标题】\n{example.expected_case_title}\n\n"
+            f"【是否命中目标案例】\n{'是' if value else '否'}\n\n"
+            f"【实际检索到的案例标题】\n{trace_text or '检索服务未返回有效结果。'}"
         )
-        if not value and getattr(example, "golden_case_title", None) and getattr(example, "golden_query", None):
+        if not value:
             feedback += (
-                "\n\nOffline golden reference (use only to improve the instruction, never as a production input):"
-                f"\nTarget case title: {example.golden_case_title}"
-                f"\nGolden query: {example.golden_query}"
-                "\nDiagnose the miss in two dimensions: identify specific terms or semantic concepts "
-                "missing from the generated query by comparing the golden query and target title; "
-                "then identify irrelevant terms in the generated query that are visibly dominating the returned titles. "
-                "Do not blindly copy the golden query; preserve useful dialogue context."
+                "\n\n请分析：从上述用户对话中抽取的 query 未能检索到目标案例，实际检索结果如上。"
+                "请据此总结如何改进 query 生成提示词。"
             )
+            if getattr(example, "golden_query", None):
+                feedback += (
+                    "\n\n【Golden query】\n"
+                    f"{example.golden_query}"
+                    "\n\nGolden query 能够检索到目标案例，仅用于离线反思。"
+                    "可以据此对比分析如何改进 query 生成提示词，不要直接照抄 Golden query。"
+                )
         return dspy.Prediction(score=value, feedback=feedback)
 
     return score
@@ -87,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-name", default="latest")
     args = parser.parse_args(argv)
     settings = load_settings(args.config)
-    rows = load_examples(settings.input_path)
+    rows = load_examples(settings.input_path, load_case_titles(settings.case_path))
     golden_references = load_golden_references(settings.golden_query_path)
     train_rows, val_rows = split_examples(rows, settings.train_ratio, settings.split_seed)
     run_dir = settings.output_dir / args.run_name
@@ -105,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     optimizer = dspy.GEPA(
         metric=_metric(retriever, settings.metric_cutoff),
         max_metric_calls=settings.max_metric_calls,
+        reflection_minibatch_size=settings.reflection_minibatch_size,
         reflection_lm=reflection_lm,
         num_threads=settings.num_threads,
         log_dir=str(run_dir / "dspy_gepa_logs"),
@@ -124,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         "golden_reference_samples": len(golden_references),
         "metric": f"recall_at_{settings.metric_cutoff}",
         "max_metric_calls": settings.max_metric_calls,
+        "reflection_minibatch_size": settings.reflection_minibatch_size,
         "optimized_instruction": instruction,
     }, run_dir / "training_summary.json")
     print(json.dumps({"run_dir": str(run_dir), "train_samples": len(train_rows), "validation_samples": len(val_rows)}, ensure_ascii=False))

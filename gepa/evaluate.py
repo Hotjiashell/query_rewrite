@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
-from common import DialogueExample, load_examples, load_settings, write_json
+from common import DialogueExample, load_case_titles, load_examples, load_settings, write_json
 from query_program import make_lm, make_program
 from retrieval import CaseRetriever, matched_rank
 
@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     dspy.configure(lm=make_lm(settings.task_lm))
     program = _load_program(args.program)
     retriever = CaseRetriever(settings.retrieval.url, settings.retrieval.timeout, settings.retrieval.top_k)
-    samples = load_examples(settings.input_path)
+    samples = load_examples(settings.input_path, load_case_titles(settings.case_path))
     with ThreadPoolExecutor(max_workers=settings.num_threads) as pool:
         records = list(pool.map(lambda sample: _record(program, retriever, sample), samples))
     payload = {"schema_version": 1, "artifact_type": "gepa_retrieval_evaluation", "configuration": {"program": args.program or "baseline", "retrieval_top_k": settings.retrieval.top_k}, "metrics": _metrics(records), "records": records}

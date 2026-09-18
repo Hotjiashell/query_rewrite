@@ -31,11 +31,13 @@ class RunSettings:
     reflection_lm: LMSettings
     retrieval: RetrievalSettings
     input_path: Path
+    case_path: Path
     golden_query_path: Path | None
     train_ratio: float
     split_seed: int
     metric_cutoff: int
     max_metric_calls: int
+    reflection_minibatch_size: int
     num_threads: int
     output_dir: Path
 
@@ -46,6 +48,7 @@ class DialogueExample:
     call_sno: str | None
     dialogue: str
     expected_case_id: str
+    expected_case_title: str
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,9 @@ def load_settings(path: str | Path) -> RunSettings:
     input_path = Path(_string(dataset.get("input_path"), "dataset.input_path"))
     if not input_path.is_absolute():
         input_path = (root / input_path).resolve()
+    case_path = Path(_string(dataset.get("case_path"), "dataset.case_path"))
+    if not case_path.is_absolute():
+        case_path = (root / case_path).resolve()
     golden_query_path = dataset.get("golden_query_path")
     if golden_query_path is not None:
         golden_query_path = Path(_string(golden_query_path, "dataset.golden_query_path"))
@@ -126,17 +132,54 @@ def load_settings(path: str | Path) -> RunSettings:
             top_k=positive_int(retrieval.get("top_k", 10), "retrieval.top_k"),
         ),
         input_path=input_path,
+        case_path=case_path,
         golden_query_path=golden_query_path,
         train_ratio=float(train_ratio),
         split_seed=int(dataset.get("split_seed", 42)),
         metric_cutoff=positive_int(optimization.get("metric_cutoff", 5), "optimization.metric_cutoff"),
         max_metric_calls=positive_int(optimization.get("max_metric_calls", 100), "optimization.max_metric_calls"),
+        reflection_minibatch_size=positive_int(
+            optimization.get("reflection_minibatch_size", 3),
+            "optimization.reflection_minibatch_size",
+        ),
         num_threads=positive_int(optimization.get("num_threads", 1), "optimization.num_threads"),
         output_dir=output_dir,
     )
 
 
-def load_examples(path: str | Path) -> list[DialogueExample]:
+def load_case_titles(path: str | Path) -> dict[str, str]:
+    """Load ``caseID -> title`` from the same formats accepted by golden query generation."""
+
+    source = Path(path)
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"case file does not exist: {source}") from exc
+    if isinstance(payload, Mapping):
+        records = list(payload.items())
+    elif isinstance(payload, list):
+        records = [
+            (item.get("caseID") or item.get("case_id"), item)
+            for item in payload
+            if isinstance(item, Mapping)
+        ]
+    else:
+        raise ValueError("case JSON must be an object keyed by case ID or a list of case objects")
+
+    titles: dict[str, str] = {}
+    for raw_case_id, item in records:
+        if not isinstance(item, Mapping) or raw_case_id is None:
+            continue
+        case_id = str(raw_case_id).strip()
+        title = item.get("case_name") or item.get("case_title") or item.get("title")
+        if case_id and isinstance(title, str) and title.strip():
+            titles[case_id] = title.strip()
+    if not titles:
+        raise ValueError(f"case file contains no usable case ID/title records: {source}")
+    return titles
+
+
+def load_examples(path: str | Path, case_titles: Mapping[str, str]) -> list[DialogueExample]:
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -151,7 +194,22 @@ def load_examples(path: str | Path) -> list[DialogueExample]:
         if not isinstance(dialogue, str) or not dialogue.strip() or case_id is None or not str(case_id).strip():
             continue
         call_sno = item.get("call_sno")
-        examples.append(DialogueExample(index, str(call_sno).strip() if call_sno is not None else None, dialogue.strip(), str(case_id).strip()))
+        normalized_case_id = str(case_id).strip()
+        case_title = case_titles.get(normalized_case_id)
+        if case_title is None:
+            raise ValueError(
+                f"dialogue sample {index} references caseID {normalized_case_id!r}, "
+                "which has no title in dataset.case_path"
+            )
+        examples.append(
+            DialogueExample(
+                index,
+                str(call_sno).strip() if call_sno is not None else None,
+                dialogue.strip(),
+                normalized_case_id,
+                case_title,
+            )
+        )
     if len(examples) < 2:
         raise ValueError("at least two valid dialogue samples with chat_content and caseID are required")
     return examples

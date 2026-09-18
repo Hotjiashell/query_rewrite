@@ -18,12 +18,14 @@
   },
   "dataset": {
     "input_path": "../data/dialog_example.json",
+    "case_path": "../data/case_example.json",
     "train_ratio": 0.8,
     "split_seed": 42
   },
   "optimization": {
     "metric_cutoff": 5,
     "max_metric_calls": 100,
+    "reflection_minibatch_size": 3,
     "num_threads": 4
   },
   "output_dir": "runs"
