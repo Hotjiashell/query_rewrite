@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 
@@ -64,9 +64,19 @@ def main(argv: list[str] | None = None) -> int:
     program = _load_program(args.program)
     retriever = CaseRetriever(settings.retrieval.url, settings.retrieval.timeout, settings.retrieval.top_k)
     samples = load_examples(settings.input_path, load_case_titles(settings.case_path))
+    records: list[dict | None] = [None] * len(samples)
     with ThreadPoolExecutor(max_workers=settings.num_threads) as pool:
-        records = list(pool.map(lambda sample: _record(program, retriever, sample), samples))
-    payload = {"schema_version": 1, "artifact_type": "gepa_retrieval_evaluation", "configuration": {"program": args.program or "baseline", "retrieval_top_k": settings.retrieval.top_k}, "metrics": _metrics(records), "records": records}
+        futures = {pool.submit(_record, program, retriever, sample): index for index, sample in enumerate(samples)}
+        completed = 0
+        total = len(samples)
+        for future in as_completed(futures):
+            records[futures[future]] = future.result()
+            completed += 1
+            print(f"\r评估进度: {completed}/{total}", end="", flush=True)
+    if samples:
+        print()
+    completed_records = [record for record in records if record is not None]
+    payload = {"schema_version": 1, "artifact_type": "gepa_retrieval_evaluation", "configuration": {"program": args.program or "baseline", "retrieval_top_k": settings.retrieval.top_k}, "metrics": _metrics(completed_records), "records": completed_records}
     write_json(payload, args.output)
     print(payload["metrics"])
     return 0
