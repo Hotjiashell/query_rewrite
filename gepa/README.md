@@ -72,6 +72,16 @@ python gepa/evaluate_prompt.py \
   --output gepa/runs/recall5-v1/test_evaluation.json
 ```
 
+该评估脚本会在每个样本完成后更新输出文件。若因 API 超时、限流或网络问题中断，使用相同参数并加上 `--resume` 续跑；已有成功样本会跳过，失败样本会重新请求：
+
+```bash
+python gepa/evaluate_prompt.py \
+  --config gepa/test_config.json \
+  --prompt gepa/runs/recall5-v1/dspy_prompt.txt \
+  --output gepa/runs/recall5-v1/test_evaluation.json \
+  --resume
+```
+
 导出的提示词包含 `[[ ## dialogue ## ]]`、`[[ ## query ## ]]` 和
 `[[ ## completed ## ]]`。评估脚本要求模型按该协议返回，并直接使用
 `--prompt` 指定的文件，不加载 DSPy program artifact。

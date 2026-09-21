@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
@@ -65,11 +66,42 @@ def _metrics(records: list[dict]) -> dict:
     return result
 
 
+def _payload(prompt_path: Path, top_k: int, records: list[dict]) -> dict:
+    return {
+        "schema_version": 1,
+        "artifact_type": "gepa_dspy_prompt_evaluation",
+        "configuration": {"prompt": str(prompt_path), "retrieval_top_k": top_k},
+        "metrics": _metrics(records),
+        "records": records,
+    }
+
+
+def _load_resume_records(output_path: Path) -> dict[int, dict]:
+    try:
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        if isinstance(exc, FileNotFoundError):
+            return {}
+        raise ValueError(f"cannot resume from invalid JSON output: {output_path}") from exc
+    if not isinstance(payload, dict) or payload.get("artifact_type") != "gepa_dspy_prompt_evaluation":
+        raise ValueError(f"output is not a gepa_dspy_prompt_evaluation artifact: {output_path}")
+    records = payload.get("records")
+    if not isinstance(records, list):
+        raise ValueError(f"resume output records must be a JSON array: {output_path}")
+    return {
+        int(record["sample_index"]): record
+        for record in records
+        if isinstance(record, dict) and isinstance(record.get("sample_index"), int)
+        and record.get("status") == "success"
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Evaluate a standalone DSPy-protocol prompt.")
     parser.add_argument("--config", default="gepa/config.json")
     parser.add_argument("--prompt", required=True, help="Prompt exported by export_dspy_prompt.py")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--resume", action="store_true", help="Resume from successful records in the existing output")
     args = parser.parse_args(argv)
     settings = load_settings(args.config)
     prompt_path = Path(args.prompt)
@@ -87,22 +119,28 @@ def main(argv: list[str] | None = None) -> int:
     retriever = CaseRetriever(settings.retrieval.url, settings.retrieval.timeout, settings.retrieval.top_k)
     samples = load_examples(settings.input_path, load_case_titles(settings.case_path))
     records: list[dict | None] = [None] * len(samples)
+    output_path = Path(args.output)
+    resumed = _load_resume_records(output_path) if args.resume else {}
+    for index, sample in enumerate(samples):
+        if sample.sample_index in resumed:
+            records[index] = resumed[sample.sample_index]
+    pending = [(index, sample) for index, sample in enumerate(samples) if records[index] is None]
+    completed = len(samples) - len(pending)
+    if completed:
+        print(f"已恢复成功样本: {completed}/{len(samples)}")
     with ThreadPoolExecutor(max_workers=settings.num_threads) as pool:
-        futures = {pool.submit(_record, lm, prompt_template, retriever, sample): index for index, sample in enumerate(samples)}
-        for completed, future in enumerate(as_completed(futures), start=1):
+        futures = {pool.submit(_record, lm, prompt_template, retriever, sample): index for index, sample in pending}
+        for future in as_completed(futures):
             records[futures[future]] = future.result()
+            completed += 1
+            completed_records = [record for record in records if record is not None]
+            write_json(_payload(prompt_path, settings.retrieval.top_k, completed_records), output_path)
             print(f"\r评估进度: {completed}/{len(samples)}", end="", flush=True)
     if samples:
         print()
     completed_records = [record for record in records if record is not None]
-    payload = {
-        "schema_version": 1,
-        "artifact_type": "gepa_dspy_prompt_evaluation",
-        "configuration": {"prompt": str(prompt_path), "retrieval_top_k": settings.retrieval.top_k},
-        "metrics": _metrics(completed_records),
-        "records": completed_records,
-    }
-    write_json(payload, args.output)
+    payload = _payload(prompt_path, settings.retrieval.top_k, completed_records)
+    write_json(payload, output_path)
     print(payload["metrics"])
     return 0
 
