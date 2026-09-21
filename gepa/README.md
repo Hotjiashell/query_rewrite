@@ -59,6 +59,23 @@ python gepa/evaluate.py --config gepa/config.json \
   --output gepa/runs/recall5-v1/evaluation.json
 ```
 
+如果希望脱离 `optimized_program.json`，直接测试包含 DSPy 字段协议的最终提示词：
+
+```bash
+python gepa/export_dspy_prompt.py \
+  --instruction gepa/runs/recall5-v1/optimized_instruction.txt \
+  --output gepa/runs/recall5-v1/dspy_prompt.txt
+
+python gepa/evaluate_prompt.py \
+  --config gepa/test_config.json \
+  --prompt gepa/runs/recall5-v1/dspy_prompt.txt \
+  --output gepa/runs/recall5-v1/test_evaluation.json
+```
+
+导出的提示词包含 `[[ ## dialogue ## ]]`、`[[ ## query ## ]]` 和
+`[[ ## completed ## ]]`。评估脚本要求模型按该协议返回，并直接使用
+`--prompt` 指定的文件，不加载 DSPy program artifact。
+
 `max_metric_calls` is a retrieval-evaluation budget, not a number of prompt
 variants. Start around 100 only after the dataset contains at least 50-100
 representative, correctly labelled dialogues. Use a small budget (for example
