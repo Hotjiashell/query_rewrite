@@ -489,6 +489,7 @@ class RetrievalEvaluator:
         *,
         fusion_method: str = DEFAULT_FUSION_METHOD,
         top_k: int = DEFAULT_TOP_K,
+        parallel_queries: bool = True,
     ) -> None:
         if fusion_method not in FUSION_METHODS:
             supported = ", ".join(sorted(FUSION_METHODS))
@@ -498,9 +499,20 @@ class RetrievalEvaluator:
         self._retriever = retriever
         self._fusion_method = fusion_method
         self._top_k = top_k
+        self._parallel_queries = parallel_queries
 
     def _retrieve_many(self, queries: Sequence[str]) -> tuple[list[list[RetrievedCase]], list[str]]:
-        """Concurrently retrieve every query for one sample, tolerating partial failure."""
+        """Retrieve every query for one sample, tolerating partial failure."""
+
+        if not self._parallel_queries:
+            traces: list[list[RetrievedCase]] = []
+            errors: list[str] = []
+            for query in queries:
+                try:
+                    traces.append(extract_retrieval_trace(self._retriever.retrieve(query)))
+                except Exception as exc:
+                    errors.append(f"{query!r}: {type(exc).__name__}: {exc}")
+            return traces, errors
 
         results: list[list[RetrievedCase] | None] = [None] * len(queries)
         errors: list[str] = []

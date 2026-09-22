@@ -164,6 +164,49 @@ failed; its `reranked_trace` falls back to the original retrieval order. The
 output includes both `source_metrics` and reranked `metrics`, plus
 `reranked_matched_rank` for each sample.
 
+## Serial latency and recall benchmark
+
+To measure the end-to-end latency of query generation, retrieval, and
+reranking, use `latency_benchmark.py`. It processes samples in input order and
+keeps all requests serial, including each query in `multi_query` mode:
+
+```bash
+python latency_benchmark.py \
+  --config config.json \
+  --test-num 100 \
+  --output results/latency_benchmark.json
+```
+
+The benchmark uses `query_generation.input_path`, the configured query method,
+retrieval settings, and the shared LLM settings from `config.json`. A
+`benchmark` section can override the input, output, sample count, method,
+retrieval URL/timeout, fusion settings, and rerank candidate limit:
+
+```json
+{
+  "benchmark": {
+    "input_path": "data/dialog_example.json",
+    "output_path": "results/latency_benchmark.json",
+    "test_num": 100,
+    "candidate_limit": 0
+  }
+}
+```
+
+`--test-num 0` means all input samples. The two reported times start before
+query generation for each sample:
+
+- `metrics.latency.time_to_retrieval.average_seconds`: average time until the
+  retrieval stage returns;
+- `metrics.latency.time_to_rerank.average_seconds`: average cumulative time
+  until the reranking stage returns.
+
+The per-sample fields are `time_to_retrieval_sec` and
+`time_to_rerank_sec`. The artifact also includes `metrics.retrieval` and
+`metrics.rerank`, each with Recall@1, Recall@3, Recall@5, and Recall@10. A
+latency average only includes samples that reached that stage; the artifact
+records the corresponding completed-sample count.
+
 ## Multi-query retrieval fusion
 
 `--method multi_query` asks the model to propose up to three queries per
