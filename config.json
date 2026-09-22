@@ -17,5 +17,11 @@
     "url": "http://10.67.43.14:8276/run_case_retrieval",
     "timeout": 30,
     "concurrency": 1
+  },
+  "rerank": {
+    "input_path": "results/baseline.json",
+    "output_path": "results/baseline_reranked.json",
+    "concurrency": 4,
+    "candidate_limit": 0
   }
 }

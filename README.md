@@ -112,6 +112,58 @@ config-file value, then environment variable. All three prompt methods include
 `extra_body={"chat_template_kwargs": {"enable_thinking": false}}` on every
 model request.
 
+## LLM reranking
+
+After retrieval, `rerank_cases.py` can ask the model to judge the returned
+cases against the full dialogue and reorder them. The current retrieval
+artifact provides `case_id`, `case_title`, and original rank as the default
+evidence sent to the model. The retrieval similarity score is deliberately
+ignored during reranking and omitted from the reranking output. If an input
+artifact has an optional `content` field in a trace entry, it is also included
+in the prompt.
+
+Add or adjust the `rerank` section in `config.json`:
+
+```json
+{
+  "rerank": {
+    "input_path": "results/baseline.json",
+    "output_path": "results/baseline_reranked.json",
+    "concurrency": 8,
+    "candidate_limit": 0
+  }
+}
+```
+
+Then run:
+
+```bash
+python rerank_cases.py --config config.json
+```
+
+The input must be the `retrieval_evaluation` artifact produced by
+`evaluate.py`. `candidate_limit` is optional; `0` reranks every returned
+candidate, while a positive value limits the model prompt to the first N
+candidates. Command-line values override the config file, so a one-off run
+can be started with:
+
+```bash
+python rerank_cases.py \
+  --input results/baseline.json \
+  --output results/baseline_reranked.json \
+  --concurrency 8
+```
+
+The model must return one JSON object with a complete `ranking` array. Every
+candidate `case_id` must occur exactly once, in the desired order, with a
+`relevance` score from 1 to 5 and a short `reason`. The script disables model
+thinking using the same `extra_body` setting as query generation, displays
+progress on stderr, and runs samples concurrently. A model timeout, malformed
+JSON response, missing candidate, or extra candidate only marks that sample as
+failed; its `reranked_trace` falls back to the original retrieval order. The
+output includes both `source_metrics` and reranked `metrics`, plus
+`reranked_matched_rank` for each sample.
+
 ## Multi-query retrieval fusion
 
 `--method multi_query` asks the model to propose up to three queries per
