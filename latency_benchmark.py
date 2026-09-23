@@ -220,7 +220,10 @@ def resolve_config(args: argparse.Namespace) -> BenchmarkConfig:
             "benchmark.input_path",
             _first_defined(args.input, benchmark.get("input_path"), generation.get("input_path")),
         ),
-        output_path=_first_defined(args.output, benchmark.get("output_path"), DEFAULT_OUTPUT_PATH),
+        output_path=_string_setting(
+            "benchmark.output_path",
+            _first_defined(args.output, benchmark.get("output_path"), DEFAULT_OUTPUT_PATH),
+        ),
         test_num=test_num,
         llm=_resolve_llm_config(args, config),
         method=method,
@@ -298,6 +301,7 @@ class SerialLatencyBenchmark:
             query_record = self._query_runner.generate_sample(sample)
             retrieval_record = self._retrieval_evaluator.evaluate_query(query_record)
             retrieval_finished = time.perf_counter()
+            retrieval_record["time_to_retrieval_sec"] = None
 
             if query_record.status == "success":
                 retrieval_record["time_to_retrieval_sec"] = retrieval_finished - started
@@ -305,6 +309,8 @@ class SerialLatencyBenchmark:
 
             reranked_record = self._reranker.rerank_sample(retrieval_record, position)
             rerank_finished = time.perf_counter()
+            reranked_record["time_to_rerank_sec"] = None
+            reranked_record["rerank_only_time_sec"] = None
             if retrieval_record.get("retrieval_status") in {"success", "partial_success"}:
                 reranked_record["time_to_rerank_sec"] = rerank_finished - started
                 reranked_record["rerank_only_time_sec"] = rerank_finished - retrieval_finished
@@ -374,7 +380,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             SearchRetriever(config.retrieval_url, config.retrieval_timeout),
             fusion_method=config.fusion_method,
             top_k=config.top_k,
-            parallel_queries=False,
         )
         rerank_config = RerankConfig(
             input_path=config.input_path,

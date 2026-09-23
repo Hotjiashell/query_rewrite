@@ -168,7 +168,8 @@ output includes both `source_metrics` and reranked `metrics`, plus
 
 To measure the end-to-end latency of query generation, retrieval, and
 reranking, use `latency_benchmark.py`. It processes samples in input order and
-keeps all requests serial, including each query in `multi_query` mode:
+processes different samples serially. Multiple queries belonging to the same
+`multi_query` sample are still retrieved in parallel:
 
 ```bash
 python latency_benchmark.py \

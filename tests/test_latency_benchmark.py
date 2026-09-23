@@ -1,5 +1,7 @@
 import json
+import threading
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -70,11 +72,14 @@ class _SerialMultiRetriever:
         self.active = 0
         self.max_active = 0
         self.calls = []
+        self.ready = threading.Barrier(2)
 
     def retrieve(self, query):
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         self.calls.append(query)
+        self.ready.wait(timeout=2)
+        time.sleep(0.01)
         response = {
             "retrieval_result": {
                 "top1": {"case_id": query, "case_title": query},
@@ -85,9 +90,9 @@ class _SerialMultiRetriever:
 
 
 class LatencyBenchmarkTests(unittest.TestCase):
-    def test_multi_query_retrieval_can_be_forced_to_serial(self):
+    def test_multi_query_retrieval_is_parallel_within_one_sample(self):
         retriever = _SerialMultiRetriever()
-        evaluator = RetrievalEvaluator(retriever, parallel_queries=False)
+        evaluator = RetrievalEvaluator(retriever)
         record = GeneratedQueryRecord(
             sample_index=0,
             call_sno="1",
@@ -101,8 +106,8 @@ class LatencyBenchmarkTests(unittest.TestCase):
 
         result = evaluator.evaluate_query(record)
 
-        self.assertEqual(retriever.calls, ["q1", "q2"])
-        self.assertEqual(retriever.max_active, 1)
+        self.assertCountEqual(retriever.calls, ["q1", "q2"])
+        self.assertGreaterEqual(retriever.max_active, 2)
         self.assertEqual(result["matched_rank"], 2)
 
     def test_benchmark_records_cumulative_timings_and_both_recalls(self):
@@ -114,7 +119,7 @@ class LatencyBenchmarkTests(unittest.TestCase):
         samples = [DialogueSample(0, "1", "dialogue", "KT1")]
         records = SerialLatencyBenchmark(
             _Generator(),
-            RetrievalEvaluator(_Retriever(), parallel_queries=False),
+            RetrievalEvaluator(_Retriever()),
             reranker,
             samples,
         ).run()
