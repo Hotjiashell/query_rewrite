@@ -470,6 +470,7 @@ class MultiQueryRetrievalTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["retrieval_status"], "success")
+        self.assertEqual(result["queries"], ["q1", "q2"])
         self.assertEqual([c["case_id"] for c in result["retrieval_trace"]], ["KT1", "KT2", "KT3"])
         self.assertEqual(result["matched_rank"], 3)
 

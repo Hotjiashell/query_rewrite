@@ -36,6 +36,7 @@ class CollectBadcasesTests(unittest.TestCase):
                                 "chat_content": "miss sample",
                                 "expected_case_id": "KT2",
                                 "query": "q2",
+                                "queries": ["q2", "q2 alternative"],
                                 "status": "success",
                                 "matched_rank": None,
                                 "retrieval_trace": [],
@@ -86,6 +87,7 @@ class CollectBadcasesTests(unittest.TestCase):
         miss = by_index[1]
         self.assertEqual(miss["gt_case_title"], "案例2标题")
         self.assertTrue(miss["gt_case_found"])
+        self.assertEqual(miss["queries"], ["q2", "q2 alternative"])
 
         outside_cutoff = by_index[2]
         self.assertIsNone(outside_cutoff["gt_case_title"])

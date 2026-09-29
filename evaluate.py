@@ -537,6 +537,11 @@ class RetrievalEvaluator:
             "chat_content": query_record.chat_content,
             "gt_case_title": None,
             "query": query_record.query,
+            # Preserve every generated query in the retrieval artifact.  The
+            # first query remains in ``query`` for compatibility with older
+            # consumers, while multi-query badcase reports can inspect the
+            # complete generation output.
+            "queries": query_record.queries,
             "query_status": query_record.status,
             "query_error": query_record.error,
             "retrieval_status": "skipped",
