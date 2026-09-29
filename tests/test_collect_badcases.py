@@ -6,8 +6,11 @@ from pathlib import Path
 from collect_badcases import collect_badcases
 
 
-def _artifact(records):
-    return {"artifact_type": "retrieval_evaluation", "records": records}
+def _artifact(records, *, source_query_path=None):
+    artifact = {"artifact_type": "retrieval_evaluation", "records": records}
+    if source_query_path is not None:
+        artifact["configuration"] = {"source_query_path": source_query_path}
+    return artifact
 
 
 class CollectBadcasesTests(unittest.TestCase):
@@ -103,6 +106,45 @@ class CollectBadcasesTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 collect_badcases(results_path, case_summary_path)
+
+    def test_falls_back_to_queries_artifact_using_source_query_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            results_path = root / "results.json"
+            query_path = root / "queries.json"
+            case_summary_path = root / "cases.json"
+            results_path.write_text(
+                json.dumps(
+                    _artifact(
+                        [
+                            {
+                                "sample_index": 4,
+                                "expected_case_id": "KT4",
+                                "query": "q1",
+                                "status": "success",
+                                "matched_rank": None,
+                                "retrieval_trace": [],
+                            }
+                        ],
+                        source_query_path="queries.json",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            query_path.write_text(
+                json.dumps(
+                    {
+                        "artifact_type": "generated_queries",
+                        "records": [{"sample_index": 4, "query": "q1", "queries": ["q1", "q2"]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            case_summary_path.write_text(json.dumps({"KT4": {"case_name": "案例4"}}), encoding="utf-8")
+
+            report = collect_badcases(results_path, case_summary_path)
+
+        self.assertEqual(report["records"][0]["queries"], ["q1", "q2"])
 
     def test_rejects_non_object_case_summary(self):
         with tempfile.TemporaryDirectory() as directory:
