@@ -208,6 +208,170 @@ The per-sample fields are `time_to_retrieval_sec` and
 latency average only includes samples that reached that stage; the artifact
 records the corresponding completed-sample count.
 
+## Multi-query evaluation with Laya filtering
+
+`evaluate_laya.py` is a separate multi-query pipeline:
+custom-prompt generation -> retrieve each query -> deduplicate by `case_id`
+-> judge each unique case against the dialogue with Laya -> filter -> fuse.
+It reuses the existing retrieval endpoint and generated-query artifact format.
+Generation always uses `custom_multi`; there is no built-in prompt selection.
+One query in a `queries` array is accepted when the custom generator only
+finds one useful search direction; single-query artifacts without that array
+are rejected per sample.
+
+Use Python 3.11+ (the existing evaluation code uses `datetime.UTC`), then install:
+
+```bash
+python -m pip install -r requirements-laya.txt
+```
+
+Use an existing query file without calling the query-generation LLM:
+
+```bash
+python evaluate_laya.py retrieve \
+  --config config.json \
+  --query-file results/custom_multi_queries.json \
+  --output results/custom_multi_laya.json \
+  --device cuda \
+  --threshold 0.5 \
+  --fusion-method round_robin \
+  --top-k 10
+```
+
+The query file is the `generated_queries` JSON artifact produced by
+`evaluate.py generate` / `generate_queries.py`: each successful record needs
+`queries`, `chat_content`, and the usual identifiers and expected case ID.
+`--input` is also accepted for the query artifact in `retrieve` mode. Older
+artifacts missing `chat_content` can supply `--dialogues-file data/dialogs.json`;
+the script restores by `sample_index` and verifies `call_sno` and the expected
+case ID against the source to avoid judging the wrong dialogue.
+
+Generate queries using your own prompt, then immediately retrieve and filter:
+
+```bash
+python evaluate_laya.py all \
+  --config config.json \
+  --input data/dialogs.json \
+  --prompt-file prompts/laya_multi_query.txt \
+  --query-output results/custom_multi_queries.json \
+  --output results/custom_multi_laya.json \
+  --device cuda \
+  --fusion-method score
+```
+
+The included prompt is an editable starting point. Like other `custom_multi`
+templates, it must contain `{dialogue}` and ask for a JSON object whose `query`
+field is an array, for example `{"query": ["first query", "second query"]}`.
+`generate` runs only generation (`--output` specifies the query artifact);
+`all --query-file FILE` bypasses generation and uses that file. The existing
+`llm`, `query_generation`, and `retrieval` config sections still apply;
+generation requires a prompt from `--prompt-file` or
+`query_generation.prompt_file`. Retrieval concurrency comes from
+`--concurrency` / `retrieval.concurrency`; generation concurrency comes from
+`--query-concurrency` / `query_generation.concurrency`.
+
+Optional Laya defaults in `config.json` (CLI values take precedence):
+
+```json
+{
+  "laya_filter": {
+    "model": "convaiinnovations/laya-multilingual",
+    "device": "cuda",
+    "threshold": 0.5,
+    "batch_size": 16,
+    "max_len": 1024,
+    "head_max_len": 256,
+    "fast": false
+  }
+}
+```
+
+The multilingual checkpoint is the default; `--laya-model` can name a local
+checkpoint directory or another Hub model. The first load downloads weights.
+Omit `--device` to let Laya choose, or use `--device cpu` / `mps` as appropriate.
+The model loads once per run. Unique title/dialogue pairs are passed to
+`predict_batch` with `--batch-size` (default 16) and length grouping; sample
+retrieval can run concurrently, while shared-model inference is serialized.
+For supported NVIDIA setups, install `"laya[fast]"` and add `--fast` to enable
+the optional TileLang path. First-use compilation can affect timings.
+
+Filtering uses a fixed two-option `choice` question with `related` and
+`unrelated` descriptions. Only **case title + original dialogue** are passed
+to Laya; neither the expected case ID nor the retrieval score is model input.
+Keep a case when `probabilities.related >= threshold` (default 0.5).
+This threshold is an experimental setting, not a calibrated accuracy guarantee.
+`--max-len` and `--head-max-len` control token budgets. If Laya reports input
+truncation, an empty title, or invalid output, the sample fails filtering with
+an explicit error instead of silently using an incomplete decision. Raise the
+token limit or shorten the source dialogue when needed.
+
+After filtering, `round_robin` takes turns among the surviving per-query
+lists, skipping duplicate IDs; `score` retains the highest retrieval score
+per ID and sorts descending. Both apply `top_k` **after** filtering, so lower
+ranked relevant cases can fill the places of removed cases. Laya probabilities
+are used for filtering, not as replacement ranking scores. Empty surviving
+lists are valid successful results with no recall hit. Partial query retrieval
+failures still use the successful lists and report `partial_success`.
+
+The output retains `artifact_type: retrieval_evaluation` and the existing
+`retrieval_trace`, `matched_rank`, and `metrics` fields for downstream tools.
+It additionally records:
+
+- `prefilter_metrics`: Recall@K before filtering with the same fusion and top K.
+- `per_query_traces` / `prefilter_trace`: original deduplicated lists and baseline fusion.
+- `laya_judgments`: every unique case's title, probability, choice, and keep/drop decision.
+- Candidate counts, `filter_status`, and `filter_error` for inspecting removals and failures.
+- `model_load_seconds` and per-sample retrieval/filter/fusion/total timings.
+- `union_top_k`: hits and recall at K=1/3/5/10 (plus the configured `top_k`),
+  counted when **any query's original rank** for the expected case is at most K,
+  before filtering or fusion. Each sample counts at most once. Each record also
+  has `union_matched_rank` and per-K boolean `union_top_k` values.
+- `threshold_search`: the best probability threshold and fusion strategy for
+  Recall@10, the best setting for each strategy, and every tested setting.
+
+New retrieval runs automatically compute these analyses. To analyse an already
+saved Laya result file offline, with no model loading or retrieval calls:
+
+```bash
+python evaluate_laya.py analyze \
+  --input results/custom_multi_laya.json \
+  --output results/custom_multi_laya_analyzed.json
+```
+
+This mode only needs the result's `per_query_traces` and `laya_judgments` plus
+evaluation identifiers/statuses; it does not read `config.json`. It preserves
+the original configured `metrics` and final trace and adds analysis fields.
+Query-generation artifacts alone do not contain the retrieval results or
+Laya probabilities needed for this analysis.
+
+The search tests `round_robin` and `score`, always fusing to **10 cases** even
+if the original run used another `top_k`. It tests 0, 1, and every distinct
+saved `related_probability`. With the `>=` keep rule, these cover every
+attainable candidate set, so the search is exact rather than a coarse grid.
+It reuses probabilities and does not rerun Laya. Contributions are accumulated
+by per-sample probability intervals, avoiding replaying the entire dataset
+for every global threshold. `threshold_search.best` records `threshold`,
+`fusion_method`, `hits_at_10`, and `recall_at_10`; `best_by_fusion` records each
+strategy's optimum. `results` records all tested combinations. For ties the
+reported best uses the lowest threshold, then `round_robin` before `score`.
+All input samples remain in the recall denominator. Samples with failed or
+incomplete Laya judgments count as misses and are listed in `skipped_samples`;
+if none are evaluable, `best` is null. This optimum is measured on the saved
+dataset used to select it; validate the chosen setting on separate data.
+
+`union_top_k.all_candidates_recall` also reports union recall over **all saved
+candidates**, which is the upper bound for the full saved candidate pool.
+`union_top_k.recall_at_10` is the upper bound when restricting each query to
+its original Top 10. A case originally ranked 11 or lower can enter the final
+Top 10 after filtering, so final Recall@10 can exceed the original-Top-10
+union value when the saved lists contain more than 10 cases each.
+
+Filtering times include batch preparation and, with concurrent samples, waiting
+for the model lock. They are pipeline timings, not isolated GPU kernel timings.
+Both Recall@K summaries use all input samples as the denominator; a filtering
+failure counts as a failure in final metrics while its successful prefilter
+retrieval remains represented in the baseline.
+
 ## Multi-query retrieval fusion
 
 `--method multi_query` asks the model to propose up to three queries per
