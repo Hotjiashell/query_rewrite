@@ -372,6 +372,106 @@ Both Recall@K summaries use all input samples as the denominator; a filtering
 failure counts as a failure in final metrics while its successful prefilter
 retrieval remains represented in the baseline.
 
+## Multi-query evaluation with StartLux-Decision-4B
+
+`evaluate_startlux.py` uses the same generation, retrieval, deduplication,
+probability filtering, fusion, union recall, and exact threshold search pipeline
+as `evaluate_laya.py`, with StartLux's `decide_batch` as the model backend.
+The default checkpoint directory is `./StartLux-Decision-4B`; model calls use
+the upstream PyTorch `StartLuxDecision` class, with image input disabled.
+This entry point does not select MLX automatically. On CUDA, the upstream model
+checks that its required fast kernels are active. CPU is supported by upstream
+but is slow. For setup details see the
+[upstream model card](https://huggingface.co/startlux-models/StartLux-Decision-4B)
+and [inference guide](https://github.com/StartLuxLabs/StartLux-Decision/blob/main/docs/inference.md).
+
+From this project directory, download the model (the model folder contains
+`startlux_decision/` and its own requirements), install the dependencies, and
+make that package importable:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install huggingface_hub
+hf download startlux-models/StartLux-Decision-4B --local-dir StartLux-Decision-4B
+python -m pip install -r StartLux-Decision-4B/requirements.txt
+export PYTHONPATH="$PWD/StartLux-Decision-4B${PYTHONPATH:+:$PYTHONPATH}"
+python -m startlux_decision.check StartLux-Decision-4B
+```
+
+The CUDA check should report `fast kernels: active`. If the model directory is
+elsewhere, point `PYTHONPATH` at the directory containing `startlux_decision/`
+and use `--startlux-model /path/to/checkpoint`. No Laya installation is needed.
+
+Run with existing multi-query artifacts:
+
+```bash
+python evaluate_startlux.py retrieve \
+  --config config.json \
+  --query-file results/custom_multi_queries.json \
+  --output results/custom_multi_startlux.json \
+  --device cuda \
+  --threshold 0.5 \
+  --fusion-method round_robin \
+  --top-k 10 \
+  --batch-size 16
+```
+
+Or generate with your specified prompt and run the full pipeline:
+
+```bash
+python evaluate_startlux.py all \
+  --config config.json \
+  --input data/dialogs.json \
+  --prompt-file prompts/laya_multi_query.txt \
+  --query-output results/custom_multi_queries.json \
+  --output results/custom_multi_startlux.json \
+  --device cuda
+```
+
+The custom query prompt is model-independent and can be reused or replaced.
+`generate`, `--dialogues-file`, retrieval concurrency, and LLM generation flags
+work as in the Laya entry point. Offline analysis needs neither model nor config:
+
+```bash
+python evaluate_startlux.py analyze \
+  --input results/custom_multi_startlux.json \
+  --output results/custom_multi_startlux_analyzed.json
+```
+
+Optional model settings in `config.json`:
+
+```json
+{
+  "startlux_filter": {
+    "model": "StartLux-Decision-4B",
+    "device": "cuda",
+    "threshold": 0.5,
+    "batch_size": 16,
+    "max_len": 4096,
+    "max_batch_tokens": 65536
+  }
+}
+```
+
+CLI values override this section. `--max-len` is the total prompt token limit
+(default 4096); upstream raises an error when an input exceeds it, without
+silently truncating the dialogue. `--max-batch-tokens` limits upstream padded
+forward-pass token budgets (default 65536). `--batch-size` additionally chunks
+unique case pairs into groups of at most N before calling `decide_batch`.
+StartLux has no separate question-head budget, so `--head-max-len`,
+`--laya-model`, and `--fast` are not accepted by this entry point.
+
+Result fields and analyses have the same meanings as in the Laya pipeline;
+the model-specific names are `startlux_judgments`,
+`timings.startlux_filter_seconds`, and `configuration.startlux_filter`.
+Both entry points can analyse either model's saved results. The
+`related_probability` threshold is re-searched for the new model; a Laya
+threshold is not assumed to transfer.
+
+The upstream code is Apache-2.0; the released weights are CC BY-NC 4.0 and
+commercial use requires separate permission from StartLux Labs, as stated in
+the [model card](https://huggingface.co/startlux-models/StartLux-Decision-4B#license).
+
 ## Multi-query retrieval fusion
 
 `--method multi_query` asks the model to propose up to three queries per

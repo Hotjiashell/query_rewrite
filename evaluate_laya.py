@@ -82,7 +82,7 @@ def analyse_saved_results(artifact: dict[str, Any]) -> dict[str, Any]:
     for position, record in enumerate(records):
         raw_traces = record.get("per_query_traces")
         if not isinstance(raw_traces, list):
-            raise ValueError("missing per_query_traces; use an evaluate_laya.py result file")
+            raise ValueError("missing per_query_traces; use a saved multi-query filter result file")
         traces = []
         for item in raw_traces:
             if not isinstance(item, Mapping) or not isinstance(item.get("trace"), list):
@@ -111,7 +111,7 @@ def analyse_saved_results(artifact: dict[str, Any]) -> dict[str, Any]:
         if record.get("filter_status") != "success":
             reason = "filter did not succeed"
         else:
-            judgments = record.get("laya_judgments", [])
+            judgments = record.get("startlux_judgments", record.get("laya_judgments", []))
             if not isinstance(judgments, list):
                 judgments = []
                 reason = "invalid laya_judgments"
@@ -137,7 +137,7 @@ def analyse_saved_results(artifact: dict[str, Any]) -> dict[str, Any]:
     total = len(records)
     artifact["union_top_k"] = {
         "total_samples": total,
-        "definition": "Any query retrieves the expected case at original rank <= k, before Laya filtering or fusion.",
+        "definition": "Any query retrieves the expected case at original rank <= k, before relevance filtering or fusion.",
         **{f"hits_at_{k}": hits for k, hits in union_hits.items()},
         **{f"recall_at_{k}": hits / total if total else 0.0 for k, hits in union_hits.items()},
         "all_candidates_hits": all_candidate_hits,
@@ -367,8 +367,8 @@ def restore_dialogues(records: Sequence[GeneratedQueryRecord], path: str) -> lis
     return restored
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(argv: Sequence[str] | None = None, *, backend: str = "laya") -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__ if backend == "laya" else "Custom multi-query evaluation with StartLux-Decision-4B.")
     parser.add_argument("stage", nargs="?", default="retrieve", choices=("generate", "retrieve", "all", "analyze"))
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--input", help="source dialogues for generate/all; query artifact for retrieve")
@@ -377,7 +377,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", help="final retrieval artifact (query artifact in generate mode)")
     parser.add_argument("--dialogues-file", help="restore missing chat_content in an older query artifact")
     parser.add_argument("--prompt-file", help="custom multi-query prompt containing {dialogue}")
-    parser.add_argument("--concurrency", type=int, help="concurrent retrieval samples; Laya forwards are serialized")
+    parser.add_argument("--concurrency", type=int, help="concurrent retrieval samples; shared-model forwards are serialized")
     parser.add_argument("--query-concurrency", type=int)
     for name in ("base-url", "model", "api-key"):
         parser.add_argument(f"--{name}")
@@ -386,18 +386,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--fusion-method", choices=tuple(FUSIONS))
     parser.add_argument("--top-k", type=int)
-    parser.add_argument("--laya-model", help="Hub checkpoint or local checkpoint directory")
-    parser.add_argument("--device", help="cpu, cuda, mps; default auto")
+    if backend == "laya":
+        parser.add_argument("--laya-model", help="Hub checkpoint or local checkpoint directory")
+    else:
+        parser.add_argument("--startlux-model", help="local checkpoint directory (default: StartLux-Decision-4B)")
+        parser.add_argument("--max-batch-tokens", type=int, help="padded batch token budget (default: 65536)")
+        parser.set_defaults(laya_model=None, head_max_len=None, fast=None)
+    parser.add_argument("--device", help="cpu, cuda, mps; default auto" if backend == "laya" else "PyTorch device: cpu or cuda; default auto")
     parser.add_argument("--threshold", type=float, help="minimum P(related), default 0.5")
-    parser.add_argument("--batch-size", type=int, help="case pairs per Laya batch, default 16")
-    parser.add_argument("--max-len", type=int, help="total token budget, default 1024")
-    parser.add_argument("--head-max-len", type=int, help="question token budget, default 256")
-    parser.add_argument("--fast", action="store_true", default=None, help="TileLang CUDA fast path")
+    parser.add_argument("--batch-size", type=int, help="case pairs per model batch, default 16")
+    parser.add_argument("--max-len", type=int, help="total token budget, default " + ("1024" if backend == "laya" else "4096"))
+    if backend == "laya":
+        parser.add_argument("--head-max-len", type=int, help="question token budget, default 256")
+        parser.add_argument("--fast", action="store_true", default=None, help="TileLang CUDA fast path")
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
+def main(argv: Sequence[str] | None = None, *, args: argparse.Namespace | None = None,
+         filter_factory=None) -> int:
+    args = args if args is not None else parse_args(argv)
     try:
         if args.stage == "analyze":
             if not args.input or not args.output:
@@ -442,9 +449,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         records = load_generated_query_records(retrieval.input_path)
         if args.dialogues_file:
             records = restore_dialogues(records, args.dialogues_file)
-        settings = config.get("laya_filter", {})
+        filter_name = "startlux_filter" if filter_factory else "laya_filter"
+        settings = config.get(filter_name, {})
         if not isinstance(settings, Mapping):
-            raise ValueError("laya_filter configuration must be an object")
+            raise ValueError(f"{filter_name} configuration must be an object")
         def setting(name: str, default: Any) -> Any:
             value = getattr(args, name)
             return value if value is not None else settings.get(name, default)
@@ -455,26 +463,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         model = args.laya_model or settings.get("model", "convaiinnovations/laya-multilingual")
         device = setting("device", None)
         fast = setting("fast", False)
-        # Validate budgets before downloading any checkpoint.
-        relevance_filter = LayaRelevanceFilter(None, **options)
-        try:
-            import laya
-        except ImportError as exc:
-            raise RuntimeError("Install Laya with: python -m pip install -r requirements-laya.txt") from exc
         load_started = time.perf_counter()
-        relevance_filter.agent = laya.load(model, device=device, fast=fast)
+        if filter_factory:
+            relevance_filter, filter_metadata = filter_factory(args, settings)
+        else:
+            # Validate budgets before downloading any checkpoint.
+            relevance_filter = LayaRelevanceFilter(None, **options)
+            try:
+                import laya
+            except ImportError as exc:
+                raise RuntimeError("Install Laya with: python -m pip install -r requirements-laya.txt") from exc
+            relevance_filter.agent = laya.load(model, device=device, fast=fast)
+            filter_metadata = {**options, "model": model, "device": device, "fast": fast}
         load_seconds = time.perf_counter() - load_started
         evaluated = LayaMultiQueryEvaluator(
             SearchRetriever(retrieval.url, retrieval.timeout), relevance_filter,
             fusion_method=retrieval.fusion_method, top_k=retrieval.top_k,
         ).evaluate(records, retrieval.concurrency, progress=True)
+        if filter_factory:
+            for record in evaluated:
+                record["startlux_judgments"] = record.pop("laya_judgments")
+                if "laya_filter_seconds" in record["timings"]:
+                    record["timings"]["startlux_filter_seconds"] = record["timings"].pop("laya_filter_seconds")
         artifact = build_retrieval_artifact(
             evaluated, input_path=retrieval.input_path, retrieval_url=retrieval.url,
             timeout=retrieval.timeout, concurrency=retrieval.concurrency,
             fusion_method=retrieval.fusion_method, top_k=retrieval.top_k,
         )
-        artifact["configuration"]["pipeline"] = "multi_query_laya_filter"
-        artifact["configuration"]["laya_filter"] = {**options, "model": model, "device": device, "fast": fast}
+        artifact["configuration"]["pipeline"] = "multi_query_" + filter_name
+        artifact["configuration"][filter_name] = filter_metadata
         artifact["configuration"]["relevance_questions"] = RELEVANCE_QUESTIONS
         artifact["model_load_seconds"] = load_seconds
         artifact["prefilter_metrics"] = calculate_metrics([
