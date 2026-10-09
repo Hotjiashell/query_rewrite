@@ -390,6 +390,8 @@ def parse_args(argv: Sequence[str] | None = None, *, backend: str = "laya") -> a
         parser.add_argument("--laya-model", help="Hub checkpoint or local checkpoint directory")
     else:
         parser.add_argument("--startlux-model", help="local checkpoint directory (default: StartLux-Decision-4B)")
+        parser.add_argument("--startlux-endpoint", help="StartLux HTTP endpoint (default: http://127.0.0.1:8090/v1/systemone)")
+        parser.add_argument("--startlux-timeout", type=float, help="StartLux HTTP timeout in seconds (default: 120)")
         parser.add_argument("--max-batch-tokens", type=int, help="padded batch token budget (default: 65536)")
         parser.set_defaults(laya_model=None, head_max_len=None, fast=None)
     parser.add_argument("--device", help="cpu, cuda, mps; default auto" if backend == "laya" else "PyTorch device: cpu or cuda; default auto")

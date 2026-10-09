@@ -377,15 +377,30 @@ retrieval remains represented in the baseline.
 `evaluate_startlux.py` uses the same generation, retrieval, deduplication,
 probability filtering, fusion, union recall, and exact threshold search pipeline
 as `evaluate_laya.py`, with StartLux's `decide_batch` as the model backend.
-The default checkpoint directory is `./StartLux-Decision-4B`; model calls use
-the upstream PyTorch `StartLuxDecision` class, with image input disabled.
-This entry point does not select MLX automatically. On CUDA, the upstream model
-checks that its required fast kernels are active. CPU is supported by upstream
-but is slow. For setup details see the
+The default model backend is the local HTTP server at
+`http://127.0.0.1:8090/v1/systemone`, so the evaluation script does not load
+weights into the evaluation process. Model calls use the upstream
+`/v1/systemone` request format, with image input disabled. Set
+`--startlux-endpoint http://host:port/v1/systemone` or configure
+`startlux_filter.endpoint` to use another server. The local-checkpoint path
+remains available with `--startlux-model`; model calls then use the upstream
+PyTorch `StartLuxDecision` class. This entry point does not select MLX
+automatically. On CUDA, the upstream local model checks that its required fast
+kernels are active. CPU is supported by upstream but is slow. For setup details see the
 [upstream model card](https://huggingface.co/startlux-models/StartLux-Decision-4B)
 and [inference guide](https://github.com/StartLuxLabs/StartLux-Decision/blob/main/docs/inference.md).
 
-From this project directory, download the model (the model folder contains
+For HTTP mode, start the upstream server separately on port 8090. From the model
+directory, the upstream commands are:
+
+```bash
+python -m startlux_decision.server --model StartLux-Decision-4B --port 8090
+curl -s http://127.0.0.1:8090/health
+```
+
+When the health endpoint is working, run the evaluation script directly; it
+only needs the project's `requests` dependency. To use the optional local
+checkpoint mode, download the model (the model folder contains
 `startlux_decision/` and its own requirements), install the dependencies, and
 make that package importable:
 
@@ -402,7 +417,7 @@ The CUDA check should report `fast kernels: active`. If the model directory is
 elsewhere, point `PYTHONPATH` at the directory containing `startlux_decision/`
 and use `--startlux-model /path/to/checkpoint`. No Laya installation is needed.
 
-Run with existing multi-query artifacts:
+Run with existing multi-query artifacts against the default local server:
 
 ```bash
 python evaluate_startlux.py retrieve \
@@ -415,6 +430,12 @@ python evaluate_startlux.py retrieve \
   --top-k 10 \
   --batch-size 16
 ```
+
+`--batch-size` groups the HTTP calls made for one dialogue; the upstream server
+currently exposes one `/v1/systemone` request at a time, so it does not turn
+those calls into one network batch. `--startlux-timeout` defaults to 120 seconds
+per case judgment. The actual filtering timing in the result includes HTTP
+round trips and server queue time.
 
 Or generate with your specified prompt and run the full pipeline:
 

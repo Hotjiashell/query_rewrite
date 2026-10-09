@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from evaluate import build_query_artifact
-from evaluate_startlux import StartLuxBatchAdapter, create_filter, main, parse_args
+from evaluate_startlux import StartLuxBatchAdapter, StartLuxHTTPAdapter, create_filter, main, parse_args
 from test_evaluate_laya import Retriever, source
 
 
@@ -49,6 +49,28 @@ class StartLuxTests(unittest.TestCase):
         from evaluate_startlux import DEFAULT_MODEL
         self.assertEqual(DEFAULT_MODEL, "StartLux-Decision-4B")
 
+    def test_http_adapter_posts_systemone_and_normalizes_base_url(self):
+        response = SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"answers": {"relevance": {"probabilities": {"related": 0.8}}}, "usage": {"input_tokens": 1}},
+        )
+        with patch("evaluate_startlux.requests.Session") as session_cls:
+            session_cls.return_value.post.return_value = response
+            adapter = StartLuxHTTPAdapter("http://127.0.0.1:8090")
+            result = adapter.predict_batch([{"dialogue": "d", "case_title": "t"}], {"relevance": {}}, batch_size=16)
+            self.assertEqual(adapter.endpoint, "http://127.0.0.1:8090/v1/systemone")
+            self.assertEqual(result[0]["answers"]["relevance"]["probabilities"]["related"], 0.8)
+            kwargs = session_cls.return_value.post.call_args.kwargs
+            self.assertEqual(kwargs["json"]["state"]["case_title"], "t")
+            self.assertEqual(kwargs["json"]["questions"]["relevance"], {})
+
+    def test_factory_defaults_to_local_http_endpoint_without_loading_weights(self):
+        args = parse_args([])
+        filter_, metadata = create_filter(args, {})
+        self.assertEqual(metadata["backend"], "http")
+        self.assertEqual(metadata["endpoint"], "http://127.0.0.1:8090/v1/systemone")
+        self.assertEqual(filter_.agent.timeout, 120.0)
+
     def test_existing_queries_produce_startlux_audits_and_offline_analysis(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -58,7 +80,8 @@ class StartLuxTests(unittest.TestCase):
             constructor = unittest.mock.Mock(return_value=StartLuxModel())
             with patch.dict("sys.modules", {"startlux_decision": SimpleNamespace(StartLuxDecision=constructor), "laya": None}), \
                  patch("evaluate_laya.SearchRetriever", return_value=Retriever()), contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(main(["retrieve", "--config", str(config), "--query-file", str(queries)]), 0)
+                self.assertEqual(main(["retrieve", "--config", str(config), "--query-file", str(queries),
+                                       "--startlux-model", directory]), 0)
             artifact = json.loads(output.read_text())
             self.assertEqual(artifact["configuration"]["pipeline"], "multi_query_startlux_filter")
             record = artifact["records"][0]
