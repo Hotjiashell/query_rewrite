@@ -372,6 +372,77 @@ Both Recall@K summaries use all input samples as the denominator; a filtering
 failure counts as a failure in final metrics while its successful prefilter
 retrieval remains represented in the baseline.
 
+## StartLux serial latency benchmark
+
+`latency_benchmark_startlux.py` follows the serial sampling approach of
+`latency_benchmark.py`, with the pipeline: custom multi-query generation →
+parallel retrieval for that sample's queries → candidate deduplication →
+StartLux relevance filtering → fusion. Each sample finishes before the next
+sample starts. The default filter endpoint is `http://127.0.0.1:8090/v1/systemone`.
+
+Benchmark the full pipeline using your prompt:
+
+```bash
+python latency_benchmark_startlux.py \
+  --config config.json \
+  --input data/dialogs.json \
+  --prompt-file prompts/laya_multi_query.txt \
+  --test-num 100 \
+  --threshold 0.5 \
+  --fusion-method round_robin \
+  --output results/latency_benchmark_startlux.json
+```
+
+Or reuse generated queries to measure retrieval, filtering and fusion:
+
+```bash
+python latency_benchmark_startlux.py \
+  --config config.json \
+  --query-file results/custom_multi_queries.json \
+  --test-num 100 \
+  --startlux-endpoint http://127.0.0.1:8090/v1/systemone \
+  --threshold 0.5 \
+  --fusion-method score \
+  --output results/latency_benchmark_startlux_score.json
+```
+
+`--test-num 0` (the default) runs all samples. Older query files without dialogue
+text also need `--dialogues-file`. The benchmark accepts the same retrieval and
+StartLux options as `evaluate_startlux.py`; sample execution stays serial.
+Optional configuration section `startlux_benchmark` supports `input_path`,
+`output_path` and `test_num`, with CLI flags taking precedence.
+
+The result's `latency` contains the following summaries, each with
+`completed_samples`, `total_seconds` and `average_seconds`:
+
+| Field | Timing scope |
+| --- | --- |
+| `query_generation_only` | Custom multi-query generation; absent per-sample timings when reusing queries |
+| `retrieval_only` | Parallel queries, response parsing and per-query deduplication |
+| `filter_only` | Relevance judgments for unique candidates, including HTTP round trips and server queue time |
+| `fusion_only` | Apply the keep decisions to each query's candidates and fuse |
+| `time_to_retrieval` | Cumulative time through retrieval |
+| `time_to_filter` | Cumulative time through relevance judgments |
+| `time_to_fusion` | Cumulative time through the final fused result |
+| `total_attempt` | All attempted samples, including failures |
+
+Cumulative timings start before generation, or before retrieval when
+`--query-file` is supplied. Per-sample timings and the raw candidates and
+probabilities are saved in `records`. Cumulative completion summaries include
+only samples that completed the corresponding stage; attempt timings retain
+failures. Stage durations and cumulative durations can differ slightly because
+cumulative durations also include candidate preparation and result assembly.
+
+Model/client setup, aggregate recall, union recall, threshold/fusion search,
+file writes and progress printing are outside the sample timers. The result
+still includes `union_top_k` and `threshold_search` for analysis;
+`offline_analysis_seconds` measures that analysis separately. The timed fusion
+always uses the threshold and method selected for this run. Setup is recorded
+separately in `setup_seconds`; there is no automatic warmup, so the first
+request's cold latency is included. HTTP timing measures the service as it runs,
+including slow kernels if the server uses them. Saved results can also be
+replayed using `recall_at_threshold.py`.
+
 ## Multi-query evaluation with StartLux-Decision-4B
 
 `evaluate_startlux.py` uses the same generation, retrieval, deduplication,

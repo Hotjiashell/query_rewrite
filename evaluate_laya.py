@@ -367,18 +367,26 @@ def restore_dialogues(records: Sequence[GeneratedQueryRecord], path: str) -> lis
     return restored
 
 
-def parse_args(argv: Sequence[str] | None = None, *, backend: str = "laya") -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None, *, backend: str = "laya",
+               benchmark: bool = False) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__ if backend == "laya" else "Custom multi-query evaluation with StartLux-Decision-4B.")
-    parser.add_argument("stage", nargs="?", default="retrieve", choices=("generate", "retrieve", "all", "analyze"))
+    if benchmark:
+        parser.description = "Serial StartLux multi-query latency benchmark; offline analysis is excluded."
+        parser.set_defaults(stage="all", concurrency=1, query_concurrency=1, query_output=None)
+        parser.add_argument("--test-num", type=int, help="samples to benchmark; 0 means all (default 0)")
+    else:
+        parser.add_argument("stage", nargs="?", default="retrieve", choices=("generate", "retrieve", "all", "analyze"))
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--input", help="source dialogues for generate/all; query artifact for retrieve")
     parser.add_argument("--query-file", help="existing generated_queries artifact; bypasses generation")
-    parser.add_argument("--query-output", help="generated query artifact path")
+    if not benchmark:
+        parser.add_argument("--query-output", help="generated query artifact path")
     parser.add_argument("--output", help="final retrieval artifact (query artifact in generate mode)")
     parser.add_argument("--dialogues-file", help="restore missing chat_content in an older query artifact")
     parser.add_argument("--prompt-file", help="custom multi-query prompt containing {dialogue}")
-    parser.add_argument("--concurrency", type=int, help="concurrent retrieval samples; shared-model forwards are serialized")
-    parser.add_argument("--query-concurrency", type=int)
+    if not benchmark:
+        parser.add_argument("--concurrency", type=int, help="concurrent retrieval samples; shared-model forwards are serialized")
+        parser.add_argument("--query-concurrency", type=int)
     for name in ("base-url", "model", "api-key"):
         parser.add_argument(f"--{name}")
     parser.add_argument("--temperature", type=float)
