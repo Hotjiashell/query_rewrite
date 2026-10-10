@@ -493,6 +493,41 @@ The upstream code is Apache-2.0; the released weights are CC BY-NC 4.0 and
 commercial use requires separate permission from StartLux Labs, as stated in
 the [model card](https://huggingface.co/startlux-models/StartLux-Decision-4B#license).
 
+## Recall at a specified relevance threshold
+
+Use `recall_at_threshold.py` to replay a saved StartLux (or Laya) result at
+one specified threshold without model or retrieval calls:
+
+```bash
+python recall_at_threshold.py \
+  --input results/custom_multi_startlux.json \
+  --threshold 0.7
+```
+
+The script keeps cases with `related_probability >= threshold`, restores each
+query's original ordering from `per_query_traces`, and fuses up to 10 cases.
+It prints Recall@1/3/5/10 and their hit counts. The default fusion strategy is
+read from the source artifact; override it with `--fusion-method round_robin`
+or `--fusion-method score`. The saved final trace and its original top-K cap
+do not restrict replay, so cases dropped in the original run can return at a
+lower threshold. All original candidates must have valid saved judgments.
+
+Optionally save the recalculated per-sample traces, matched ranks, errors,
+and aggregate metrics to a separate file:
+
+```bash
+python recall_at_threshold.py \
+  --input results/custom_multi_startlux.json \
+  --threshold 0.7 \
+  --fusion-method score \
+  --output results/startlux_threshold_0.7_score.json
+```
+
+All input samples remain in the denominator. Failed filtering samples or
+incomplete judgments count as misses and are reported as failures; a successful
+sample with no surviving cases is valid and contributes no hit. The script
+refuses to overwrite the original source result file.
+
 ## Multi-query retrieval fusion
 
 `--method multi_query` asks the model to propose up to three queries per
