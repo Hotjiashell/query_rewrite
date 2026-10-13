@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "artifact_type": "badcase_analysis",
+  "created_at": "2026-10-13T06:00:00+00:00",
+  "records": [
+    {
+      "record_key": "12",
+      "sample_index": 12,
+      "status": "success",
+      "stage1": {
+        "ranks": [2, 6],
+        "reason": "用户忘记手机银行登录密码。第2个案例标题直接涉及密码重置，第6个案例涉及无法登录，可能包含相关处理方法，需要进一步查看正文。"
+      },
+      "decisions": [
+        {
+          "rank": 2,
+          "case_id": "DEMO_KT000123",
+          "title": "手机银行登录密码忘记如何处理",
+          "same": true,
+          "reason": "用户诉求是忘记登录密码后恢复登录。候选案例与GT都要求通过手机号及身份验证后重置登录密码，适用条件和关键步骤一致，能够直接解决用户的问题。"
+        },
+        {
+          "rank": 6,
+          "case_id": "DEMO_KT000456",
+          "title": "手机银行客户端无法登录",
+          "same": false,
+          "reason": "候选案例针对客户端缓存异常，建议清理缓存并重新安装。用户对话明确说明忘记登录密码，这些操作不能重置密码，因此无法解决当前问题。"
+        }
+      ]
+    },
+    {
+      "record_key": "15",
+      "sample_index": 15,
+      "status": "success",
+      "stage1": {
+        "ranks": [3],
+        "reason": "用户因预留手机号已停用而无法接收验证码，第3个案例涉及变更预留手机号，可能解决验证码无法接收的上游原因。"
+      },
+      "decisions": [
+        {
+          "rank": 3,
+          "case_id": "DEMO_KT000789",
+          "title": "原预留手机号停用后的变更流程",
+          "same": true,
+          "reason": "用户无法接收验证码的原因是原预留手机号已停用。候选案例提供身份核验后变更预留手机号的流程，变更后可使用新号码接收验证码，能够间接解决当前问题。"
+        }
+      ]
+    },
+    {
+      "record_key": "20",
+      "sample_index": 20,
+      "status": "success",
+      "stage1": {
+        "ranks": [],
+        "reason": "召回标题均与用户需要办理的业务及GT解决方法无关，未发现需要进一步查看正文的候选。"
+      },
+      "decisions": []
+    },
+    {
+      "record_key": "23",
+      "sample_index": 23,
+      "status": "success",
+      "stage1": {
+        "ranks": [4],
+        "reason": "第4个案例标题与用户诉求相关，需要查看正文确认适用条件及解决步骤。"
+      },
+      "decisions": [
+        {
+          "rank": 4,
+          "case_id": "DEMO_KT000999",
+          "title": "账户异常处理流程",
+          "same": null,
+          "reason": "候选案例内容未找到"
+        }
+      ]
+    },
+    {
+      "record_key": "27",
+      "sample_index": 27,
+      "status": "error",
+      "error": "ValueError: model response is not valid JSON"
+    }
+  ]
+}

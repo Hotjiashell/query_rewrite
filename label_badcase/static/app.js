@@ -1,0 +1,122 @@
+/* All writes are serialized; navigation waits for the current draft to reach disk. */
+const $ = id => document.getElementById(id);
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let data, state, stats, currentKey, draft, dirty = false, timer, queue = Promise.resolve(), fatalConflict = false;
+let filter = 'all', search = '';
+const hasYes = a => Object.values(a?.reviews || {}).some(r => r.verdict === 'yes');
+const record = () => data.records.find(r => r.key === currentKey);
+const blank = () => ({reviews:{}, error_type:'', error_detail:'', owner:'', completed:false});
+function notice(message='') { $('notice').textContent=message; $('notice').hidden=!message; }
+function saving(message, error=false) { $('save-state').textContent=message; $('save-state').classList.toggle('error',error); $('retry').hidden=!error; }
+function visible() {
+  return data.records.filter(r => {
+    const a=state.annotations[r.key];
+    const match=filter==='all' || filter==='pending'&&!a?.completed || filter==='complete'&&a?.completed || filter==='alternative'&&hasYes(a) || filter==='genuine'&&a?.completed&&!hasYes(a) || filter==='model'&&r.retrieved.some(c=>c.model_same===true&&!c.is_gt);
+    return match && (!search || [r.key,r.call_sno,r.chat_content,r.query,...r.queries,r.gt.title,...r.retrieved.map(c=>c.title)].join(' ').toLowerCase().includes(search));
+  });
+}
+function renderStats() {
+  const percent=stats.total ? Math.round(stats.completed/stats.total*100) : 0;
+  $('stats').innerHTML=[
+    ['全部 badcase',stats.total,'本次待复核数据'],
+    ['已完成标注',`${stats.completed} / ${stats.total}`,`${percent}% · ${stats.drafts} 条草稿`],
+    ['人工确认有其他正确案例',stats.alternative,'包含已确认“是”的草稿'],
+    ['真实 badcase',stats.genuine,'仅统计完成且没有其他正确案例'],
+    ['模型认为有其他正确案例',stats.model_positive,'模型建议，等待人工核验']
+  ].map(([title,value,sub],i)=>`<div class="stat ${i===2?'highlight':''}"><span>${title}</span><strong>${value}</strong><small>${sub}</small>${i===1?`<div class="progress"><i style="width:${percent}%"></i></div>`:''}</div>`).join('');
+}
+function histogram() {
+  const max=Math.max(1,...Object.values(stats.error_counts));
+  return `<div class="histogram"><h3>错误类型分布</h3><div class="model-note">仅统计已完成的真实 badcase</div>${Object.entries(stats.error_counts).map(([name,count])=>`<div class="hist-row"><span>${esc(name)}</span><div class="hist-bar"><i style="width:${count/max*100}%"></i></div><b>${count}</b></div>`).join('')}</div>`;
+}
+function pageInfo() {
+  const list=visible(), index=list.findIndex(r=>r.key===currentKey);
+  const originalIndex=data.records.findIndex(r=>r.key===currentKey);
+  $('page-info').textContent=index<0?`当前记录不在筛选结果中 · ${list.length} 条`:`${index+1} / ${list.length} 条`;
+  $('jump').max=list.length; $('jump').value=index>=0?index+1:'';
+  $('prev').disabled=index>=0?index<=0:!list.some(r=>data.records.indexOf(r)<originalIndex);
+  $('next').disabled=index>=0?index>=list.length-1:!list.some(r=>data.records.indexOf(r)>originalIndex);
+  $('complete').disabled=!record() || fatalConflict;
+  $('record-state').innerHTML=record()?`<b>样本 ${esc(currentKey)}</b> · ${draft.completed?'<span class="tag green">已完成</span>':'<span class="tag gold">待完成</span>'} <span class="muted">修改后自动保存</span>`:'';
+  $('complete').textContent=draft?.completed?'重新确认完成':'完成标注';
+}
+function reviewCard(c) {
+  const r=draft.reviews[c.case_id]||{};
+  return `<article class="candidate ${c.model_same===true?'positive':''}" data-cid="${esc(c.case_id)}"><div class="card-heading"><h3>#${c.rank} ${esc(c.title)}</h3><span class="tag ${c.model_same===true?'green':'gold'}">${c.model_same===true?'模型认为正确':'人工补充核验'}</span></div><span class="case-id">${esc(c.case_id)}</span><div class="content">${c.text?esc(c.text):'<span class="tag red">案例正文缺失，请补齐案例库再核验</span>'}</div>${c.model_reason?`<div class="model-reason"><b>模型理由</b><br>${esc(c.model_reason)}</div>`:''}<div class="verdict"><button data-verdict="yes" class="${r.verdict==='yes'?'selected':''}" aria-pressed="${r.verdict==='yes'}">是，能解决</button><button data-verdict="no" class="${r.verdict==='no'?'selected':''}" aria-pressed="${r.verdict==='no'}">否，不能解决</button></div><label class="form-field"><span>判断理由 *</span><textarea data-review-field="reason" placeholder="结合用户诉求、适用条件与处理步骤说明理由">${esc(r.reason||'')}</textarea></label><label class="form-field"><span>核验负责人 *</span><input data-review-field="owner" value="${esc(r.owner||'')}" placeholder="姓名 / 工号"></label></article>`;
+}
+function errorPanel() {
+  if(hasYes(draft)) return `<div class="card"><h2>已有其他正确案例</h2><p>已人工确认至少一个召回案例能够解决用户问题。完成其余待核验案例后，可点击“完成标注”。</p><p class="muted">如改为全部否决，将显示真实 badcase 分类表单。</p></div>`;
+  return `<div class="card"><h2>真实 badcase 分类</h2><p class="muted">当所有待核验案例都不能解决问题，或没有待核验案例时，请填写以下信息。尚未完成核验的记录不会计入真实 badcase 数量。</p><label class="form-field"><span>错误类型 *</span><select id="error-type"><option value="">请选择错误类型</option>${state.error_types.map(t=>`<option value="${esc(t)}" ${draft.error_type===t?'selected':''}>${esc(t)}</option>`).join('')}</select></label><label class="form-field"><span>详细说明 *</span><textarea id="error-detail" placeholder="说明漏召回的原因、query的问题、正确处理方向等">${esc(draft.error_detail)}</textarea></label><label class="form-field"><span>分类负责人 *</span><input id="error-owner" value="${esc(draft.owner)}" placeholder="姓名 / 工号"></label></div>`;
+}
+function renderWorkspace() {
+  const r=record();
+  if(!r) { $('workspace').innerHTML='<div class="empty"><h2>没有匹配的 badcase</h2><p>调整筛选条件或检查输入数据。</p></div>';pageInfo();return; }
+  const selected=r.retrieved.filter(c=>!c.is_gt&&(c.model_same===true||draft.reviews[c.case_id]));
+  $('workspace').innerHTML=`<div class="column"><section class="card"><div class="card-heading"><h2>用户与客服对话</h2><span class="tag">样本 ${esc(r.key)}</span></div><div class="model-note">会话编号 ${esc(r.call_sno||'未提供')}</div><div class="content scroll-content">${esc(typeof r.chat_content==='string'?r.chat_content:JSON.stringify(r.chat_content,null,2))||'未提供对话'}</div></section><section class="card"><h2>检索 Query</h2><div class="label">QUERY</div><div class="query">${esc(r.query)||'未提供'}</div><div class="label">QUERIES · ${r.queries.length} 条</div>${r.queries.length?r.queries.map((q,i)=>`<div class="query">${i+1}. ${esc(q)}</div>`).join(''):'<p class="muted">未提供多路 query</p>'}</section><section class="card"><div class="card-heading"><h2>GT 案例</h2><span class="tag green">标注正确案例</span></div><h3>${esc(r.gt.title)}</h3><span class="case-id">${esc(r.gt.case_id)}</span><div class="content scroll-content">${esc(r.gt.text)||'<span class="tag red">GT正文缺失</span>'}</div></section><section class="card"><h2>召回 Top-10</h2><p class="model-note">可查看正文，并补充核验模型漏选的非GT案例。</p><table class="retrieval"><tbody>${r.retrieved.map(c=>`<tr><td>${c.rank}</td><td><details><summary>${esc(c.title)}</summary><span class="case-id">${esc(c.case_id)}</span><div class="content">${esc(c.text)||'案例正文缺失'}</div>${c.model_reason?`<div class="model-note">模型理由：${esc(c.model_reason)}</div>`:''}</details>${c.is_gt?'<span class="tag">GT本身，不计入其他正确案例</span>':c.model_same===true?'<span class="tag green">模型认为正确</span>':c.model_same===false?'<span class="tag">模型否决</span>':'<span class="tag gold">未判断 / 未选中</span>'}</td><td>${c.is_gt?'':`<button data-add="${esc(c.case_id)}" ${selected.includes(c)?'disabled':''}>${selected.includes(c)?'已列入':'补充核验'}</button>`}</td></tr>`).join('')}</tbody></table>${histogram()}</section></div><div class="column"><section class="card"><div class="card-heading"><h2>人工核验</h2><span class="tag">${selected.length} 个待核验案例</span></div><p class="muted">核验召回案例能否直接或间接解决对话中的用户问题。每个案例分别填写判断、理由和负责人。</p>${r.model_status!=='success'?`<div class="model-reason"><span class="tag gold">模型分析${r.model_status==='missing'?'缺失':'失败'}</span><p>${esc(r.model_error||'请查看召回列表并手动补充需要核验的案例。')}</p></div>`:''}${r.stage1_reason?`<details><summary>查看模型初筛依据</summary><p class="content model-note">${esc(r.stage1_reason)}</p></details>`:''}${selected.length?selected.map(reviewCard).join(''):'<p class="muted">模型没有建议核验的正确案例。请复核左侧召回列表，必要时补充核验；确认没有其他正确案例后填写错误分类。</p>'}</section><div id="classification">${errorPanel()}</div></div>`;
+  pageInfo();
+}
+function openRecord(key) { currentKey=key; draft=structuredClone(state.annotations[key]||blank()); dirty=false; notice(); renderWorkspace(); }
+function changed() {draft.completed=false;dirty=true;saving('待保存…');clearTimeout(timer);timer=setTimeout(()=>flush().catch(()=>{}),450);pageInfo();}
+async function request(body) {
+  const controller=new AbortController(), timeout=setTimeout(()=>controller.abort(),15000);
+  try {
+    const response=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,revision:state.revision}),signal:controller.signal});
+    const result=await response.json();
+    if(!response.ok) { if(response.status===409)fatalConflict=true;throw Error(result.error||'保存失败'); }
+    state=result.state;stats=result.summary;renderStats();return result;
+  } finally {clearTimeout(timeout);}
+}
+function flush() {
+  clearTimeout(timer);
+  const job=queue.catch(()=>{}).then(async()=>{
+    if(!dirty)return;
+    if(fatalConflict)throw Error('另一个页面已经修改数据，请先复制当前草稿内容，再刷新页面');
+    const key=currentKey, snapshot=structuredClone(draft);
+    saving('正在写入文件…');
+    await request({action:'annotation',key,annotation:snapshot});
+    if(key===currentKey&&JSON.stringify(snapshot)===JSON.stringify(draft)) {draft=structuredClone(state.annotations[key]);dirty=false;}
+    saving(dirty?'待保存…':`已保存 · ${new Date().toLocaleTimeString()}`);pageInfo();
+  });
+  queue=job;
+  return job.catch(error=>{saving('保存失败 · 草稿仍在页面中',true);notice(error.message);throw error;});
+}
+async function navigate(delta) {
+  try {await flush();const list=visible();const i=list.findIndex(r=>r.key===currentKey), originalIndex=data.records.findIndex(r=>r.key===currentKey);const next=i>=0?list[i+delta]:(delta>0?list.find(r=>data.records.indexOf(r)>originalIndex):list.findLast(r=>data.records.indexOf(r)<originalIndex));if(next){openRecord(next.key);window.scrollTo(0,0);}}catch{}
+}
+async function changeView() {
+  try {await flush();filter=$('filter').value;search=$('search').value.trim().toLowerCase();const list=visible();openRecord(list.some(r=>r.key===currentKey)?currentKey:list[0]?.key);}catch{}
+}
+$('workspace').addEventListener('input',event=>{
+  const el=event.target, card=el.closest('[data-cid]');
+  if(card&&el.dataset.reviewField){const cid=card.dataset.cid;draft.reviews[cid]??={verdict:'',reason:'',owner:''};draft.reviews[cid][el.dataset.reviewField]=el.value;changed();}
+  else if(['error-type','error-detail','error-owner'].includes(el.id)){draft[{'error-type':'error_type','error-detail':'error_detail','error-owner':'owner'}[el.id]]=el.value;changed();}
+});
+$('workspace').addEventListener('click',event=>{
+  const el=event.target.closest('button');if(!el)return;
+  if(el.dataset.verdict){const card=el.closest('[data-cid]'),cid=card.dataset.cid;draft.reviews[cid]??={verdict:'',reason:'',owner:''};draft.reviews[cid].verdict=el.dataset.verdict;changed();card.querySelectorAll('[data-verdict]').forEach(b=>{b.classList.toggle('selected',b===el);b.setAttribute('aria-pressed',b===el?'true':'false');});$('classification').innerHTML=errorPanel();}
+  if(el.dataset.add){draft.reviews[el.dataset.add]={verdict:'',reason:'',owner:''};changed();renderWorkspace();}
+});
+$('prev').onclick=()=>navigate(-1);$('next').onclick=()=>navigate(1);
+$('jump-go').onclick=async()=>{try{await flush();const list=visible(),n=Number($('jump').value);if(Number.isInteger(n)&&n>=1&&n<=list.length){openRecord(list[n-1].key);window.scrollTo(0,0);}else notice('请输入筛选范围内的有效页码');}catch{}};
+$('filter').onchange=changeView;$('search').onchange=changeView;
+$('complete').onclick=async()=>{
+  const r=record();if(!r)return;
+  const selected=r.retrieved.filter(c=>!c.is_gt&&(c.model_same===true||draft.reviews[c.case_id]));
+  if(selected.some(c=>{const x=draft.reviews[c.case_id];return !x?.verdict||!x.reason?.trim()||!x.owner?.trim();})){notice('请为每个待核验案例填写是/否、理由和负责人');return;}
+  if(!hasYes(draft)&&(!draft.error_type||!draft.error_detail.trim()||!draft.owner.trim())){notice('请填写真实 badcase 的错误类型、详细说明和负责人');return;}
+  draft.completed=true;dirty=true;try{await flush();notice();renderWorkspace();}catch{}
+};
+$('retry').onclick=()=>flush().catch(()=>{});
+$('export').onclick=async()=>{try{await flush();const response=await fetch('/api/export');if(!response.ok)throw Error('导出失败');const blob=new Blob([JSON.stringify(await response.json(),null,2)],{type:'application/json'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='badcase_annotations.json';a.click();URL.revokeObjectURL(url);}catch(e){notice(e.message);}};
+function renderTypes() {$('types-list').innerHTML=state.error_types.map(t=>`<div class="type-row"><span>${esc(t)}</span>${t==='其他'?'<span class="muted">保留类型</span>':`<button data-delete-type="${esc(t)}">删除</button>`}</div>`).join('');}
+$('types-open').onclick=async()=>{try{await flush();renderTypes();$('types-dialog').showModal();}catch{}};
+$('types-close').onclick=()=>$('types-dialog').close();
+async function typeMutation(action,name) {
+  try{await flush();const job=queue.catch(()=>{}).then(()=>request({action,name}));queue=job;await job;draft=structuredClone(state.annotations[currentKey]||blank());renderTypes();renderWorkspace();saving('错误类型已保存');}
+  catch(e){notice(e.message);alert(e.message);}
+}
+$('type-form').onsubmit=async event=>{event.preventDefault();const name=$('type-name').value.trim();await typeMutation('add_type',name);if(state.error_types.includes(name))$('type-name').value='';};
+$('types-list').onclick=event=>{const name=event.target.dataset.deleteType;if(name&&confirm(`删除“${name}”？已有该类型标注将转为“其他”，并保留原类型说明。`))typeMutation('delete_type',name);};
+window.addEventListener('beforeunload',event=>{if(dirty){event.preventDefault();event.returnValue='';}});
+document.addEventListener('keydown',event=>{if(['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)||$('types-dialog').open)return;if(event.key==='ArrowLeft')navigate(-1);if(event.key==='ArrowRight')navigate(1);});
+(async()=>{try{const response=await fetch('/api/data');if(!response.ok)throw Error('数据加载失败');data=await response.json();state=data.state;stats=data.summary;renderStats();openRecord(data.records[0]?.key);saving('已连接 · 自动保存');$('save-state').title=`输出文件：${data.output}`;}catch(e){notice(e.message);saving('加载失败',true);$('workspace').innerHTML='<div class="empty">请检查本地服务及输入文件后刷新页面。</div>';}})();

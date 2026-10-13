@@ -1,0 +1,185 @@
+{
+  "badcases": {
+    "artifact_type": "badcase_report",
+    "records": [
+      {
+        "sample_index": 12,
+        "call_sno": "DEMO_CALL_001",
+        "chat_content": "用户：我忘了手机银行的登录密码，现在登录不进去。\n客服：您现在预留手机号还可以使用吗？\n用户：可以，短信能收到。\n客服：好的，我帮您查一下重置的方法。",
+        "expected_case_id": "DEMO_GT_RESET",
+        "gt_case_title": "忘记手机银行登录密码",
+        "query": "手机银行忘记登录密码如何重置",
+        "queries": [
+          "手机银行登录密码重置",
+          "忘记密码 身份核验"
+        ],
+        "retrieval_trace": [
+          {
+            "rank": 2,
+            "case_id": "DEMO_RESET",
+            "case_title": "手机银行登录密码重置"
+          },
+          {
+            "rank": 6,
+            "case_id": "DEMO_CACHE",
+            "case_title": "手机银行客户端闪退及无法登录"
+          }
+        ]
+      },
+      {
+        "sample_index": 15,
+        "call_sno": "DEMO_CALL_002",
+        "chat_content": "用户：我办业务要收验证码，但以前的手机号已经停用了。\n客服：是银行预留的号码吗？\n用户：是的，我换了新号码，旧号码用不了了。",
+        "expected_case_id": "DEMO_GT_SMS",
+        "query": "银行预留手机号停用 验证码无法接收",
+        "queries": [
+          "预留手机号变更流程"
+        ],
+        "retrieval_trace": [
+          {
+            "rank": 3,
+            "case_id": "DEMO_PHONE",
+            "case_title": "变更已停用的预留手机号"
+          }
+        ]
+      },
+      {
+        "sample_index": 20,
+        "call_sno": "DEMO_CALL_003",
+        "chat_content": "用户：转账时提示超过单笔限额，怎么提高限额？\n客服：您在手机银行进行转账吗？\n用户：对，金额比平时大。",
+        "expected_case_id": "DEMO_GT_TRANSFER",
+        "query": "银行卡信息查询",
+        "queries": [],
+        "retrieval_trace": [
+          {
+            "rank": 1,
+            "case_id": "DEMO_CARD",
+            "case_title": "查询银行卡开户行"
+          }
+        ]
+      },
+      {
+        "sample_index": 27,
+        "call_sno": "DEMO_CALL_004",
+        "chat_content": "用户：密码输错好几次，现在提示账户锁定了。\n客服：提示有没有写锁定多长时间？\n用户：没有看清楚，想知道怎么解锁。",
+        "expected_case_id": "DEMO_GT_LOCK",
+        "query": "账户密码错误锁定处理",
+        "queries": [
+          "账户解锁流程"
+        ],
+        "retrieval_trace": [
+          {
+            "rank": 1,
+            "case_id": "DEMO_RESET",
+            "case_title": "手机银行登录密码重置"
+          },
+          {
+            "rank": 2,
+            "case_id": "DEMO_CACHE",
+            "case_title": "手机银行客户端闪退及无法登录"
+          }
+        ]
+      }
+    ]
+  },
+  "analysis": {
+    "artifact_type": "badcase_analysis",
+    "records": [
+      {
+        "record_key": "12",
+        "sample_index": 12,
+        "status": "success",
+        "stage1": {
+          "ranks": [
+            2,
+            6
+          ],
+          "reason": "登录密码重置和无法登录的案例均可能相关，查看内容确认。"
+        },
+        "decisions": [
+          {
+            "rank": 2,
+            "case_id": "DEMO_RESET",
+            "same": true,
+            "reason": "用户忘记登录密码，候选案例提供验证身份后的密码重置流程，可直接解决问题。"
+          },
+          {
+            "rank": 6,
+            "case_id": "DEMO_CACHE",
+            "same": false,
+            "reason": "该案例处理客户端故障，不能解决忘记密码的问题。"
+          }
+        ]
+      },
+      {
+        "record_key": "15",
+        "sample_index": 15,
+        "status": "success",
+        "stage1": {
+          "ranks": [
+            3
+          ],
+          "reason": "需要解决预留号码停用这一上游原因。"
+        },
+        "decisions": [
+          {
+            "rank": 3,
+            "case_id": "DEMO_PHONE",
+            "same": true,
+            "reason": "更新已停用的预留号码后可重新收到验证码，间接解决当前问题。"
+          }
+        ]
+      },
+      {
+        "record_key": "20",
+        "sample_index": 20,
+        "status": "success",
+        "stage1": {
+          "ranks": [],
+          "reason": "查询开户行不能提高转账限额。"
+        },
+        "decisions": []
+      },
+      {
+        "record_key": "27",
+        "sample_index": 27,
+        "status": "error",
+        "error": "ValueError: model response is not valid JSON"
+      }
+    ]
+  },
+  "cases": {
+    "DEMO_GT_RESET": {
+      "case_name": "忘记手机银行登录密码",
+      "text": "适用条件：客户忘记登录密码。\n处理步骤：进入登录页面，点击“忘记密码”，完成手机号与身份核验，设置新的登录密码。\n处理结果：客户使用新密码成功登录。"
+    },
+    "DEMO_RESET": {
+      "case_name": "手机银行登录密码重置",
+      "text": "用户忘记登录密码时，可通过登录页“忘记密码”入口验证身份。按提示完成短信与身份核验，设置新密码后重新登录。"
+    },
+    "DEMO_CACHE": {
+      "case_name": "手机银行客户端闪退及无法登录",
+      "text": "适用于客户端启动异常或闪退。指导客户清理缓存，更新客户端并重新打开。此流程不涉及登录密码重置。"
+    },
+    "DEMO_GT_SMS": {
+      "case_name": "原手机号停用导致验证码无法接收",
+      "text": "核实客户预留手机号是否停用；停用后需携带有效证件前往网点核验身份并修改预留手机号，之后重新获取验证码。"
+    },
+    "DEMO_PHONE": {
+      "case_name": "变更已停用的预留手机号",
+      "text": "原预留手机号无法使用时，客户携带有效身份证件前往网点，核验身份后将预留手机号更新为本人正在使用的新号码。更新后可正常接收银行短信。"
+    },
+    "DEMO_GT_TRANSFER": {
+      "case_name": "调整转账限额",
+      "text": "确认客户转账金额超过单笔限额后，指导客户在手机银行安全设置中查看并调整限额；超过可自助调整范围时到网点办理。"
+    },
+    "DEMO_CARD": {
+      "case_name": "查询银行卡开户行",
+      "text": "通过手机银行账户详情查看银行卡开户行信息。"
+    },
+    "DEMO_GT_LOCK": {
+      "case_name": "密码连续输错后账户锁定",
+      "text": "确认账户因连续输错密码锁定，核实锁定期限，等待自动解锁或按身份验证流程办理解锁。"
+    }
+  }
+}

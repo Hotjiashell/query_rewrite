@@ -1,0 +1,4 @@
+__pycache__/
+annotations.json
+demo_annotations.json
+*.tmp
