@@ -743,6 +743,40 @@ records, a sample's own queries are always retrieved concurrently with each
 other regardless of `retrieval.concurrency`, which only limits how many
 samples are processed at once.
 
+## Check retrieval using GT case titles
+
+Use `check_gt_retrieval.py` to check the test set and retrieval system by
+searching with each ground-truth case's own title, resolved from the case
+summary file's `case_name`. It uses the same retrieval client and response
+parser as `evaluate.py`:
+
+```bash
+python check_gt_retrieval.py \
+  --input data/dialogs.json \
+  --case-summary data/case_summary.json \
+  --config config.json \
+  --concurrency 4 \
+  --output results/gt_title_retrieval_check.json
+```
+
+Replace the input paths with your actual test set and case summary. Test
+samples only need `caseID`; dialogue text is optional for this check. Each GT
+case ID is queried once, with all associated sample indices, call IDs, and
+dialogues retained in the report. A hit requires the returned `case_id` to
+equal the GT ID, even if another case has an identical title.
+
+By default, a miss means the GT ID is absent from **all candidates returned
+by the service**. Add `--cutoff 10` to identify top-10 misses instead. This
+does not change the number of candidates returned by the service. The report
+contains `misses` (the requested cases that cannot be recalled by title),
+`errors` (missing GT titles or retrieval request failures), `input_errors`
+(samples without a valid GT ID), and `records` (all unique GT cases and their
+full retrieval traces). The summary counts both missed cases and affected
+test samples. Request failures are kept separate from successful retrieval
+misses. The check makes retrieval requests only; no LLM call or API key is
+needed. `--config` is optional and only supplies the retrieval URL, timeout,
+and concurrency; CLI values override it.
+
 ## Collect badcases
 
 To review every sample that missed within top-K, use `collect_badcases.py`.
