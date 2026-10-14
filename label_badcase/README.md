@@ -37,7 +37,7 @@ python label_badcase/server.py --demo
 ## 标注流程
 
 1. 左侧阅读对话、query / queries、GT 标题和内容，以及 top-10 召回案例。
-2. 右侧核验模型 `same=true` 的案例，每个案例填写“是 / 否”、理由和负责人。
+2. 右侧核验模型 `same=true` 的案例，每个案例填写“是 / 否”和负责人。选“是”且模型提供了理由时，人工理由可留空，表示接受模型理由；选“否”必须填写理由。人工补充且模型未判为正确的案例仍需填写理由。
 3. 如模型漏选，可在左侧召回列表点击“补充核验”，再填写判断。模型否决、未选中、判断不完整的案例都可以补充。
 4. 至少一个案例被人工确认“是”时，记录归为“存在其他正确案例”。
 5. 没有其他正确案例时，填写错误类型、详细说明和分类负责人。
@@ -103,6 +103,8 @@ python label_badcase/server.py --demo
 ```
 
 `outcome` 为 `alternative_found` / `genuine_badcase` / `pending`。`verdict` 为 `yes` / `no` / 空字符串。`owner` 是真实 badcase 分类负责人，单个候选的负责人保存在 `reviews` 内。
+
+新保存的核验结果还包含 `reason_source` 和 `effective_reason`：留空并接受模型理由时，`reason` 保留为空，`reason_source` 为 `model`，`effective_reason` 保存被接受的模型理由；填写人工理由时，`reason_source` 为 `human`，`effective_reason` 为人工理由。模型无肯定判断或理由缺失时，不能通过留空理由完成核验。
 
 工具支持在同一个服务进程下多人同时标注，监听 `0.0.0.0`。其他电脑通过 `http://服务电脑内网IP:8765` 访问。
 

@@ -29,6 +29,12 @@ with sync_playwright() as p:
     page.reload()
     expect(page.locator("#record-state")).to_contain_text("已完成")
     expect(page.locator('[data-review-field="reason"]')).to_have_value("核验通过：身份验证后重置密码能解决诉求")
+    page.locator('[data-review-field="reason"]').fill("")
+    page.locator("#complete").click()
+    expect(page.locator("#record-state")).to_contain_text("已完成")
+    accepted = page.request.get("http://127.0.0.1:8765/api/data").json()["state"]["annotations"]["12"]["reviews"]["DEMO_RESET"]
+    assert accepted["reason_source"] == "model" and accepted["effective_reason"]
+    assert accepted["reason"] == ""
     page.locator("#next").click()
     expect(page.locator("#record-state")).to_contain_text("样本 15")
     page.locator("#next").click()

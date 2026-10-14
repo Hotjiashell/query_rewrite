@@ -26,9 +26,21 @@ class AnnotationTests(unittest.TestCase):
         restored = Store(self.records, self.output, {"demo": True})
         self.assertEqual(restored.state["annotations"]["12"]["outcome"], "alternative_found")
         a["reviews"]["DEMO_RESET"]["reason"] = ""
+        a["reviews"]["DEMO_RESET"]["verdict"] = "no"
         with self.assertRaises(ValueError):
             self.save("12", a)
         self.assertEqual(self.store.summary()["completed"], 1)
+
+    def test_accept_model_reason_when_yes_and_empty(self):
+        self.save("12", {"completed": True, "reviews": {"DEMO_RESET": {
+            "verdict": "yes", "reason": " ", "owner": "张三"}}})
+        review = self.store.state["annotations"]["12"]["reviews"]["DEMO_RESET"]
+        self.assertEqual(review["reason_source"], "model")
+        self.assertIn("密码", review["effective_reason"])
+        self.assertEqual(review["reason"], " ")
+        with self.assertRaises(ValueError):
+            self.save("27", {"completed": True, "reviews": {"DEMO_RESET": {
+                "verdict": "yes", "reason": "", "owner": "张三"}}})
 
     def test_drafts_not_counted_as_genuine_and_type_migration(self):
         self.assertEqual(self.store.state["error_types"], ["其他"])

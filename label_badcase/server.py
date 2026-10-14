@@ -146,11 +146,17 @@ class Store:
         if not isinstance(reviews, dict) or any(cid not in allowed for cid in reviews):
             raise ValueError("核验案例必须是top-10内的非GT案例")
         clean = {}
+        candidates = {c["case_id"]: c for c in record["retrieved"]}
         for cid, review in reviews.items():
             if not isinstance(review, dict) or review.get("verdict", "") not in ("", "yes", "no"):
                 raise ValueError("判断只能为是、否或未判断")
             clean[cid] = {"verdict": review.get("verdict", ""), "reason": str(review.get("reason", "")),
                           "owner": str(review.get("owner", ""))}
+            candidate = candidates[cid]
+            accepts_model = (clean[cid]["verdict"] == "yes" and not clean[cid]["reason"].strip()
+                             and candidate["model_same"] is True and bool(candidate["model_reason"].strip()))
+            clean[cid]["reason_source"] = "model" if accepts_model else "human"
+            clean[cid]["effective_reason"] = candidate["model_reason"] if accepts_model else clean[cid]["reason"]
         error_type = str(raw.get("error_type", ""))
         if error_type and error_type not in self.state["error_types"]:
             raise ValueError("错误类型不存在，请刷新")
@@ -162,8 +168,8 @@ class Store:
             required = {c["case_id"] for c in record["retrieved"] if c["model_same"] is True and not c["is_gt"]} | set(clean)
             for cid in required:
                 r = clean.get(cid, {})
-                if r.get("verdict") not in ("yes", "no") or not r.get("reason", "").strip() or not r.get("owner", "").strip():
-                    raise ValueError("请为每个待核验案例填写是/否、理由和负责人")
+                if r.get("verdict") not in ("yes", "no") or not r.get("effective_reason", "").strip() or not r.get("owner", "").strip():
+                    raise ValueError("请填写是/否和负责人；选否需填写理由，选是仅在可接受模型理由时允许留空")
             has_alternative = any(r["verdict"] == "yes" for r in clean.values())
             if not has_alternative and (not error_type or not annotation["error_detail"].strip() or not annotation["owner"].strip()):
                 raise ValueError("真实badcase需要填写错误类型、详细说明和负责人")
