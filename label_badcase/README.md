@@ -24,6 +24,45 @@ python label_badcase/server.py --demo
 
 模拟模式默认保存到 `label_badcase/demo_annotations.json`，不会污染正式标注文件。`demo_data.json` 中的内容均为虚构示例。
 
+## 一键导入 GT 标题检索失败结果
+
+先停止正在运行的标注器，在项目根目录执行：
+
+```bash
+python label_badcase/import_gt_retrieval.py \
+  --report results/gt_title_retrieval_check.json \
+  --annotations label_badcase/annotations.json
+```
+
+脚本从现有标注文件的 `sources` 自动读取 badcases、模型分析和案例库路径，
+复用标注器的数据关联、指纹校验、标注校验和统计逻辑。按 GT ID 匹配结果，
+同一 GT 对应的多条 badcase 分别导入，只处理模型分析成功且 Top-10 非 GT
+候选没有 `same=true` 的记录，与页面“模型认为没有其他正确案例”筛选一致。
+只有 GT ID 在标题检索结果中完全没有出现才导入；如果报告指定了 cutoff，
+仅排名超出 cutoff、实际上已召回的记录会跳过。缺少标题和请求失败也不会导入。
+
+导入后标为已完成，错误类型为“检索端问题”，详细说明为
+“即使用GT案例标题检索也检索不到”，分类负责人为“唐锦康”。
+错误类型和负责人自动加入下拉选项，统计和版本号同步更新。
+
+默认跳过所有已有标注；添加 `--overwrite` 可更新符合条件的已有标注，
+保留其候选核验结果，仍跳过包含“是”“不确定”或未判断的人工核验记录。
+重复执行不会再次更新已经导入且内容一致的标注。
+添加 `--dry-run` 可预览导入数量而不写文件。
+写入前自动在同目录生成 `annotations.json.*.bak` 原文件备份。
+导入后使用原来的命令重新启动标注器。
+
+如果没有现成落盘文件，或原始数据路径已经变化，显式指定三个源文件：
+
+```bash
+python label_badcase/import_gt_retrieval.py \
+  --report results/gt_title_retrieval_check.json \
+  --annotations label_badcase/annotations.json \
+  --badcases results/badcases.json \
+  --analysis results/badcase_analysis.json \
+  --cases data/case_summary.json
+```
+
 ## 数据来源
 
 | 输入 | 用途 |
