@@ -77,6 +77,20 @@ class AnnotationTests(unittest.TestCase):
         self.assertEqual(restored.state["annotations"]["20"]["revision"], 0)
         self.assertEqual(restored.state["types_revision"], 0)
 
+    def test_owner_addition_persistence_and_legacy_names(self):
+        self.store.mutate({"action": "add_owner", "name": " 张三 "})
+        self.store.mutate({"action": "add_owner", "name": "张三"})
+        self.assertEqual(self.store.state["owners"], ["张三"])
+        self.save("20", {"owner": "李四"})
+        self.save("12", {"reviews": {"DEMO_RESET": {"owner": "王五"}}})
+        saved = json.loads(self.output.read_text())
+        del saved["owners"]
+        self.output.write_text(json.dumps(saved))
+        restored = Store(self.records, self.output, {})
+        self.assertEqual(set(restored.state["owners"]), {"李四", "王五"})
+        with self.assertRaises(ValueError):
+            self.store.mutate({"action": "add_owner", "name": " "})
+
 
 if __name__ == "__main__":
     unittest.main()

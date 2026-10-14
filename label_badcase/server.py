@@ -110,8 +110,16 @@ class Store:
                 raise ValueError("输出文件属于另一份数据或模型结果已变化，请指定新的--output，避免混用标注")
             self.state = previous
         self.state.setdefault("types_revision", 0)
+        self.state.setdefault("owners", [])
         for annotation in self.state["annotations"].values():
             annotation.setdefault("revision", 0)
+            self.collect_owners(annotation)
+
+    def collect_owners(self, annotation):
+        for item in [annotation, *annotation.get("reviews", {}).values()]:
+            name = item.get("owner", "").strip()
+            if name and name not in self.state["owners"]:
+                self.state["owners"].append(name)
 
     def summary(self):
         annotations = self.state["annotations"]
@@ -170,7 +178,7 @@ class Store:
                 current_revision = self.state["annotations"].get(key, {}).get("revision", 0)
                 if body.get("record_revision") != current_revision:
                     raise RuntimeError("这条badcase已被其他人修改。你的草稿已保留，请比较最新标注后选择处理方式。")
-            elif body.get("types_revision") != self.state["types_revision"]:
+            elif action in ("add_type", "delete_type") and body.get("types_revision") != self.state["types_revision"]:
                 raise RuntimeError("错误类型已被其他人修改，请同步后重试。")
             old = copy.deepcopy(self.state)
             try:
@@ -180,6 +188,13 @@ class Store:
                     annotation = self.validate_annotation(key, body.get("annotation"))
                     annotation["revision"] = current_revision + 1
                     self.state["annotations"][key] = annotation
+                    self.collect_owners(annotation)
+                elif action == "add_owner":
+                    name = str(body.get("name", "")).strip()
+                    if not name or len(name) > 80:
+                        raise ValueError("姓名需要非空且不超过80字")
+                    if name not in self.state["owners"]:
+                        self.state["owners"].append(name)
                 elif action == "add_type":
                     name = str(body.get("name", "")).strip()
                     if not name or len(name) > 80 or name in self.state["error_types"]:

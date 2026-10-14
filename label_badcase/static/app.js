@@ -20,12 +20,14 @@ function updateTypes() {
   const select=$('error-type');
   if(select){const names=[...state.error_types];if(draft.error_type&&!names.includes(draft.error_type))names.push(draft.error_type);select.innerHTML='<option value="">请选择错误类型</option>'+names.map(t=>`<option value="${esc(t)}" ${draft.error_type===t?'selected':''}>${esc(t)}${state.error_types.includes(t)?'':'（已删除，请重选）'}</option>`).join('');}
   if($('types-dialog').open)renderTypes();
+  updateOwners();
 }
 function applyRemote(result) {
   if(result.state.revision < state.revision)return;
-  const before=revisionOf(currentKey), typesBefore=state.types_revision;
+  const before=revisionOf(currentKey), typesBefore=state.types_revision, ownersBefore=JSON.stringify(state.owners);
   state=result.state;stats=result.summary;renderStats();
   if(typesBefore!==state.types_revision)updateTypes();
+  else if(ownersBefore!==JSON.stringify(state.owners))updateOwners();
   const hist=document.querySelector('.histogram');if(hist)hist.outerHTML=histogram();
   if(revisionOf(currentKey)!==before || remotePending){
     if(dirty||fatalConflict){showConflict();}
@@ -49,6 +51,17 @@ async function sync() {
 const hasYes = a => Object.values(a?.reviews || {}).some(r => r.verdict === 'yes');
 const record = () => data.records.find(r => r.key === currentKey);
 const blank = () => ({reviews:{}, error_type:'', error_detail:'', owner:'', completed:false});
+function ownerOptions(selected='') {
+  const names=[...(state.owners||[])];if(selected&&!names.includes(selected))names.push(selected);
+  return '<option value="">请选择姓名</option>'+names.map(name=>`<option value="${esc(name)}" ${name===selected?'selected':''}>${esc(name)}</option>`).join('');
+}
+function renderOwners() {
+  $('owners-list').innerHTML=(state.owners||[]).map(name=>`<div class="type-row">${esc(name)}</div>`).join('')||'<p class="muted">尚无负责人，请先添加姓名。</p>';
+}
+function updateOwners() {
+  document.querySelectorAll('select[data-review-field="owner"],select#error-owner').forEach(select=>{const value=select.value;const html=ownerOptions(value);if(select.innerHTML!==html)select.innerHTML=html;select.value=value;});
+  if($('owners-dialog').open)renderOwners();
+}
 function notice(message='') { $('notice').textContent=message; $('notice').hidden=!message; }
 function saving(message, error=false) { $('save-state').textContent=message; $('save-state').classList.toggle('error',error); $('retry').hidden=!error; }
 function visible() {
@@ -85,11 +98,11 @@ function pageInfo() {
 }
 function reviewCard(c) {
   const r=draft.reviews[c.case_id]||{};
-  return `<article class="candidate ${c.model_same===true?'positive':''}" data-cid="${esc(c.case_id)}"><div class="card-heading"><h3>#${c.rank} ${esc(c.title)}</h3><span class="tag ${c.model_same===true?'green':'gold'}">${c.model_same===true?'模型认为正确':'人工补充核验'}</span></div><span class="case-id">${esc(c.case_id)}</span><div class="content">${c.text?esc(c.text):'<span class="tag red">案例正文缺失，请补齐案例库再核验</span>'}</div>${c.model_reason?`<div class="model-reason"><b>模型理由</b><br>${esc(c.model_reason)}</div>`:''}<div class="verdict"><button data-verdict="yes" class="${r.verdict==='yes'?'selected':''}" aria-pressed="${r.verdict==='yes'}">是，能解决</button><button data-verdict="no" class="${r.verdict==='no'?'selected':''}" aria-pressed="${r.verdict==='no'}">否，不能解决</button></div><label class="form-field"><span>判断理由 *</span><textarea data-review-field="reason" placeholder="结合用户诉求、适用条件与处理步骤说明理由">${esc(r.reason||'')}</textarea></label><label class="form-field"><span>核验负责人 *</span><input data-review-field="owner" value="${esc(r.owner||'')}" placeholder="姓名"></label></article>`;
+  return `<article class="candidate ${c.model_same===true?'positive':''}" data-cid="${esc(c.case_id)}"><div class="card-heading"><h3>#${c.rank} ${esc(c.title)}</h3><span class="tag ${c.model_same===true?'green':'gold'}">${c.model_same===true?'模型认为正确':'人工补充核验'}</span></div><span class="case-id">${esc(c.case_id)}</span><div class="content">${c.text?esc(c.text):'<span class="tag red">案例正文缺失，请补齐案例库再核验</span>'}</div>${c.model_reason?`<div class="model-reason"><b>模型理由</b><br>${esc(c.model_reason)}</div>`:''}<div class="verdict"><button data-verdict="yes" class="${r.verdict==='yes'?'selected':''}" aria-pressed="${r.verdict==='yes'}">是，能解决</button><button data-verdict="no" class="${r.verdict==='no'?'selected':''}" aria-pressed="${r.verdict==='no'}">否，不能解决</button></div><label class="form-field"><span>判断理由 *</span><textarea data-review-field="reason" placeholder="结合用户诉求、适用条件与处理步骤说明理由">${esc(r.reason||'')}</textarea></label><label class="form-field"><span>核验负责人 *</span><select data-review-field="owner">${ownerOptions(r.owner||'')}</select></label></article>`;
 }
 function errorPanel() {
   if(hasYes(draft)) return `<div class="card"><h2>已有其他正确案例</h2><p>已人工确认至少一个召回案例能够解决用户问题。完成其余待核验案例后，可点击“完成标注”。</p><p class="muted">如改为全部否决，将显示真实 badcase 分类表单。</p></div>`;
-  return `<div class="card"><h2>真实 badcase 分类</h2><p class="muted">当所有待核验案例都不能解决问题，或没有待核验案例时，请填写以下信息。尚未完成核验的记录不会计入真实 badcase 数量。</p><label class="form-field"><span>错误类型 *</span><select id="error-type"><option value="">请选择错误类型</option>${state.error_types.map(t=>`<option value="${esc(t)}" ${draft.error_type===t?'selected':''}>${esc(t)}</option>`).join('')}</select></label><label class="form-field"><span>详细说明 *</span><textarea id="error-detail" placeholder="说明漏召回的原因、query的问题、正确处理方向等">${esc(draft.error_detail)}</textarea></label><label class="form-field"><span>分类负责人 *</span><input id="error-owner" value="${esc(draft.owner)}" placeholder="姓名"></label></div>`;
+  return `<div class="card"><h2>真实 badcase 分类</h2><p class="muted">当所有待核验案例都不能解决问题，或没有待核验案例时，请填写以下信息。尚未完成核验的记录不会计入真实 badcase 数量。</p><label class="form-field"><span>错误类型 *</span><select id="error-type"><option value="">请选择错误类型</option>${state.error_types.map(t=>`<option value="${esc(t)}" ${draft.error_type===t?'selected':''}>${esc(t)}</option>`).join('')}</select></label><label class="form-field"><span>详细说明 *</span><textarea id="error-detail" placeholder="说明漏召回的原因、query的问题、正确处理方向等">${esc(draft.error_detail)}</textarea></label><label class="form-field"><span>分类负责人 *</span><select id="error-owner">${ownerOptions(draft.owner)}</select></label></div>`;
 }
 function renderWorkspace() {
   const r=record();
@@ -161,6 +174,16 @@ $('export').onclick=async()=>{try{await flush();const response=await fetch('/api
 function renderTypes() {$('types-list').innerHTML=state.error_types.map(t=>`<div class="type-row"><span>${esc(t)}</span>${t==='其他'?'<span class="muted">保留类型</span>':`<button data-delete-type="${esc(t)}">删除</button>`}</div>`).join('');}
 $('types-open').onclick=async()=>{try{await flush();renderTypes();$('types-dialog').showModal();}catch{}};
 $('types-close').onclick=()=>$('types-dialog').close();
+$('owners-open').onclick=()=>{renderOwners();$('owners-message').textContent='';$('owners-dialog').showModal();};
+$('owners-close').onclick=()=>$('owners-dialog').close();
+$('owner-form').onsubmit=async event=>{
+  event.preventDefault();const name=$('owner-name').value.trim();
+  const button=$('owner-form').querySelector('button');button.disabled=true;
+  const job=queue.catch(()=>{}).then(()=>request({action:'add_owner',name}));queue=job;
+  try{await job;updateOwners();$('owner-name').value='';$('owners-message').textContent=`已保存负责人：${name}`;}
+  catch(error){$('owners-message').textContent=error.message;}
+  finally{button.disabled=false;}
+};
 async function typeMutation(action,name) {
   try{await flush();const job=queue.catch(()=>{}).then(()=>request({action,name}));queue=job;await job;renderTypes();saving('错误类型已保存');}
   catch(e){notice(e.message);alert(e.message);}
@@ -168,7 +191,7 @@ async function typeMutation(action,name) {
 $('type-form').onsubmit=async event=>{event.preventDefault();const name=$('type-name').value.trim();await typeMutation('add_type',name);if(state.error_types.includes(name))$('type-name').value='';};
 $('types-list').onclick=event=>{const name=event.target.dataset.deleteType;if(name&&confirm(`删除“${name}”？已有该类型标注将转为“其他”，并保留原类型说明。`))typeMutation('delete_type',name);};
 window.addEventListener('beforeunload',event=>{if(dirty){event.preventDefault();event.returnValue='';}});
-document.addEventListener('keydown',event=>{if(['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)||$('types-dialog').open)return;if(event.key==='ArrowLeft')navigate(-1);if(event.key==='ArrowRight')navigate(1);});
+document.addEventListener('keydown',event=>{if(['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)||$('types-dialog').open||$('owners-dialog').open)return;if(event.key==='ArrowLeft')navigate(-1);if(event.key==='ArrowRight')navigate(1);});
 $('use-remote').onclick=async()=>{if(!confirm('采用最新标注将放弃本条尚未保存的草稿。是否继续？'))return;await sync();clearBackup(currentKey);openRecord(currentKey);saving('已采用最新标注');};
 $('use-draft').onclick=async()=>{
   await sync();if(!confirm('确认以页面中的草稿替换刚刚展示的服务端最新标注？'))return;
