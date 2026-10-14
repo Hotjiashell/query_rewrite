@@ -126,12 +126,14 @@ class Store:
         values = list(annotations.values())
         completed = [a for a in values if a.get("completed")]
         alternative = [a for a in values if any(r.get("verdict") == "yes" for r in a.get("reviews", {}).values())]
-        genuine = [a for a in completed if not any(r.get("verdict") == "yes" for r in a.get("reviews", {}).values())]
+        genuine = [a for a in completed if not any(r.get("verdict") in ("yes", "uncertain") for r in a.get("reviews", {}).values())]
+        uncertain = [a for a in completed if not any(r.get("verdict") == "yes" for r in a.get("reviews", {}).values())
+                     and any(r.get("verdict") == "uncertain" for r in a.get("reviews", {}).values())]
         counts = {name: 0 for name in self.state["error_types"]}
         for a in genuine:
             counts[a["error_type"]] = counts.get(a["error_type"], 0) + 1
         return {"total": len(self.records), "completed": len(completed), "drafts": len(values) - len(completed),
-                "alternative": len(alternative), "genuine": len(genuine), "error_counts": counts,
+                "alternative": len(alternative), "genuine": len(genuine), "uncertain": len(uncertain), "error_counts": counts,
                 "model_positive": sum(any(c["model_same"] is True and not c["is_gt"] for c in r["retrieved"]) for r in self.records)}
 
     def snapshot(self):
@@ -148,8 +150,8 @@ class Store:
         clean = {}
         candidates = {c["case_id"]: c for c in record["retrieved"]}
         for cid, review in reviews.items():
-            if not isinstance(review, dict) or review.get("verdict", "") not in ("", "yes", "no"):
-                raise ValueError("判断只能为是、否或未判断")
+            if not isinstance(review, dict) or review.get("verdict", "") not in ("", "yes", "no", "uncertain"):
+                raise ValueError("判断只能为是、否、不确定或未判断")
             clean[cid] = {"verdict": review.get("verdict", ""), "reason": str(review.get("reason", "")),
                           "owner": str(review.get("owner", ""))}
             candidate = candidates[cid]
@@ -168,12 +170,17 @@ class Store:
             required = {c["case_id"] for c in record["retrieved"] if c["model_same"] is True and not c["is_gt"]} | set(clean)
             for cid in required:
                 r = clean.get(cid, {})
-                if r.get("verdict") not in ("yes", "no") or not r.get("effective_reason", "").strip() or not r.get("owner", "").strip():
-                    raise ValueError("请填写是/否和负责人；选否需填写理由，选是仅在可接受模型理由时允许留空")
+                if (r.get("verdict") not in ("yes", "no", "uncertain")
+                    or (r.get("verdict") != "uncertain" and not r.get("effective_reason", "").strip())
+                    or not r.get("owner", "").strip()):
+                    raise ValueError("请选择判断和负责人；不确定可留空理由，选是可接受模型理由，选否必须填写理由")
             has_alternative = any(r["verdict"] == "yes" for r in clean.values())
-            if not has_alternative and (not error_type or not annotation["error_detail"].strip() or not annotation["owner"].strip()):
+            has_uncertain = any(r["verdict"] == "uncertain" for r in clean.values())
+            if not has_alternative and not has_uncertain and (not error_type or not annotation["error_detail"].strip() or not annotation["owner"].strip()):
                 raise ValueError("真实badcase需要填写错误类型、详细说明和负责人")
-        annotation["outcome"] = "alternative_found" if any(r["verdict"] == "yes" for r in clean.values()) else ("genuine_badcase" if annotation["completed"] else "pending")
+        annotation["outcome"] = ("alternative_found" if any(r["verdict"] == "yes" for r in clean.values()) else
+                                 ("uncertain" if any(r["verdict"] == "uncertain" for r in clean.values()) else
+                                  ("genuine_badcase" if annotation["completed"] else "pending")))
         return annotation
 
     def mutate(self, body):

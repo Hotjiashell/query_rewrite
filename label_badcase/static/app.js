@@ -3,6 +3,8 @@ const $ = id => document.getElementById(id);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let data, state, stats, currentKey, draft, dirty = false, timer, queue = Promise.resolve(), fatalConflict = false;
 let filter = 'all', search = '';
+let defaultOwner = '';
+try {defaultOwner=localStorage.getItem('badcase-default-owner')||'';} catch {}
 let baseRevision = 0, remotePending = false, syncing = false;
 const revisionOf = key => state.annotations[key]?.revision || 0;
 const backupKey = key => `badcase-draft:${state.dataset_fingerprint}:${key}`;
@@ -49,13 +51,29 @@ async function sync() {
   finally{syncing=false;}
 }
 const hasYes = a => Object.values(a?.reviews || {}).some(r => r.verdict === 'yes');
+const hasUncertain = a => Object.values(a?.reviews || {}).some(r => r.verdict === 'uncertain');
 const record = () => data.records.find(r => r.key === currentKey);
 const blank = () => ({reviews:{}, error_type:'', error_detail:'', owner:'', completed:false});
 function ownerOptions(selected='') {
   const names=[...(state.owners||[])];if(selected&&!names.includes(selected))names.push(selected);
   return '<option value="">请选择姓名</option>'+names.map(name=>`<option value="${esc(name)}" ${name===selected?'selected':''}>${esc(name)}</option>`).join('');
 }
+function selectedOwner(owner='') {return owner||defaultOwner;}
+function applyDefaultOwner() {
+  if(!defaultOwner||!record())return;
+  if(!draft.owner)draft.owner=defaultOwner;
+  for(const c of record().retrieved){
+    if(c.is_gt || (c.model_same!==true&&!draft.reviews[c.case_id]))continue;
+    draft.reviews[c.case_id]??={verdict:'',reason:'',owner:''};
+    if(!draft.reviews[c.case_id].owner)draft.reviews[c.case_id].owner=defaultOwner;
+  }
+}
+function renderDefaultOwner() {
+  $('default-owner').innerHTML='<option value="">不设置默认负责人</option>'+[...new Set([...(state.owners||[]),...(defaultOwner?[defaultOwner]:[])])].map(name=>`<option value="${esc(name)}" ${name===defaultOwner?'selected':''}>${esc(name)}</option>`).join('');
+  $('default-owner-status').textContent=defaultOwner?`我的默认负责人：${defaultOwner}`:'我的默认负责人：未设置';
+}
 function renderOwners() {
+  renderDefaultOwner();
   $('owners-list').innerHTML=(state.owners||[]).map(name=>`<div class="type-row">${esc(name)}</div>`).join('')||'<p class="muted">尚无负责人，请先添加姓名。</p>';
 }
 function updateOwners() {
@@ -67,7 +85,7 @@ function saving(message, error=false) { $('save-state').textContent=message; $('
 function visible() {
   return data.records.filter(r => {
     const a=state.annotations[r.key];
-    const match=filter==='all' || filter==='pending'&&!a?.completed || filter==='complete'&&a?.completed || filter==='alternative'&&hasYes(a) || filter==='genuine'&&a?.completed&&!hasYes(a) || filter==='model'&&r.retrieved.some(c=>c.model_same===true&&!c.is_gt) || filter==='model_none'&&r.model_status==='success'&&!r.retrieved.some(c=>c.model_same===true&&!c.is_gt);
+    const match=filter==='all' || filter==='pending'&&!a?.completed || filter==='complete'&&a?.completed || filter==='alternative'&&hasYes(a) || filter==='genuine'&&a?.completed&&!hasYes(a)&&!hasUncertain(a) || filter==='uncertain'&&hasUncertain(a)&&!hasYes(a) || filter==='model'&&r.retrieved.some(c=>c.model_same===true&&!c.is_gt) || filter==='model_none'&&r.model_status==='success'&&!r.retrieved.some(c=>c.model_same===true&&!c.is_gt);
     return match && (!search || [r.key,r.call_sno,r.chat_content,r.query,...r.queries,r.gt.title,...r.retrieved.map(c=>c.title)].join(' ').toLowerCase().includes(search));
   });
 }
@@ -98,17 +116,18 @@ function pageInfo() {
 }
 function reviewCard(c) {
   const r=draft.reviews[c.case_id]||{};
-  return `<article class="candidate ${c.model_same===true?'positive':''}" data-cid="${esc(c.case_id)}"><div class="card-heading"><h3>#${c.rank} ${esc(c.title)}</h3><span class="tag ${c.model_same===true?'green':'gold'}">${c.model_same===true?'模型认为正确':'人工补充核验'}</span></div><span class="case-id">${esc(c.case_id)}</span><div class="content">${c.text?esc(c.text):'<span class="tag red">案例正文缺失，请补齐案例库再核验</span>'}</div>${c.model_reason?`<div class="model-reason"><b>模型理由</b><br>${esc(c.model_reason)}</div>`:''}<div class="verdict"><button data-verdict="yes" class="${r.verdict==='yes'?'selected':''}" aria-pressed="${r.verdict==='yes'}">是，能解决</button><button data-verdict="no" class="${r.verdict==='no'?'selected':''}" aria-pressed="${r.verdict==='no'}">否，不能解决</button></div><label class="form-field"><span>判断理由${c.model_same===true&&c.model_reason?.trim()?'（选“是”可留空，表示接受上方模型理由；选“否”必填）':' *'}</span><textarea data-review-field="reason" placeholder="${c.model_same===true&&c.model_reason?.trim()?'选是可留空接受模型理由，也可填写自己的理由':'请说明判断理由'}">${esc(r.reason||'')}</textarea></label><label class="form-field"><span>核验负责人 *</span><select data-review-field="owner">${ownerOptions(r.owner||'')}</select></label></article>`;
+  return `<article class="candidate ${c.model_same===true?'positive':''}" data-cid="${esc(c.case_id)}"><div class="card-heading"><h3>#${c.rank} ${esc(c.title)}</h3><span class="tag ${c.model_same===true?'green':'gold'}">${c.model_same===true?'模型认为正确':'人工补充核验'}</span></div><span class="case-id">${esc(c.case_id)}</span><div class="content">${c.text?esc(c.text):'<span class="tag red">案例正文缺失，请补齐案例库再核验</span>'}</div>${c.model_reason?`<div class="model-reason"><b>模型理由</b><br>${esc(c.model_reason)}</div>`:''}<div class="verdict"><button data-verdict="yes" class="${r.verdict==='yes'?'selected':''}" aria-pressed="${r.verdict==='yes'}">是，能解决</button><button data-verdict="no" class="${r.verdict==='no'?'selected':''}" aria-pressed="${r.verdict==='no'}">否，不能解决</button><button data-verdict="uncertain" class="${r.verdict==='uncertain'?'selected':''}" aria-pressed="${r.verdict==='uncertain'}">不确定</button></div><label class="form-field"><span>判断理由（不确定可留空）${c.model_same===true&&c.model_reason?.trim()?'（选“是”也可留空，接受模型理由；选“否”必填）':'（选“是”或“否”必填）'}</span><textarea data-review-field="reason" placeholder="${c.model_same===true&&c.model_reason?.trim()?'选是可留空接受模型理由，也可填写自己的理由':'请说明判断理由'}">${esc(r.reason||'')}</textarea></label><label class="form-field"><span>核验负责人 *</span><select data-review-field="owner">${ownerOptions(selectedOwner(r.owner))}</select></label></article>`;
 }
 function errorPanel() {
   if(hasYes(draft)) return `<div class="card"><h2>已有其他正确案例</h2><p>已人工确认至少一个召回案例能够解决用户问题。完成其余待核验案例后，可点击“完成标注”。</p><p class="muted">如改为全部否决，将显示真实 badcase 分类表单。</p></div>`;
-  return `<div class="card"><h2>真实 badcase 分类</h2><p class="muted">当所有待核验案例都不能解决问题，或没有待核验案例时，请填写以下信息。尚未完成核验的记录不会计入真实 badcase 数量。</p><label class="form-field"><span>错误类型 *</span><select id="error-type"><option value="">请选择错误类型</option>${state.error_types.map(t=>`<option value="${esc(t)}" ${draft.error_type===t?'selected':''}>${esc(t)}</option>`).join('')}</select></label><label class="form-field"><span>详细说明 *</span><textarea id="error-detail" placeholder="说明漏召回的原因、query的问题、正确处理方向等">${esc(draft.error_detail)}</textarea></label><label class="form-field"><span>分类负责人 *</span><select id="error-owner">${ownerOptions(draft.owner)}</select></label></div>`;
+  if(hasUncertain(draft)) return '<div class="card"><h2>待进一步确认</h2><p>目前有案例标为“不确定”，且没有确认正确的案例。可以完成本轮标注，无需填写错误分类；该记录不会计入真实 badcase 或错误类型统计。</p></div>';
+  return `<div class="card"><h2>真实 badcase 分类</h2><p class="muted">当所有待核验案例都不能解决问题，或没有待核验案例时，请填写以下信息。尚未完成核验的记录不会计入真实 badcase 数量。</p><label class="form-field"><span>错误类型 *</span><select id="error-type"><option value="">请选择错误类型</option>${state.error_types.map(t=>`<option value="${esc(t)}" ${draft.error_type===t?'selected':''}>${esc(t)}</option>`).join('')}</select></label><label class="form-field"><span>详细说明 *</span><textarea id="error-detail" placeholder="说明漏召回的原因、query的问题、正确处理方向等">${esc(draft.error_detail)}</textarea></label><label class="form-field"><span>分类负责人 *</span><select id="error-owner">${ownerOptions(selectedOwner(draft.owner))}</select></label></div>`;
 }
 function renderWorkspace() {
   const r=record();
   if(!r) { $('workspace').innerHTML='<div class="empty"><h2>没有匹配的 badcase</h2><p>调整筛选条件或检查输入数据。</p></div>';pageInfo();return; }
   const selected=r.retrieved.filter(c=>!c.is_gt&&(c.model_same===true||draft.reviews[c.case_id]));
-  $('workspace').innerHTML=`<div class="column"><section class="card"><div class="card-heading"><h2>用户与客服对话</h2><span class="tag">样本 ${esc(r.key)}</span></div><div class="model-note">会话编号 ${esc(r.call_sno||'未提供')}</div><div class="content scroll-content">${esc(typeof r.chat_content==='string'?r.chat_content:JSON.stringify(r.chat_content,null,2))||'未提供对话'}</div></section><section class="card"><h2>检索 Query</h2><div class="label">QUERY</div><div class="query">${esc(r.query)||'未提供'}</div><div class="label">QUERIES · ${r.queries.length} 条</div>${r.queries.length?r.queries.map((q,i)=>`<div class="query">${i+1}. ${esc(q)}</div>`).join(''):'<p class="muted">未提供多路 query</p>'}</section><section class="card"><div class="card-heading"><h2>GT 案例</h2><span class="tag green">标注正确案例</span></div><h3>${esc(r.gt.title)}</h3><span class="case-id">${esc(r.gt.case_id)}</span><div class="content scroll-content">${esc(r.gt.text)||'<span class="tag red">GT正文缺失</span>'}</div></section><section class="card"><h2>召回 Top-10</h2><p class="model-note">可查看正文，并补充核验模型漏选的非GT案例。</p><table class="retrieval"><tbody>${r.retrieved.map(c=>`<tr><td>${c.rank}</td><td><details><summary>${esc(c.title)}</summary><span class="case-id">${esc(c.case_id)}</span><div class="content">${esc(c.text)||'案例正文缺失'}</div>${c.model_reason?`<div class="model-note">模型理由：${esc(c.model_reason)}</div>`:''}</details>${c.is_gt?'<span class="tag">GT本身，不计入其他正确案例</span>':c.model_same===true?'<span class="tag green">模型认为正确</span>':c.model_same===false?'<span class="tag">模型否决</span>':'<span class="tag gold">未判断 / 未选中</span>'}</td><td>${c.is_gt?'':`<button data-add="${esc(c.case_id)}" ${selected.includes(c)?'disabled':''}>${selected.includes(c)?'已列入':'补充核验'}</button>`}</td></tr>`).join('')}</tbody></table>${histogram()}</section></div><div class="column"><section class="card"><div class="card-heading"><h2>人工核验</h2><span class="tag">${selected.length} 个待核验案例</span></div><p class="muted">核验召回案例能否直接或间接解决对话中的用户问题。每个案例分别填写判断和负责人。对模型推荐案例选“是”时可留空理由，表示接受模型理由；选“否”时需填写理由。</p>${r.model_status!=='success'?`<div class="model-reason"><span class="tag gold">模型分析${r.model_status==='missing'?'缺失':'失败'}</span><p>${esc(r.model_error||'请查看召回列表并手动补充需要核验的案例。')}</p></div>`:''}${r.stage1_reason?`<details><summary>查看模型初筛依据</summary><p class="content model-note">${esc(r.stage1_reason)}</p></details>`:''}${selected.length?selected.map(reviewCard).join(''):'<p class="muted">模型没有建议核验的正确案例。请复核左侧召回列表，必要时补充核验；确认没有其他正确案例后填写错误分类。</p>'}</section><div id="classification">${errorPanel()}</div></div>`;
+  $('workspace').innerHTML=`<div class="column"><section class="card"><div class="card-heading"><h2>用户与客服对话</h2><span class="tag">样本 ${esc(r.key)}</span></div><div class="model-note">会话编号 ${esc(r.call_sno||'未提供')}</div><div class="content scroll-content">${esc(typeof r.chat_content==='string'?r.chat_content:JSON.stringify(r.chat_content,null,2))||'未提供对话'}</div></section><section class="card"><h2>检索 Query</h2><div class="label">QUERY</div><div class="query">${esc(r.query)||'未提供'}</div><div class="label">QUERIES · ${r.queries.length} 条</div>${r.queries.length?r.queries.map((q,i)=>`<div class="query">${i+1}. ${esc(q)}</div>`).join(''):'<p class="muted">未提供多路 query</p>'}</section><section class="card"><div class="card-heading"><h2>GT 案例</h2><span class="tag green">标注正确案例</span></div><h3>${esc(r.gt.title)}</h3><span class="case-id">${esc(r.gt.case_id)}</span><div class="content scroll-content">${esc(r.gt.text)||'<span class="tag red">GT正文缺失</span>'}</div></section><section class="card"><h2>召回 Top-10</h2><p class="model-note">可查看正文，并补充核验模型漏选的非GT案例。</p><table class="retrieval"><tbody>${r.retrieved.map(c=>`<tr><td>${c.rank}</td><td><details><summary>${esc(c.title)}</summary><span class="case-id">${esc(c.case_id)}</span><div class="content">${esc(c.text)||'案例正文缺失'}</div>${c.model_reason?`<div class="model-note">模型理由：${esc(c.model_reason)}</div>`:''}</details>${c.is_gt?'<span class="tag">GT本身，不计入其他正确案例</span>':c.model_same===true?'<span class="tag green">模型认为正确</span>':c.model_same===false?'<span class="tag">模型否决</span>':'<span class="tag gold">未判断 / 未选中</span>'}</td><td>${c.is_gt?'':`<button data-add="${esc(c.case_id)}" ${selected.includes(c)?'disabled':''}>${selected.includes(c)?'已列入':'补充核验'}</button>`}</td></tr>`).join('')}</tbody></table>${histogram()}</section></div><div class="column"><section class="card"><div class="card-heading"><h2>人工核验</h2><span class="tag">${selected.length} 个待核验案例</span></div><p class="muted">核验召回案例能否直接或间接解决对话中的用户问题。每个案例分别填写判断和负责人。对模型推荐案例选“是”时可留空理由，表示接受模型理由；选“否”时需填写理由，“不确定”无需理由。</p>${r.model_status!=='success'?`<div class="model-reason"><span class="tag gold">模型分析${r.model_status==='missing'?'缺失':'失败'}</span><p>${esc(r.model_error||'请查看召回列表并手动补充需要核验的案例。')}</p></div>`:''}${r.stage1_reason?`<details><summary>查看模型初筛依据</summary><p class="content model-note">${esc(r.stage1_reason)}</p></details>`:''}${selected.length?selected.map(reviewCard).join(''):'<p class="muted">模型没有建议核验的正确案例。请复核左侧召回列表，必要时补充核验；确认没有其他正确案例后填写错误分类。</p>'}</section><div id="classification">${errorPanel()}</div></div>`;
   pageInfo();
 }
 function openRecord(key) {
@@ -116,7 +135,7 @@ function openRecord(key) {
   try{const saved=JSON.parse(localStorage.getItem(backupKey(key))||'null');if(saved){draft=saved.draft;baseRevision=saved.baseRevision;dirty=true;notice('已恢复本浏览器尚未保存的草稿。');}}catch{}
   renderWorkspace();if(dirty){if(baseRevision!==revisionOf(key))showConflict();else{saving('已恢复草稿 · 待保存');timer=setTimeout(()=>flush().catch(()=>{}),450);}}
 }
-function changed() {draft.completed=false;dirty=true;backup();if(remotePending||baseRevision!==revisionOf(currentKey))showConflict();else saving('待保存…');clearTimeout(timer);if(!fatalConflict)timer=setTimeout(()=>flush().catch(()=>{}),450);pageInfo();}
+function changed() {applyDefaultOwner();draft.completed=false;dirty=true;backup();if(remotePending||baseRevision!==revisionOf(currentKey))showConflict();else saving('待保存…');clearTimeout(timer);if(!fatalConflict)timer=setTimeout(()=>flush().catch(()=>{}),450);pageInfo();}
 async function request(body) {
   const controller=new AbortController(), timeout=setTimeout(()=>controller.abort(),15000);
   try {
@@ -164,9 +183,10 @@ $('jump-go').onclick=async()=>{try{await flush();const list=visible(),n=Number($
 $('filter').onchange=changeView;$('search').onchange=changeView;
 $('complete').onclick=async()=>{
   const r=record();if(!r)return;
+  applyDefaultOwner();
   const selected=r.retrieved.filter(c=>!c.is_gt&&(c.model_same===true||draft.reviews[c.case_id]));
-  if(selected.some(c=>{const x=draft.reviews[c.case_id];const acceptsModel=x?.verdict==='yes'&&c.model_same===true&&c.model_reason?.trim();return !x?.verdict||(!x.reason?.trim()&&!acceptsModel)||!x.owner?.trim();})){notice('请为每个待核验案例填写是/否和负责人；选否需填写理由，选是可留空接受模型理由（模型需提供肯定判断及理由）');return;}
-  if(!hasYes(draft)&&(!draft.error_type||!draft.error_detail.trim()||!draft.owner.trim())){notice('请填写真实 badcase 的错误类型、详细说明和负责人');return;}
+  if(selected.some(c=>{const x=draft.reviews[c.case_id];const acceptsModel=x?.verdict==='yes'&&c.model_same===true&&c.model_reason?.trim();return !x?.verdict||(x.verdict!=='uncertain'&&!x.reason?.trim()&&!acceptsModel)||!x.owner?.trim();})){notice('请为每个待核验案例选择判断和负责人；不确定可留空理由，选是可接受模型理由，选否必须填写理由');return;}
+  if(!hasYes(draft)&&!hasUncertain(draft)&&(!draft.error_type||!draft.error_detail.trim()||!draft.owner.trim())){notice('请填写真实 badcase 的错误类型、详细说明和负责人');return;}
   draft.completed=true;dirty=true;backup();try{await flush();notice();renderWorkspace();}catch{}
 };
 $('retry').onclick=()=>flush().catch(()=>{});
@@ -176,6 +196,11 @@ $('types-open').onclick=async()=>{try{await flush();renderTypes();$('types-dialo
 $('types-close').onclick=()=>$('types-dialog').close();
 $('owners-open').onclick=()=>{renderOwners();$('owners-message').textContent='';$('owners-dialog').showModal();};
 $('owners-close').onclick=()=>$('owners-dialog').close();
+$('default-owner').onchange=()=>{
+  const value=$('default-owner').value;
+  try{localStorage.setItem('badcase-default-owner',value);defaultOwner=value;if(dirty){applyDefaultOwner();backup();}renderDefaultOwner();renderWorkspace();$('owners-message').textContent=value?`已设置默认负责人：${value}（仅当前浏览器）`:'已取消默认负责人';}
+  catch{$('owners-message').textContent='浏览器未允许保存设置，请检查本地存储权限。';renderDefaultOwner();}
+};
 $('owner-form').onsubmit=async event=>{
   event.preventDefault();const name=$('owner-name').value.trim();
   const button=$('owner-form').querySelector('button');button.disabled=true;
@@ -200,4 +225,4 @@ $('use-draft').onclick=async()=>{
 $('download-draft').onclick=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify({record_key:currentKey,baseRevision,draft},null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=`badcase-${currentKey}-draft.json`;a.click();URL.revokeObjectURL(url);};
 document.addEventListener('focusout',()=>{setTimeout(()=>{if(remotePending&&!dirty&&!fatalConflict&&!$('workspace').contains(document.activeElement)){remotePending=false;baseRevision=revisionOf(currentKey);draft=structuredClone(state.annotations[currentKey]||blank());renderWorkspace();notice('已同步当前记录的最新标注。');}},0);});
 setInterval(sync,3000);
-(async()=>{try{const response=await fetch('/api/data');if(!response.ok)throw Error('数据加载失败');data=await response.json();state=data.state;stats=data.summary;renderStats();openRecord(data.records[0]?.key);saving('已连接 · 自动保存');$('save-state').title=`输出文件：${data.output}`;}catch(e){notice(e.message);saving('加载失败',true);$('workspace').innerHTML='<div class="empty">请检查本地服务及输入文件后刷新页面。</div>';}})();
+(async()=>{try{const response=await fetch('/api/data');if(!response.ok)throw Error('数据加载失败');data=await response.json();state=data.state;stats=data.summary;renderStats();openRecord(data.records[0]?.key);saving('已连接 · 自动保存');$('save-state').title=`输出文件：${data.output}`;renderDefaultOwner();}catch(e){notice(e.message);saving('加载失败',true);$('workspace').innerHTML='<div class="empty">请检查本地服务及输入文件后刷新页面。</div>';}})();

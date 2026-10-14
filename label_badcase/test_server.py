@@ -42,6 +42,19 @@ class AnnotationTests(unittest.TestCase):
             self.save("27", {"completed": True, "reviews": {"DEMO_RESET": {
                 "verdict": "yes", "reason": "", "owner": "张三"}}})
 
+    def test_uncertain_requires_owner_but_not_reason_or_classification(self):
+        self.save("12", {"completed": True, "reviews": {"DEMO_RESET": {
+            "verdict": "uncertain", "reason": "", "owner": "张三"}}})
+        self.assertEqual(self.store.state["annotations"]["12"]["outcome"], "uncertain")
+        self.assertEqual(self.store.summary()["completed"], 1)
+        self.assertEqual(self.store.summary()["uncertain"], 1)
+        self.assertEqual(self.store.summary()["genuine"], 0)
+        self.assertEqual(self.store.summary()["alternative"], 0)
+        self.assertEqual(sum(self.store.summary()["error_counts"].values()), 0)
+        with self.assertRaises(ValueError):
+            self.save("12", {"completed": True, "reviews": {"DEMO_RESET": {
+                "verdict": "uncertain", "reason": "", "owner": ""}}})
+
     def test_drafts_not_counted_as_genuine_and_type_migration(self):
         self.assertEqual(self.store.state["error_types"], ["其他"])
         self.store.mutate({"types_revision": self.store.state["types_revision"], "action": "add_type", "name": "检索排序问题"})
