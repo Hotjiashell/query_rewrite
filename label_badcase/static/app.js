@@ -54,7 +54,7 @@ function saving(message, error=false) { $('save-state').textContent=message; $('
 function visible() {
   return data.records.filter(r => {
     const a=state.annotations[r.key];
-    const match=filter==='all' || filter==='pending'&&!a?.completed || filter==='complete'&&a?.completed || filter==='alternative'&&hasYes(a) || filter==='genuine'&&a?.completed&&!hasYes(a) || filter==='model'&&r.retrieved.some(c=>c.model_same===true&&!c.is_gt);
+    const match=filter==='all' || filter==='pending'&&!a?.completed || filter==='complete'&&a?.completed || filter==='alternative'&&hasYes(a) || filter==='genuine'&&a?.completed&&!hasYes(a) || filter==='model'&&r.retrieved.some(c=>c.model_same===true&&!c.is_gt) || filter==='model_none'&&r.model_status==='success'&&!r.retrieved.some(c=>c.model_same===true&&!c.is_gt);
     return match && (!search || [r.key,r.call_sno,r.chat_content,r.query,...r.queries,r.gt.title,...r.retrieved.map(c=>c.title)].join(' ').toLowerCase().includes(search));
   });
 }
