@@ -24,6 +24,27 @@ python label_badcase/server.py --demo
 
 模拟模式默认保存到 `label_badcase/demo_annotations.json`，不会污染正式标注文件。`demo_data.json` 中的内容均为虚构示例。
 
+## 尝试检索
+
+每条 badcase 的右侧提供“尝试检索”。输入 query 并点击“尝试检索”，即可调用
+`search.py` 的检索接口，查看返回案例的排名、标题、ID、分数和可展开的正文。
+支持“填入原 query”和“填入 GT 标题”，填入后点击检索即可。
+
+提示以当前记录的 GT 案例 ID 为准：命中时显示排名并高亮对应案例；未命中时
+明确提示返回结果中没有该 ID；当前记录缺少 GT ID 时提示无法判断。
+检查全部返回候选，不限于 Top-10。空结果与请求失败分别提示。
+
+尝试结果按 badcase 分别保存在当前页面内，翻页后回来仍可查看，刷新后清空。
+查询过程中可继续标注和翻页，返回结果只属于发起查询的记录。
+尝试检索不会修改原 query、原召回列表、标注或统计。
+
+默认使用 `search.py` 的接口地址，超时为30秒。需要 `requests` 依赖。
+如需指定其他接口，在原启动命令后增加：
+
+```bash
+--retrieval-url http://host:8276/run_case_retrieval --retrieval-timeout 60
+```
+
 ## 一键导入 GT 标题检索失败结果
 
 先停止正在运行的标注器，在项目根目录执行：

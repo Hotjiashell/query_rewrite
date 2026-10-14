@@ -1,9 +1,10 @@
 import json
 import tempfile
 import unittest
+import copy
 from pathlib import Path
 
-from server import Store, build_dataset, ROOT
+from server import Store, build_dataset, ROOT, handler
 
 
 class AnnotationTests(unittest.TestCase):
@@ -115,6 +116,47 @@ class AnnotationTests(unittest.TestCase):
         self.assertEqual(set(restored.state["owners"]), {"李四", "王五"})
         with self.assertRaises(ValueError):
             self.store.mutate({"action": "add_owner", "name": " "})
+
+    def test_try_retrieval_gt_matching_order_and_no_annotation_write(self):
+        before = copy.deepcopy(self.store.state)
+        gt = self.store.by_key["12"]["gt"]["case_id"]
+        queries = []
+        def retrieve(query):
+            queries.append(query)
+            return {"retrieval_result": {
+                "top12": {"case_id": gt, "case_title": "GT标题", "content": "正文", "score": 0.8},
+                "top2": {"case_id": "OTHER", "case_title": "GT标题"},
+                "metadata": {},
+            }}
+        self.store.retriever = retrieve
+        result = self.store.try_retrieval({"key": "12", "query": "  测试query  "})
+        self.assertEqual(queries, ["测试query"])
+        self.assertTrue(result["gt_hit"])
+        self.assertEqual(result["matched_rank"], 12)
+        self.assertEqual([c["rank"] for c in result["cases"]], [2, 12])
+        self.assertFalse(result["cases"][0]["is_gt"])
+        self.assertEqual(result["cases"][1]["text"], "正文")
+        self.assertEqual(before, self.store.state)
+        self.assertFalse(self.output.exists())
+
+    def test_try_retrieval_empty_failure_and_validation(self):
+        self.store.retriever = lambda query: {"retrieval_result": {}}
+        result = self.store.try_retrieval({"key": "12", "query": "没有结果"})
+        self.assertFalse(result["gt_hit"])
+        self.assertIsNone(result["matched_rank"])
+        self.assertEqual(result["cases"], [])
+        for body in ({"key": "12", "query": " "}, {"key": "missing", "query": "q"}, [],
+                     {"key": "12", "query": "q" * 10001}):
+            with self.assertRaises(ValueError):
+                self.store.try_retrieval(body)
+        self.store.retriever = lambda query: {}
+        with self.assertRaisesRegex(RuntimeError, "retrieval_result"):
+            self.store.try_retrieval({"key": "12", "query": "q"})
+        def fail(query):
+            raise TimeoutError("服务超时")
+        self.store.retriever = fail
+        with self.assertRaisesRegex(RuntimeError, "服务超时"):
+            self.store.try_retrieval({"key": "12", "query": "q"})
 
 
 if __name__ == "__main__":

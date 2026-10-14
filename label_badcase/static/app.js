@@ -6,6 +6,39 @@ let filter = 'all', search = '';
 let defaultOwner = '';
 try {defaultOwner=localStorage.getItem('badcase-default-owner')||'';} catch {}
 let baseRevision = 0, remotePending = false, syncing = false;
+const retrievalTrials = new Map();
+function trialFor(key=currentKey) {
+  if(!retrievalTrials.has(key))retrievalTrials.set(key,{query:data.records.find(r=>r.key===key)?.query||'',loading:false,result:null,error:''});
+  return retrievalTrials.get(key);
+}
+function trialResults(trial) {
+  if(trial.loading)return '<p class="muted" role="status">正在检索，请稍候…</p>';
+  if(trial.error)return `<p class="trial-error" role="alert">${esc(trial.error)}</p>`;
+  const result=trial.result;if(!result)return '<p class="muted">输入 query，检查当前 GT 是否在返回结果中。</p>';
+  const status=!result.gt_available?'当前记录缺少 GT ID，无法判断命中':result.gt_hit?`命中 GT · 排名 #${result.matched_rank}`:'未命中 GT · 返回结果中没有该案例 ID';
+  return `<div class="trial-status" role="status"><span class="tag ${result.gt_hit?'green':'gold'}">${esc(status)}</span><p class="model-note">GT ID：${esc(result.gt_case_id||'未提供')} · 返回 ${result.cases.length} 个案例</p></div><div class="model-note">本次检索 query</div><div class="query">${esc(result.query)}</div>${result.cases.length?`<ol class="trial-cases">${result.cases.map(c=>`<li class="${c.is_gt?'trial-hit':''}"><details><summary><b>#${c.rank} ${esc(c.title||'无标题')}</b> ${c.is_gt?'<span class="tag green">GT 命中</span>':''}</summary><span class="case-id">${esc(c.case_id)}</span><div class="content">${esc(c.text||'接口未返回案例正文')}</div></details><div class="model-note">ID：${esc(c.case_id)}${c.score==null?'':` · 分数：${esc(c.score)}`}</div></li>`).join('')}</ol>`:'<p class="muted">本次未返回任何案例。</p>'}`;
+}
+function trialPanel() {
+  const trial=trialFor();
+  return `<section id="trial-panel" class="card"><h2>尝试检索</h2><p class="model-note">针对当前记录尝试新的 query，按案例 ID 检查是否命中 GT。尝试结果仅在当前页面保留。</p><form id="trial-form"><label class="form-field"><span>检索 query</span><textarea id="trial-query" required maxlength="10000" placeholder="输入想尝试的 query">${esc(trial.query)}</textarea></label><div class="toolbar"><button class="primary" id="trial-submit" ${trial.loading?'disabled':''}>${trial.loading?'正在检索…':'尝试检索'}</button><button type="button" data-trial-fill="query">填入原 query</button><button type="button" data-trial-fill="gt">填入 GT 标题</button></div></form><div id="trial-results" aria-live="polite">${trialResults(trial)}</div></section>`;
+}
+function renderTrial() {
+  const panel=$('trial-panel');if(!panel)return;
+  const trial=trialFor();$('trial-results').innerHTML=trialResults(trial);
+  $('trial-submit').disabled=trial.loading;$('trial-submit').textContent=trial.loading?'正在检索…':'尝试检索';
+}
+async function tryRetrieval() {
+  const key=currentKey, trial=trialFor(key);if(trial.loading)return;
+  const query=$('trial-query').value.trim();if(!query){$('trial-query').reportValidity();return;}
+  trial.query=query;trial.loading=true;trial.result=null;trial.error='';renderTrial();
+  try {
+    const response=await fetch('/api/retrieve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,query})});
+    const result=await response.json();if(!response.ok)throw Error(result.error||'检索失败');
+    if(result.record_key!==key)throw Error('检索结果与当前记录不匹配，请重试');
+    trial.result=result;
+  }catch(error){trial.error=error.message||'检索失败，请重试';}
+  finally{trial.loading=false;if(currentKey===key)renderTrial();}
+}
 const revisionOf = key => state.annotations[key]?.revision || 0;
 const backupKey = key => `badcase-draft:${state.dataset_fingerprint}:${key}`;
 function backup() {
@@ -128,6 +161,7 @@ function renderWorkspace() {
   if(!r) { $('workspace').innerHTML='<div class="empty"><h2>没有匹配的 badcase</h2><p>调整筛选条件或检查输入数据。</p></div>';pageInfo();return; }
   const selected=r.retrieved.filter(c=>!c.is_gt&&(c.model_same===true||draft.reviews[c.case_id]));
   $('workspace').innerHTML=`<div class="column"><section class="card"><div class="card-heading"><h2>用户与客服对话</h2><span class="tag">样本 ${esc(r.key)}</span></div><div class="model-note">会话编号 ${esc(r.call_sno||'未提供')}</div><div class="content scroll-content">${esc(typeof r.chat_content==='string'?r.chat_content:JSON.stringify(r.chat_content,null,2))||'未提供对话'}</div></section><section class="card"><h2>检索 Query</h2><div class="label">QUERY</div><div class="query">${esc(r.query)||'未提供'}</div><div class="label">QUERIES · ${r.queries.length} 条</div>${r.queries.length?r.queries.map((q,i)=>`<div class="query">${i+1}. ${esc(q)}</div>`).join(''):'<p class="muted">未提供多路 query</p>'}</section><section class="card"><div class="card-heading"><h2>GT 案例</h2><span class="tag green">标注正确案例</span></div><h3>${esc(r.gt.title)}</h3><span class="case-id">${esc(r.gt.case_id)}</span><div class="content scroll-content">${esc(r.gt.text)||'<span class="tag red">GT正文缺失</span>'}</div></section><section class="card"><h2>召回 Top-10</h2><p class="model-note">可查看正文，并补充核验模型漏选的非GT案例。</p><table class="retrieval"><tbody>${r.retrieved.map(c=>`<tr><td>${c.rank}</td><td><details><summary>${esc(c.title)}</summary><span class="case-id">${esc(c.case_id)}</span><div class="content">${esc(c.text)||'案例正文缺失'}</div>${c.model_reason?`<div class="model-note">模型理由：${esc(c.model_reason)}</div>`:''}</details>${c.is_gt?'<span class="tag">GT本身，不计入其他正确案例</span>':c.model_same===true?'<span class="tag green">模型认为正确</span>':c.model_same===false?'<span class="tag">模型否决</span>':'<span class="tag gold">未判断 / 未选中</span>'}</td><td>${c.is_gt?'':`<button data-add="${esc(c.case_id)}" ${selected.includes(c)?'disabled':''}>${selected.includes(c)?'已列入':'补充核验'}</button>`}</td></tr>`).join('')}</tbody></table>${histogram()}</section></div><div class="column"><section class="card"><div class="card-heading"><h2>人工核验</h2><span class="tag">${selected.length} 个待核验案例</span></div><p class="muted">核验召回案例能否直接或间接解决对话中的用户问题。每个案例分别填写判断和负责人。对模型推荐案例选“是”时可留空理由，表示接受模型理由；选“否”时需填写理由，“不确定”无需理由。</p>${r.model_status!=='success'?`<div class="model-reason"><span class="tag gold">模型分析${r.model_status==='missing'?'缺失':'失败'}</span><p>${esc(r.model_error||'请查看召回列表并手动补充需要核验的案例。')}</p></div>`:''}${r.stage1_reason?`<details><summary>查看模型初筛依据</summary><p class="content model-note">${esc(r.stage1_reason)}</p></details>`:''}${selected.length?selected.map(reviewCard).join(''):'<p class="muted">模型没有建议核验的正确案例。请复核左侧召回列表，必要时补充核验；确认没有其他正确案例后填写错误分类。</p>'}</section><div id="classification">${errorPanel()}</div></div>`;
+  $('classification').insertAdjacentHTML('beforebegin',trialPanel());
   pageInfo();
 }
 function openRecord(key) {
@@ -186,14 +220,17 @@ async function changeView() {
 }
 $('workspace').addEventListener('input',event=>{
   const el=event.target, card=el.closest('[data-cid]');
+  if(el.id==='trial-query'){trialFor().query=el.value;return;}
   if(card&&el.dataset.reviewField){const cid=card.dataset.cid;draft.reviews[cid]??={verdict:'',reason:'',owner:''};draft.reviews[cid][el.dataset.reviewField]=el.value;changed();}
   else if(['error-type','error-detail','error-owner'].includes(el.id)){draft[{'error-type':'error_type','error-detail':'error_detail','error-owner':'owner'}[el.id]]=el.value;changed();}
 });
 $('workspace').addEventListener('click',event=>{
   const el=event.target.closest('button');if(!el)return;
+  if(el.dataset.trialFill){const value=el.dataset.trialFill==='gt'?record().gt.title:record().query||'';trialFor().query=value;$('trial-query').value=value;$('trial-query').focus();return;}
   if(el.dataset.verdict){const card=el.closest('[data-cid]'),cid=card.dataset.cid;draft.reviews[cid]??={verdict:'',reason:'',owner:''};draft.reviews[cid].verdict=el.dataset.verdict;changed();card.querySelectorAll('[data-verdict]').forEach(b=>{b.classList.toggle('selected',b===el);b.setAttribute('aria-pressed',b===el?'true':'false');});$('classification').innerHTML=errorPanel();}
   if(el.dataset.add){draft.reviews[el.dataset.add]={verdict:'',reason:'',owner:''};changed();renderWorkspace();}
 });
+$('workspace').addEventListener('submit',event=>{if(event.target.id==='trial-form'){event.preventDefault();tryRetrieval();}});
 $('prev').onclick=()=>navigate(-1);$('next').onclick=()=>navigate(1);
 $('next-pending').onclick=nextPending;
 $('jump-go').onclick=async()=>{try{await flush();const list=visible(),n=Number($('jump').value);if(Number.isInteger(n)&&n>=1&&n<=list.length){openRecord(list[n-1].key);window.scrollTo(0,0);}else notice('请输入筛选范围内的有效页码');}catch{}};

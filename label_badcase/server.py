@@ -6,6 +6,8 @@ import copy
 import hashlib
 import json
 import os
+import re
+import sys
 import tempfile
 import threading
 from datetime import datetime, timezone
@@ -14,6 +16,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_TYPES = ["其他"]
+
+
+def retrieve_cases(query, *, url=None, timeout=30):
+    # Keep the app's existing startup independent of optional requests dependency.
+    project_root = str(ROOT.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from search import DEFAULT_RETRIEVAL_URL, test_retrieval
+    return test_retrieval(query, url=url or DEFAULT_RETRIEVAL_URL, timeout=timeout)
 
 
 def now():
@@ -95,11 +106,12 @@ def build_dataset(badcases, analysis, cases):
 
 
 class Store:
-    def __init__(self, records, output, sources):
+    def __init__(self, records, output, sources, *, retriever=None):
         self.records = records
         self.by_key = {r["key"]: r for r in records}
         self.output = output
         self.lock = threading.Lock()
+        self.retriever = retriever or retrieve_cases
         fingerprint = hashlib.sha256(json.dumps(records, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         self.state = {"schema_version": 1, "artifact_type": "badcase_annotations",
                       "dataset_fingerprint": fingerprint, "sources": sources, "revision": 0,
@@ -120,6 +132,43 @@ class Store:
             name = item.get("owner", "").strip()
             if name and name not in self.state["owners"]:
                 self.state["owners"].append(name)
+
+    def try_retrieval(self, body):
+        if not isinstance(body, dict):
+            raise ValueError("检索请求必须是对象")
+        key = str(body.get("key"))
+        if key not in self.by_key:
+            raise ValueError("无效badcase")
+        query = body.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("请输入检索 query")
+        query = query.strip()
+        if len(query) > 10000:
+            raise ValueError("检索 query 不能超过10000字")
+        try:
+            response = self.retriever(query)
+            result = response.get("retrieval_result") if isinstance(response, dict) else None
+            if not isinstance(result, dict):
+                raise ValueError("检索响应缺少 retrieval_result 对象")
+            cases = []
+            gt_id = self.by_key[key]["gt"]["case_id"]
+            for name, item in result.items():
+                match = re.fullmatch(r"top([1-9]\d*)", str(name), re.IGNORECASE)
+                if not match or not isinstance(item, dict) or item.get("case_id") is None:
+                    continue
+                cid = str(item["case_id"])
+                cases.append({"rank": int(match[1]), "case_id": cid,
+                              "title": str(item.get("case_title") or ""),
+                              "text": str(item.get("content") or ""),
+                              "score": item.get("score") if isinstance(item.get("score"), (int, float)) else None,
+                              "is_gt": bool(gt_id) and cid == gt_id})
+            cases.sort(key=lambda c: c["rank"])
+        except Exception as exc:
+            raise RuntimeError(f"检索失败：{exc}") from exc
+        matched_rank = next((c["rank"] for c in cases if c["is_gt"]), None)
+        return {"record_key": key, "query": query, "gt_case_id": gt_id,
+                "gt_available": bool(gt_id), "gt_hit": matched_rank is not None,
+                "matched_rank": matched_rank, "cases": cases}
 
     def summary(self):
         annotations = self.state["annotations"]
@@ -273,7 +322,7 @@ def handler(store):
             self.wfile.write(data)
 
         def do_POST(self):
-            if self.path != "/api/save":
+            if self.path not in ("/api/save", "/api/retrieve"):
                 self.respond(404, {"error": "Not found"})
                 return
             # Only same-origin browser writes are accepted by this local service.
@@ -286,9 +335,9 @@ def handler(store):
                 if not 0 < length <= 2_000_000:
                     raise ValueError("请求大小不合法")
                 body = json.loads(self.rfile.read(length))
-                self.respond(200, store.mutate(body))
+                self.respond(200, store.try_retrieval(body) if self.path == "/api/retrieve" else store.mutate(body))
             except RuntimeError as exc:
-                self.respond(409, {"error": str(exc)})
+                self.respond(502 if self.path == "/api/retrieve" else 409, {"error": str(exc)})
             except (ValueError, TypeError, KeyError) as exc:
                 self.respond(400, {"error": str(exc)})
             except OSError as exc:
@@ -308,7 +357,11 @@ def main():
     parser.add_argument("--output", default=str(ROOT / "annotations.json"))
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--demo", action="store_true", help="使用独立的模拟数据体验界面")
+    parser.add_argument("--retrieval-url", help="尝试检索接口地址，默认使用 search.py 中的地址")
+    parser.add_argument("--retrieval-timeout", type=float, default=30, help="尝试检索超时秒数（默认30）")
     args = parser.parse_args()
+    if not 0 < args.retrieval_timeout <= 300:
+        parser.error("--retrieval-timeout 需要大于0且不超过300秒")
     if args.demo:
         demo = load(ROOT / "demo_data.json")
         records = build_dataset(demo["badcases"], demo["analysis"], demo["cases"])
@@ -322,7 +375,8 @@ def main():
         if output in [Path(p) for p in sources.values()]:
             parser.error("输出路径不能覆盖输入文件")
         records = build_dataset(*(load(sources[k]) for k in ("badcases", "analysis", "cases")))
-    store = Store(records, output.resolve(), sources)
+    store = Store(records, output.resolve(), sources,
+                  retriever=lambda query: retrieve_cases(query, url=args.retrieval_url, timeout=args.retrieval_timeout))
     server = ThreadingHTTPServer(("0.0.0.0", args.port), handler(store))
     print(f"标注器已启动：http://0.0.0.0:{args.port}\n共{len(records)}条，实时保存到：{store.output}", flush=True)
     try:
