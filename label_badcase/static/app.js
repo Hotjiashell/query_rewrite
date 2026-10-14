@@ -165,6 +165,22 @@ function flush() {
 async function navigate(delta) {
   try {await flush();const list=visible();const i=list.findIndex(r=>r.key===currentKey), originalIndex=data.records.findIndex(r=>r.key===currentKey);const next=i>=0?list[i+delta]:(delta>0?list.find(r=>data.records.indexOf(r)>originalIndex):list.findLast(r=>data.records.indexOf(r)<originalIndex));if(next){openRecord(next.key);window.scrollTo(0,0);}}catch{}
 }
+async function nextPending() {
+  const button=$('next-pending');button.disabled=true;
+  try {
+    await flush();
+    await sync();
+    // Changes made while syncing must also reach disk before switching records.
+    await flush();
+    const originalIndex=data.records.findIndex(r=>r.key===currentKey);
+    const candidates=visible().filter(r=>r.key!==currentKey&&!state.annotations[r.key]?.completed);
+    const next=candidates.find(r=>data.records.indexOf(r)>originalIndex)||candidates[0];
+    if(!next){notice('当前筛选和搜索范围内没有其他未完成的 badcase。');return;}
+    const wrapped=data.records.indexOf(next)<=originalIndex;
+    openRecord(next.key);window.scrollTo(0,0);
+    if(wrapped)notice('已到末尾，从当前筛选范围的开头继续查找未完成记录。');
+  }catch{}finally{button.disabled=false;}
+}
 async function changeView() {
   try {await flush();filter=$('filter').value;search=$('search').value.trim().toLowerCase();const list=visible();openRecord(list.some(r=>r.key===currentKey)?currentKey:list[0]?.key);}catch{}
 }
@@ -179,6 +195,7 @@ $('workspace').addEventListener('click',event=>{
   if(el.dataset.add){draft.reviews[el.dataset.add]={verdict:'',reason:'',owner:''};changed();renderWorkspace();}
 });
 $('prev').onclick=()=>navigate(-1);$('next').onclick=()=>navigate(1);
+$('next-pending').onclick=nextPending;
 $('jump-go').onclick=async()=>{try{await flush();const list=visible(),n=Number($('jump').value);if(Number.isInteger(n)&&n>=1&&n<=list.length){openRecord(list[n-1].key);window.scrollTo(0,0);}else notice('请输入筛选范围内的有效页码');}catch{}};
 $('filter').onchange=changeView;$('search').onchange=changeView;
 $('complete').onclick=async()=>{
