@@ -16,7 +16,7 @@ class AnnotationTests(unittest.TestCase):
         self.store = Store(self.records, self.output, {"demo": True})
 
     def save(self, key, annotation):
-        return self.store.mutate({"revision": self.store.state["revision"], "action": "annotation", "key": key, "annotation": annotation})
+        return self.store.mutate({"record_revision": self.store.state["annotations"].get(key, {}).get("revision", 0), "action": "annotation", "key": key, "annotation": annotation})
 
     def test_completion_validation_and_resume(self):
         a = {"completed": True, "reviews": {"DEMO_RESET": {"verdict": "yes", "reason": "密码重置适用", "owner": "张三"}}}
@@ -32,20 +32,24 @@ class AnnotationTests(unittest.TestCase):
 
     def test_drafts_not_counted_as_genuine_and_type_migration(self):
         self.assertEqual(self.store.state["error_types"], ["其他"])
-        self.store.mutate({"revision": self.store.state["revision"], "action": "add_type", "name": "检索排序问题"})
+        self.store.mutate({"types_revision": self.store.state["types_revision"], "action": "add_type", "name": "检索排序问题"})
         self.save("20", {"error_type": "检索排序问题", "error_detail": "排序偏差", "owner": "李四"})
         self.assertEqual(self.store.summary()["genuine"], 0)
         self.save("20", {"completed": True, "error_type": "检索排序问题", "error_detail": "排序偏差", "owner": "李四"})
         self.assertEqual(self.store.summary()["error_counts"]["检索排序问题"], 1)
-        self.store.mutate({"revision": self.store.state["revision"], "action": "delete_type", "name": "检索排序问题"})
+        record_revision = self.store.state["annotations"]["20"]["revision"]
+        self.store.mutate({"types_revision": self.store.state["types_revision"], "action": "delete_type", "name": "检索排序问题"})
         a = self.store.state["annotations"]["20"]
         self.assertEqual(a["error_type"], "其他")
         self.assertIn("原错误类型：检索排序问题", a["error_detail"])
         self.assertEqual(self.store.summary()["error_counts"]["其他"], 1)
+        self.assertEqual(a["revision"], record_revision + 1)
+        with self.assertRaises(RuntimeError):
+            self.store.mutate({"record_revision": record_revision, "action": "annotation", "key": "20", "annotation": {}})
 
     def test_concurrent_revision_rejected_and_gt_not_allowed(self):
         with self.assertRaises(RuntimeError):
-            self.store.mutate({"revision": -1, "action": "add_type", "name": "新类型"})
+            self.store.mutate({"types_revision": -1, "action": "add_type", "name": "新类型"})
         with self.assertRaises(ValueError):
             self.save("12", {"reviews": {"DEMO_GT_RESET": {"verdict": "yes"}}})
 
@@ -54,6 +58,24 @@ class AnnotationTests(unittest.TestCase):
         self.records[0]["query"] = "变化的query"
         with self.assertRaises(ValueError):
             Store(self.records, self.output, {})
+
+    def test_independent_versions_and_same_record_conflict(self):
+        self.store.mutate({"record_revision": 0, "action": "annotation", "key": "12", "annotation": {}})
+        self.store.mutate({"record_revision": 0, "action": "annotation", "key": "20", "annotation": {}})
+        self.assertEqual(self.store.state["annotations"]["20"]["revision"], 1)
+        with self.assertRaises(RuntimeError):
+            self.store.mutate({"record_revision": 0, "action": "annotation", "key": "12", "annotation": {"owner": "不能覆盖"}})
+        self.assertEqual(self.store.state["annotations"]["12"]["owner"], "")
+
+    def test_legacy_file_migration(self):
+        self.save("20", {})
+        legacy = json.loads(self.output.read_text())
+        del legacy["annotations"]["20"]["revision"]
+        del legacy["types_revision"]
+        self.output.write_text(json.dumps(legacy))
+        restored = Store(self.records, self.output, {})
+        self.assertEqual(restored.state["annotations"]["20"]["revision"], 0)
+        self.assertEqual(restored.state["types_revision"], 0)
 
 
 if __name__ == "__main__":

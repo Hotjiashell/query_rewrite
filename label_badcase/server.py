@@ -109,6 +109,9 @@ class Store:
             if previous.get("artifact_type") != "badcase_annotations" or previous.get("dataset_fingerprint") != fingerprint:
                 raise ValueError("输出文件属于另一份数据或模型结果已变化，请指定新的--output，避免混用标注")
             self.state = previous
+        self.state.setdefault("types_revision", 0)
+        for annotation in self.state["annotations"].values():
+            annotation.setdefault("revision", 0)
 
     def summary(self):
         annotations = self.state["annotations"]
@@ -161,14 +164,22 @@ class Store:
 
     def mutate(self, body):
         with self.lock:
-            if body.get("revision") != self.state["revision"]:
-                raise RuntimeError("数据已被另一个页面修改，请刷新后继续；当前草稿仍保留在页面中")
+            action = body.get("action")
+            key = str(body.get("key"))
+            if action == "annotation":
+                current_revision = self.state["annotations"].get(key, {}).get("revision", 0)
+                if body.get("record_revision") != current_revision:
+                    raise RuntimeError("这条badcase已被其他人修改。你的草稿已保留，请比较最新标注后选择处理方式。")
+            elif body.get("types_revision") != self.state["types_revision"]:
+                raise RuntimeError("错误类型已被其他人修改，请同步后重试。")
             old = copy.deepcopy(self.state)
             try:
                 action = body.get("action")
                 if action == "annotation":
                     key = str(body.get("key"))
-                    self.state["annotations"][key] = self.validate_annotation(key, body.get("annotation"))
+                    annotation = self.validate_annotation(key, body.get("annotation"))
+                    annotation["revision"] = current_revision + 1
+                    self.state["annotations"][key] = annotation
                 elif action == "add_type":
                     name = str(body.get("name", "")).strip()
                     if not name or len(name) > 80 or name in self.state["error_types"]:
@@ -183,8 +194,11 @@ class Store:
                         if annotation.get("error_type") == name:
                             annotation.update(error_type="其他", updated_at=now())
                             annotation["error_detail"] = f"[原错误类型：{name}]\n" + annotation["error_detail"]
+                            annotation["revision"] += 1
                 else:
                     raise ValueError("未知操作")
+                if action in ("add_type", "delete_type"):
+                    self.state["types_revision"] += 1
                 self.state["revision"] += 1
                 self.state["updated_at"] = now()
                 self.state["summary"] = self.summary()
@@ -207,6 +221,10 @@ def handler(store):
             self.wfile.write(data)
 
         def do_GET(self):
+            if self.path == "/api/sync":
+                with store.lock:
+                    self.respond(200, {"state": store.state, "summary": store.summary()})
+                return
             if self.path == "/api/data":
                 with store.lock:
                     self.respond(200, store.snapshot())
