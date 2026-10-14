@@ -31,6 +31,8 @@ class AnnotationTests(unittest.TestCase):
         self.assertEqual(self.store.summary()["completed"], 1)
 
     def test_drafts_not_counted_as_genuine_and_type_migration(self):
+        self.assertEqual(self.store.state["error_types"], ["其他"])
+        self.store.mutate({"revision": self.store.state["revision"], "action": "add_type", "name": "检索排序问题"})
         self.save("20", {"error_type": "检索排序问题", "error_detail": "排序偏差", "owner": "李四"})
         self.assertEqual(self.store.summary()["genuine"], 0)
         self.save("20", {"completed": True, "error_type": "检索排序问题", "error_detail": "排序偏差", "owner": "李四"})

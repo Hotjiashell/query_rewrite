@@ -45,7 +45,7 @@ python label_badcase/server.py --demo
 
 支持筛选、对话/标题/ID搜索、页码跳转、上一条/下一条，以及非输入状态下的左右方向键翻页。数据集展示顺序和原始 badcase 文件一致。若当前记录完成后不再满足筛选条件，页面仍保留当前记录供确认，点击下一条可继续处理筛选结果中的下一条。
 
-错误类型下拉框包含“其他”，支持在“管理错误类型”中添加或删除类型。“其他”不可删除。删除已经被使用的类型时，旧标注自动转入“其他”，原类型写入详细说明，历史结论和负责人保留。
+错误类型初始只提供“其他”，支持在“管理错误类型”中添加或删除类型。“其他”不可删除。删除已经被使用的类型时，旧标注自动转入“其他”，原类型写入详细说明，历史结论和负责人保留。负责人填写姓名。
 
 ## 保存与统计
 
@@ -69,7 +69,7 @@ python label_badcase/server.py --demo
   "sources": {"badcases": "...", "analysis": "...", "cases": "..."},
   "revision": 1,
   "updated_at": "...",
-  "error_types": ["检索排序问题", "其他"],
+  "error_types": ["其他"],
   "annotations": {
     "12": {
       "record_key": "12",
@@ -92,7 +92,7 @@ python label_badcase/server.py --demo
     "alternative": 1,
     "genuine": 0,
     "model_positive": 20,
-    "error_counts": {"检索排序问题": 0, "其他": 0}
+    "error_counts": {"其他": 0}
   }
 }
 ```

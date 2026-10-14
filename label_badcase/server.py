@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_TYPES = ["Query遗漏关键信息", "Query引入错误信息", "对话意图理解错误", "检索排序问题", "案例库覆盖不足", "GT标注问题", "其他"]
+DEFAULT_TYPES = ["其他"]
 
 
 def now():
@@ -277,8 +277,8 @@ def main():
             parser.error("输出路径不能覆盖输入文件")
         records = build_dataset(*(load(sources[k]) for k in ("badcases", "analysis", "cases")))
     store = Store(records, output.resolve(), sources)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), handler(store))
-    print(f"标注器已启动：http://127.0.0.1:{args.port}\n共{len(records)}条，实时保存到：{store.output}", flush=True)
+    server = ThreadingHTTPServer(("0.0.0.0", args.port), handler(store))
+    print(f"标注器已启动：http://0.0.0.0:{args.port}\n共{len(records)}条，实时保存到：{store.output}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
