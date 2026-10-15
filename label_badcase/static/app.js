@@ -242,7 +242,8 @@ $('complete').onclick=async()=>{
   const selected=r.retrieved.filter(c=>!c.is_gt&&(c.model_same===true||draft.reviews[c.case_id]));
   if(selected.some(c=>{const x=draft.reviews[c.case_id];const acceptsModel=x?.verdict==='yes'&&c.model_same===true&&c.model_reason?.trim();return !x?.verdict||(x.verdict!=='uncertain'&&!x.reason?.trim()&&!acceptsModel)||!x.owner?.trim();})){notice('请为每个待核验案例选择判断和负责人；不确定可留空理由，选是可接受模型理由，选否必须填写理由');return;}
   if(!hasYes(draft)&&!hasUncertain(draft)&&(!draft.error_type||!draft.error_detail.trim()||!draft.owner.trim())){notice('请填写真实 badcase 的错误类型、详细说明和负责人');return;}
-  draft.completed=true;dirty=true;backup();try{await flush();notice();renderWorkspace();}catch{}
+  draft.completed=true;dirty=true;backup();
+  try{await flush();notice();renderWorkspace();await nextPending();}catch{}
 };
 $('retry').onclick=()=>flush().catch(()=>{});
 $('export').onclick=async()=>{try{await flush();const response=await fetch('/api/export');if(!response.ok)throw Error('导出失败');const blob=new Blob([JSON.stringify(await response.json(),null,2)],{type:'application/json'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='badcase_annotations.json';a.click();URL.revokeObjectURL(url);}catch(e){notice(e.message);}};
