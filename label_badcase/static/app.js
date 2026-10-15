@@ -24,7 +24,10 @@ function trialPanel() {
 }
 function gtTitlePanel(r) {
   const result=r.gt_title_retrieval;if(!result)return '';
-  return `<section id="gt-title-results" class="card"><h2>GT 案例标题检索结果</h2><p class="model-note">使用 GT 案例标题检索的已保存结果${result.created_at?` · ${esc(result.created_at)}`:''}。下方正文来自当前案例库。</p>${trialResults({result})}</section>`;
+  const failed=['missing_title','retrieval_failed'].includes(result.outcome);
+  const content=failed?`<span class="tag gold">${result.outcome==='missing_title'?'GT 标题缺失 · 未发起检索':'GT 标题检索请求失败'}</span><p class="content trial-error">${esc(result.error||'没有可用的检索结果')}</p>`:trialResults({result});
+  const cutoffNote=result.outcome==='miss'&&result.gt_hit?`<p class="model-note">已返回 GT，但排名超出本次报告的 Top-${esc(result.cutoff||'K')} 范围。</p>`:'';
+  return `<section id="gt-title-results" class="card"><h2>GT 案例标题检索结果</h2><p class="model-note">使用 GT 案例标题检索的已保存结果${result.created_at?` · ${esc(result.created_at)}`:''}。下方正文来自当前案例库。</p>${content}${cutoffNote}</section>`;
 }
 function renderTrial() {
   const panel=$('trial-panel');if(!panel)return;

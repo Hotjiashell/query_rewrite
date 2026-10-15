@@ -160,14 +160,15 @@ class AnnotationTests(unittest.TestCase):
 
     def test_saved_gt_title_results_match_by_id_without_changing_fingerprint(self):
         gt_id = self.records[0]["gt"]["case_id"]
-        report = {"artifact_type": "gt_title_retrieval_check", "created_at": "yesterday", "misses": [
+        second_id = self.records[1]["gt"]["case_id"]
+        report = {"artifact_type": "gt_title_retrieval_check", "created_at": "yesterday", "records": [
             {"expected_case_id": gt_id, "outcome": "miss", "matched_rank": None,
              "query": "GT标题", "retrieval_trace": [
                  {"rank": 12, "case_id": "OTHER", "case_title": "候选标题", "score": .7}]},
-            {"expected_case_id": self.records[1]["gt"]["case_id"], "outcome": "miss",
-             "matched_rank": 12, "retrieval_trace": []}]}
+            {"expected_case_id": second_id, "outcome": "miss",
+             "matched_rank": 12, "retrieval_trace": [{"rank": 12, "case_id": second_id}]}]}
         results = load_gt_title_results(report, {"OTHER": {"text": "案例库正文"}})
-        self.assertEqual(set(results), {gt_id})
+        self.assertEqual(set(results), {gt_id, second_id})
         self.save("20", {"owner": "原负责人"})
         restored = Store(self.records, self.output, {}, gt_title_results=results)
         self.assertEqual(restored.state["dataset_fingerprint"], self.store.state["dataset_fingerprint"])
@@ -175,11 +176,27 @@ class AnnotationTests(unittest.TestCase):
         rows = restored.snapshot()["records"]
         self.assertEqual(rows[0]["gt_title_retrieval"]["cases"][0]["text"], "案例库正文")
         self.assertEqual(rows[0]["gt_title_retrieval"]["cases"][0]["rank"], 12)
-        self.assertIsNone(rows[1]["gt_title_retrieval"])
+        self.assertTrue(rows[1]["gt_title_retrieval"]["gt_hit"])
+        self.assertEqual(rows[1]["gt_title_retrieval"]["matched_rank"], 12)
         self.assertNotIn("gt_title_retrieval", self.records[0])
-        report["misses"][0]["retrieval_trace"][0]["case_id"] = gt_id
+        report["records"][0]["retrieval_trace"][0]["case_id"] = gt_id
         with self.assertRaisesRegex(ValueError, "矛盾"):
             load_gt_title_results(report, {})
+
+    def test_saved_title_hits_and_errors_are_all_retained(self):
+        report = {"artifact_type": "gt_title_retrieval_check", "records": [
+            {"expected_case_id": "HIT", "outcome": "hit", "matched_rank": 1,
+             "retrieval_trace": [{"rank": 1, "case_id": "HIT", "case_title": "命中"}]},
+            {"expected_case_id": "FAIL", "outcome": "retrieval_failed", "error": "timeout"},
+            {"expected_case_id": "MISSING", "outcome": "missing_title", "error": "missing title"},
+            {"expected_case_id": "EMPTY", "outcome": "miss", "retrieval_trace": []}]}
+        results = load_gt_title_results(report, {})
+        self.assertEqual(len(results), 4)
+        self.assertTrue(results["HIT"]["gt_hit"])
+        self.assertTrue(results["HIT"]["cases"][0]["is_gt"])
+        self.assertEqual(results["FAIL"]["error"], "timeout")
+        self.assertEqual(results["MISSING"]["outcome"], "missing_title")
+        self.assertEqual(results["EMPTY"]["cases"], [])
 
 
 if __name__ == "__main__":

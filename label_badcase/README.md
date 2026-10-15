@@ -28,9 +28,11 @@ python label_badcase/server.py --demo
 
 在启动命令后增加 `--gt-title-report results/gt_title_retrieval_check.json`，
 即可在主界面左栏、GT 案例下方展示“GT 案例标题检索结果”。该文件为
-`check_gt_retrieval.py` 的输出。只对 GT ID 在标题检索返回候选中完全缺失的
-记录展示，包含已保存的检索 query、未命中提示、返回案例排名、标题、ID、
-分数和可展开正文；正文从当前案例库补齐。展示全部返回候选，不限于 Top-10。
+`check_gt_retrieval.py` 的输出。读取 `records` 中所有 GT 的检查结果，包含
+已保存的检索 query、命中排名或未命中提示、返回案例排名、标题、ID、
+分数和可展开正文；命中的 GT 高亮显示，正文从当前案例库补齐。
+缺少标题、请求失败分别展示异常原因。展示全部返回候选，不限于 Top-10，
+GT 已返回但超出报告 cutoff 时另外注明。旧版仅含 `misses` 的文件仍可读取。
 此展示不受模型判断或人工分类影响，同一 GT 的多条 badcase 都会匹配。
 未传此参数时保持原界面，传入后也可继续使用原标注落盘文件。
 

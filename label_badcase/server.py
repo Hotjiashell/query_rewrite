@@ -106,18 +106,16 @@ def build_dataset(badcases, analysis, cases):
 
 
 def load_gt_title_results(report, cases):
-    """Read saved title misses as optional display data, independent of labels."""
+    """Read all saved title checks as display data, independent of labels."""
     if not isinstance(report, dict) or report.get("artifact_type") != "gt_title_retrieval_check":
         raise ValueError("GT标题检索报告必须是 gt_title_retrieval_check 格式")
-    if not isinstance(report.get("misses"), list):
-        raise ValueError("GT标题检索报告需要包含 misses 数组")
+    rows = report.get("records", report.get("misses"))
+    if not isinstance(rows, list):
+        raise ValueError("GT标题检索报告需要包含 records 数组")
     results = {}
-    for row in report["misses"]:
-        if not isinstance(row, dict) or row.get("outcome") != "miss" or not row.get("expected_case_id"):
-            raise ValueError("GT标题检索报告的 misses 包含无效记录")
-        # A case returned beyond a requested cutoff was still retrieved.
-        if row.get("matched_rank") is not None:
-            continue
+    for row in rows:
+        if not isinstance(row, dict) or row.get("outcome") not in ("hit", "miss", "missing_title", "retrieval_failed") or not row.get("expected_case_id"):
+            raise ValueError("GT标题检索报告包含无效记录")
         cid = str(row["expected_case_id"])
         if cid in results:
             raise ValueError(f"GT标题检索报告包含重复案例ID：{cid}")
@@ -129,16 +127,20 @@ def load_gt_title_results(report, cases):
             if not isinstance(item, dict) or not isinstance(item.get("rank"), int) or isinstance(item["rank"], bool) or item["rank"] < 1 or item.get("case_id") is None:
                 raise ValueError(f"GT标题检索记录包含无效候选：{cid}")
             candidate_id = str(item["case_id"])
-            if candidate_id == cid:
-                raise ValueError(f"GT标题检索报告未命中结论与候选矛盾：{cid}")
             entry = cases.get(candidate_id) or {}
             candidates.append({"rank": item["rank"], "case_id": candidate_id,
                                "title": item.get("case_title") or entry.get("case_name") or candidate_id,
-                               "text": entry.get("text") or "", "score": item.get("score"), "is_gt": False})
+                               "text": entry.get("text") or "", "score": item.get("score"), "is_gt": candidate_id == cid})
+        candidates.sort(key=lambda c: c["rank"])
+        matched_rank = next((c["rank"] for c in candidates if c["is_gt"]), None)
+        if matched_rank != row.get("matched_rank"):
+            raise ValueError(f"GT标题检索报告命中排名与候选矛盾：{cid}")
         results[cid] = {"query": row.get("query") or row.get("gt_case_title") or "",
-                        "gt_case_id": cid, "gt_available": True, "gt_hit": False,
-                        "matched_rank": None, "created_at": report.get("created_at"),
-                        "cases": sorted(candidates, key=lambda c: c["rank"])}
+                        "gt_case_id": cid, "gt_available": True, "gt_hit": matched_rank is not None,
+                        "matched_rank": matched_rank, "created_at": report.get("created_at"),
+                        "outcome": row["outcome"], "error": row.get("error"),
+                        "cutoff": (report.get("configuration") or {}).get("cutoff"),
+                        "cases": candidates}
     return results
 
 
@@ -397,7 +399,7 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--demo", action="store_true", help="使用独立的模拟数据体验界面")
     parser.add_argument("--retrieval-url", help="尝试检索接口地址，默认使用 search.py 中的地址")
-    parser.add_argument("--gt-title-report", help="check_gt_retrieval.py 输出；在左栏展示GT标题检索未命中结果")
+    parser.add_argument("--gt-title-report", help="check_gt_retrieval.py 输出；在左栏展示所有GT标题检索结果")
     parser.add_argument("--retrieval-timeout", type=float, default=30, help="尝试检索超时秒数（默认30）")
     args = parser.parse_args()
     if not 0 < args.retrieval_timeout <= 300:

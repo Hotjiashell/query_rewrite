@@ -38,9 +38,14 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), RetrievalHandler)
         endpoint = f"http://127.0.0.1:{upstream.server_port}"
-        saved_results = load_gt_title_results({"artifact_type": "gt_title_retrieval_check", "misses": [
+        second_gt = records[1]["gt"]["case_id"]
+        saved_results = load_gt_title_results({"artifact_type": "gt_title_retrieval_check", "records": [
             {"expected_case_id": gt, "outcome": "miss", "matched_rank": None, "query": "已保存的GT标题",
-             "retrieval_trace": [{"rank": 2, "case_id": "SAVED", "case_title": "历史检索候选", "score": .5}]}]},
+             "retrieval_trace": [{"rank": 2, "case_id": "SAVED", "case_title": "历史检索候选", "score": .5}]},
+            {"expected_case_id": second_gt, "outcome": "hit", "matched_rank": 1, "query": "命中标题",
+             "retrieval_trace": [{"rank": 1, "case_id": second_gt, "case_title": "已命中的GT"}]},
+            {"expected_case_id": records[2]["gt"]["case_id"], "outcome": "retrieval_failed", "error": "测试接口超时"},
+            {"expected_case_id": records[3]["gt"]["case_id"], "outcome": "missing_title", "error": "测试标题缺失"}]},
             {"SAVED": {"text": "从案例库补齐的正文"}})
         store = Store(records, Path(tmp) / "labels.json", {"demo": True},
                       gt_title_results=saved_results,
@@ -78,7 +83,8 @@ def main():
                     page.locator("#trial-query").fill("slow")
                     page.locator("#trial-submit").click()
                     page.locator("#next").click()
-                    expect(page.locator('#gt-title-results')).to_have_count(0)
+                    expect(page.locator('#gt-title-results')).to_contain_text('命中 GT · 排名 #1')
+                    expect(page.locator('#gt-title-results .trial-hit')).to_have_count(1)
                     expect(page.locator("#trial-results")).to_contain_text("输入 query")
                     page.wait_for_timeout(1200)
                     expect(page.locator("#trial-results")).to_contain_text("输入 query")
@@ -86,6 +92,14 @@ def main():
                     expect(page.locator('#gt-title-results')).to_contain_text('历史检索候选')
                     expect(page.locator("#trial-results")).to_contain_text("命中 GT · 排名 #3")
                     expect(page.locator("#trial-query")).to_have_value("slow")
+                    page.locator('#jump').fill('3')
+                    page.locator('#jump-go').click()
+                    expect(page.locator('#gt-title-results')).to_contain_text('GT 标题检索请求失败')
+                    expect(page.locator('#gt-title-results')).to_contain_text('测试接口超时')
+                    page.locator('#next').click()
+                    expect(page.locator('#gt-title-results')).to_contain_text('GT 标题缺失 · 未发起检索')
+                    page.locator('#jump').fill('1')
+                    page.locator('#jump-go').click()
                     assert not store.state["annotations"]
                     assert not store.output.exists()
                     page.screenshot(path="/tmp/badcase-trial-desktop.png", full_page=True)
