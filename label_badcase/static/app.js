@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let data, state, stats, currentKey, draft, dirty = false, timer, queue = Promise.resolve(), fatalConflict = false;
-let filter = 'all', search = '', errorTypeFilter = '';
+let filter = 'all', search = '', errorTypeFilter = '', humanReviewFilter = '';
 let defaultOwner = '';
 try {defaultOwner=localStorage.getItem('badcase-default-owner')||'';} catch {}
 let baseRevision = 0, remotePending = false, syncing = false;
@@ -102,6 +102,15 @@ async function sync() {
 }
 const hasYes = a => Object.values(a?.reviews || {}).some(r => r.verdict === 'yes');
 const hasUncertain = a => Object.values(a?.reviews || {}).some(r => r.verdict === 'uncertain');
+function matchesHumanReview(a) {
+  switch(humanReviewFilter) {
+    case 'yes': return hasYes(a);
+    case 'no': return a?.completed && !hasYes(a) && !hasUncertain(a);
+    case 'uncertain': return hasUncertain(a);
+    case 'unreviewed': return !a?.completed && !Object.values(a?.reviews || {}).some(r => ['yes','no','uncertain'].includes(r.verdict));
+    default: return true;
+  }
+}
 const record = () => data.records.find(r => r.key === currentKey);
 const blank = () => ({reviews:{}, error_type:'', error_detail:'', owner:'', completed:false});
 function ownerOptions(selected='') {
@@ -137,7 +146,7 @@ function visible() {
     const a=state.annotations[r.key];
     const match=filter==='all' || filter==='pending'&&!a?.completed || filter==='complete'&&a?.completed || filter==='alternative'&&hasYes(a) || filter==='genuine'&&a?.completed&&!hasYes(a)&&!hasUncertain(a) || filter==='uncertain'&&hasUncertain(a)&&!hasYes(a) || filter==='model'&&r.retrieved.some(c=>c.model_same===true&&!c.is_gt) || filter==='model_none'&&r.model_status==='success'&&!r.retrieved.some(c=>c.model_same===true&&!c.is_gt);
     const typeMatch=!errorTypeFilter || (errorTypeFilter==='unset'?!a?.error_type:a?.error_type===errorTypeFilter.slice(5));
-    return match && typeMatch && (!search || [r.key,r.call_sno,r.chat_content,r.query,...r.queries,r.gt.title,...r.retrieved.map(c=>c.title)].join(' ').toLowerCase().includes(search));
+    return match && matchesHumanReview(a) && typeMatch && (!search || [r.key,r.call_sno,r.chat_content,r.query,...r.queries,r.gt.title,...r.retrieved.map(c=>c.title)].join(' ').toLowerCase().includes(search));
   });
 }
 function renderStats() {
@@ -237,8 +246,8 @@ async function nextPending() {
   }catch{}finally{button.disabled=false;}
 }
 async function changeView() {
-  const nextFilter=$('filter').value, nextType=$('error-type-filter').value, nextSearch=$('search').value.trim().toLowerCase();
-  try {await flush();filter=nextFilter;errorTypeFilter=nextType;search=nextSearch;renderErrorTypeFilter();const list=visible();openRecord(list.some(r=>r.key===currentKey)?currentKey:list[0]?.key);}catch{renderErrorTypeFilter();}
+  const nextFilter=$('filter').value, nextHumanReview=$('human-review-filter').value, nextType=$('error-type-filter').value, nextSearch=$('search').value.trim().toLowerCase();
+  try {await flush();filter=nextFilter;humanReviewFilter=nextHumanReview;errorTypeFilter=nextType;search=nextSearch;renderErrorTypeFilter();const list=visible();openRecord(list.some(r=>r.key===currentKey)?currentKey:list[0]?.key);}catch{$('filter').value=filter;$('human-review-filter').value=humanReviewFilter;$('search').value=search;renderErrorTypeFilter();}
 }
 $('workspace').addEventListener('input',event=>{
   const el=event.target, card=el.closest('[data-cid]');
@@ -258,6 +267,7 @@ $('next-pending').onclick=nextPending;
 $('jump-go').onclick=async()=>{try{await flush();const list=visible(),n=Number($('jump').value);if(Number.isInteger(n)&&n>=1&&n<=list.length){openRecord(list[n-1].key);window.scrollTo(0,0);}else notice('请输入筛选范围内的有效页码');}catch{}};
 $('filter').onchange=changeView;$('search').onchange=changeView;
 $('error-type-filter').onchange=changeView;
+$('human-review-filter').onchange=changeView;
 $('complete').onclick=async()=>{
   const r=record();if(!r)return;
   applyDefaultOwner();
