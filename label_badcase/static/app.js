@@ -153,8 +153,9 @@ function reviewCard(c) {
 }
 function errorPanel() {
   if(hasYes(draft)) return `<div class="card"><h2>已有其他正确案例</h2><p>已人工确认至少一个召回案例能够解决用户问题。完成其余待核验案例后，可点击“完成标注”。</p><p class="muted">如改为全部否决，将显示真实 badcase 分类表单。</p></div>`;
-  if(hasUncertain(draft)) return '<div class="card"><h2>待进一步确认</h2><p>目前有案例标为“不确定”，且没有确认正确的案例。可以完成本轮标注，无需填写错误分类；该记录不会计入真实 badcase 或错误类型统计。</p></div>';
-  return `<div class="card"><h2>真实 badcase 分类</h2><p class="muted">当所有待核验案例都不能解决问题，或没有待核验案例时，请填写以下信息。尚未完成核验的记录不会计入真实 badcase 数量。</p><label class="form-field"><span>错误类型 *</span><select id="error-type"><option value="">请选择错误类型</option>${state.error_types.map(t=>`<option value="${esc(t)}" ${draft.error_type===t?'selected':''}>${esc(t)}</option>`).join('')}</select></label><label class="form-field"><span>详细说明 *</span><textarea id="error-detail" placeholder="说明漏召回的原因、query的问题、正确处理方向等">${esc(draft.error_detail)}</textarea></label><label class="form-field"><span>分类负责人 *</span><select id="error-owner">${ownerOptions(selectedOwner(draft.owner))}</select></label></div>`;
+  const uncertain=hasUncertain(draft);
+  const required=uncertain?'（选填）':' *';
+  return `<div class="card"><h2>${uncertain?'待进一步确认 · 可选错误分类':'真实 badcase 分类'}</h2><p class="muted">${uncertain?'存在“不确定”的案例时，也可以记录初步错误类型、说明和负责人，均为选填。该记录仍归为待进一步确认，不计入真实 badcase 或错误类型统计。':'当所有待核验案例都不能解决问题，或没有待核验案例时，请填写以下信息。尚未完成核验的记录不会计入真实 badcase 数量。'}</p><label class="form-field"><span>错误类型${required}</span><select id="error-type"><option value="">请选择错误类型</option>${state.error_types.map(t=>`<option value="${esc(t)}" ${draft.error_type===t?'selected':''}>${esc(t)}</option>`).join('')}</select></label><label class="form-field"><span>详细说明${required}</span><textarea id="error-detail" placeholder="说明漏召回的原因、query的问题、正确处理方向等">${esc(draft.error_detail)}</textarea></label><label class="form-field"><span>分类负责人${required}</span><select id="error-owner">${ownerOptions(selectedOwner(draft.owner))}</select></label></div>`;
 }
 function renderWorkspace() {
   const r=record();
