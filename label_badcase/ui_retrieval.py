@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, expect
-from server import ROOT, Store, build_dataset, handler, load, retrieve_cases
+from server import ROOT, Store, build_dataset, handler, load, retrieve_cases, load_gt_title_results
 
 
 def main():
@@ -38,7 +38,12 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), RetrievalHandler)
         endpoint = f"http://127.0.0.1:{upstream.server_port}"
+        saved_results = load_gt_title_results({"artifact_type": "gt_title_retrieval_check", "misses": [
+            {"expected_case_id": gt, "outcome": "miss", "matched_rank": None, "query": "已保存的GT标题",
+             "retrieval_trace": [{"rank": 2, "case_id": "SAVED", "case_title": "历史检索候选", "score": .5}]}]},
+            {"SAVED": {"text": "从案例库补齐的正文"}})
         store = Store(records, Path(tmp) / "labels.json", {"demo": True},
+                      gt_title_results=saved_results,
                       retriever=lambda query: retrieve_cases(query, url=endpoint, timeout=3))
         app = ThreadingHTTPServer(("127.0.0.1", 0), handler(store))
         for server in (upstream, app):
@@ -52,6 +57,11 @@ def main():
                     page.on("pageerror", lambda e: errors.append(str(e)))
                     page.goto(f"http://127.0.0.1:{app.server_port}")
                     page.wait_for_load_state("networkidle")
+                    expect(page.locator('#workspace > .column').first.locator('#gt-title-results')).to_be_visible()
+                    expect(page.locator('#gt-title-results')).to_contain_text('已保存的GT标题')
+                    expect(page.locator('#gt-title-results')).to_contain_text('未命中 GT')
+                    page.locator('#gt-title-results summary').click()
+                    expect(page.locator('#gt-title-results .content')).to_have_text('从案例库补齐的正文')
                     expect(page.locator("#trial-panel")).to_be_visible()
                     page.locator('[data-trial-fill="gt"]').click()
                     expect(page.locator("#trial-query")).to_have_value(records[0]["gt"]["title"])
@@ -68,10 +78,12 @@ def main():
                     page.locator("#trial-query").fill("slow")
                     page.locator("#trial-submit").click()
                     page.locator("#next").click()
+                    expect(page.locator('#gt-title-results')).to_have_count(0)
                     expect(page.locator("#trial-results")).to_contain_text("输入 query")
                     page.wait_for_timeout(1200)
                     expect(page.locator("#trial-results")).to_contain_text("输入 query")
                     page.locator("#prev").click()
+                    expect(page.locator('#gt-title-results')).to_contain_text('历史检索候选')
                     expect(page.locator("#trial-results")).to_contain_text("命中 GT · 排名 #3")
                     expect(page.locator("#trial-query")).to_have_value("slow")
                     assert not store.state["annotations"]

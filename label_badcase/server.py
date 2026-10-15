@@ -105,13 +105,51 @@ def build_dataset(badcases, analysis, cases):
     return result
 
 
+def load_gt_title_results(report, cases):
+    """Read saved title misses as optional display data, independent of labels."""
+    if not isinstance(report, dict) or report.get("artifact_type") != "gt_title_retrieval_check":
+        raise ValueError("GT标题检索报告必须是 gt_title_retrieval_check 格式")
+    if not isinstance(report.get("misses"), list):
+        raise ValueError("GT标题检索报告需要包含 misses 数组")
+    results = {}
+    for row in report["misses"]:
+        if not isinstance(row, dict) or row.get("outcome") != "miss" or not row.get("expected_case_id"):
+            raise ValueError("GT标题检索报告的 misses 包含无效记录")
+        # A case returned beyond a requested cutoff was still retrieved.
+        if row.get("matched_rank") is not None:
+            continue
+        cid = str(row["expected_case_id"])
+        if cid in results:
+            raise ValueError(f"GT标题检索报告包含重复案例ID：{cid}")
+        trace = row.get("retrieval_trace", [])
+        if not isinstance(trace, list):
+            raise ValueError(f"GT标题检索记录的 retrieval_trace 必须是数组：{cid}")
+        candidates = []
+        for item in trace:
+            if not isinstance(item, dict) or not isinstance(item.get("rank"), int) or isinstance(item["rank"], bool) or item["rank"] < 1 or item.get("case_id") is None:
+                raise ValueError(f"GT标题检索记录包含无效候选：{cid}")
+            candidate_id = str(item["case_id"])
+            if candidate_id == cid:
+                raise ValueError(f"GT标题检索报告未命中结论与候选矛盾：{cid}")
+            entry = cases.get(candidate_id) or {}
+            candidates.append({"rank": item["rank"], "case_id": candidate_id,
+                               "title": item.get("case_title") or entry.get("case_name") or candidate_id,
+                               "text": entry.get("text") or "", "score": item.get("score"), "is_gt": False})
+        results[cid] = {"query": row.get("query") or row.get("gt_case_title") or "",
+                        "gt_case_id": cid, "gt_available": True, "gt_hit": False,
+                        "matched_rank": None, "created_at": report.get("created_at"),
+                        "cases": sorted(candidates, key=lambda c: c["rank"])}
+    return results
+
+
 class Store:
-    def __init__(self, records, output, sources, *, retriever=None):
+    def __init__(self, records, output, sources, *, retriever=None, gt_title_results=None):
         self.records = records
         self.by_key = {r["key"]: r for r in records}
         self.output = output
         self.lock = threading.Lock()
         self.retriever = retriever or retrieve_cases
+        self.gt_title_results = gt_title_results or {}
         fingerprint = hashlib.sha256(json.dumps(records, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         self.state = {"schema_version": 1, "artifact_type": "badcase_annotations",
                       "dataset_fingerprint": fingerprint, "sources": sources, "revision": 0,
@@ -186,7 +224,8 @@ class Store:
                 "model_positive": sum(any(c["model_same"] is True and not c["is_gt"] for c in r["retrieved"]) for r in self.records)}
 
     def snapshot(self):
-        return {"records": self.records, "state": self.state, "summary": self.summary(), "output": str(self.output)}
+        records = [{**r, "gt_title_retrieval": self.gt_title_results.get(r["gt"]["case_id"])} for r in self.records]
+        return {"records": records, "state": self.state, "summary": self.summary(), "output": str(self.output)}
 
     def validate_annotation(self, key, raw):
         if key not in self.by_key or not isinstance(raw, dict):
@@ -358,6 +397,7 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--demo", action="store_true", help="使用独立的模拟数据体验界面")
     parser.add_argument("--retrieval-url", help="尝试检索接口地址，默认使用 search.py 中的地址")
+    parser.add_argument("--gt-title-report", help="check_gt_retrieval.py 输出；在左栏展示GT标题检索未命中结果")
     parser.add_argument("--retrieval-timeout", type=float, default=30, help="尝试检索超时秒数（默认30）")
     args = parser.parse_args()
     if not 0 < args.retrieval_timeout <= 300:
@@ -375,7 +415,13 @@ def main():
         if output in [Path(p) for p in sources.values()]:
             parser.error("输出路径不能覆盖输入文件")
         records = build_dataset(*(load(sources[k]) for k in ("badcases", "analysis", "cases")))
-    store = Store(records, output.resolve(), sources,
+    gt_title_results = {}
+    if args.gt_title_report:
+        if Path(args.gt_title_report).resolve() == output.resolve():
+            parser.error("输出路径不能覆盖GT标题检索报告")
+        cases = demo["cases"] if args.demo else load(sources["cases"])
+        gt_title_results = load_gt_title_results(load(args.gt_title_report), cases)
+    store = Store(records, output.resolve(), sources, gt_title_results=gt_title_results,
                   retriever=lambda query: retrieve_cases(query, url=args.retrieval_url, timeout=args.retrieval_timeout))
     server = ThreadingHTTPServer(("0.0.0.0", args.port), handler(store))
     print(f"标注器已启动：http://0.0.0.0:{args.port}\n共{len(records)}条，实时保存到：{store.output}", flush=True)

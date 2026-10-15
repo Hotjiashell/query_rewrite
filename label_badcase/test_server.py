@@ -4,7 +4,7 @@ import unittest
 import copy
 from pathlib import Path
 
-from server import Store, build_dataset, ROOT, handler
+from server import Store, build_dataset, ROOT, handler, load_gt_title_results
 
 
 class AnnotationTests(unittest.TestCase):
@@ -157,6 +157,29 @@ class AnnotationTests(unittest.TestCase):
         self.store.retriever = fail
         with self.assertRaisesRegex(RuntimeError, "服务超时"):
             self.store.try_retrieval({"key": "12", "query": "q"})
+
+    def test_saved_gt_title_results_match_by_id_without_changing_fingerprint(self):
+        gt_id = self.records[0]["gt"]["case_id"]
+        report = {"artifact_type": "gt_title_retrieval_check", "created_at": "yesterday", "misses": [
+            {"expected_case_id": gt_id, "outcome": "miss", "matched_rank": None,
+             "query": "GT标题", "retrieval_trace": [
+                 {"rank": 12, "case_id": "OTHER", "case_title": "候选标题", "score": .7}]},
+            {"expected_case_id": self.records[1]["gt"]["case_id"], "outcome": "miss",
+             "matched_rank": 12, "retrieval_trace": []}]}
+        results = load_gt_title_results(report, {"OTHER": {"text": "案例库正文"}})
+        self.assertEqual(set(results), {gt_id})
+        self.save("20", {"owner": "原负责人"})
+        restored = Store(self.records, self.output, {}, gt_title_results=results)
+        self.assertEqual(restored.state["dataset_fingerprint"], self.store.state["dataset_fingerprint"])
+        self.assertEqual(restored.state["annotations"], self.store.state["annotations"])
+        rows = restored.snapshot()["records"]
+        self.assertEqual(rows[0]["gt_title_retrieval"]["cases"][0]["text"], "案例库正文")
+        self.assertEqual(rows[0]["gt_title_retrieval"]["cases"][0]["rank"], 12)
+        self.assertIsNone(rows[1]["gt_title_retrieval"])
+        self.assertNotIn("gt_title_retrieval", self.records[0])
+        report["misses"][0]["retrieval_trace"][0]["case_id"] = gt_id
+        with self.assertRaisesRegex(ValueError, "矛盾"):
+            load_gt_title_results(report, {})
 
 
 if __name__ == "__main__":

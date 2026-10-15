@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let data, state, stats, currentKey, draft, dirty = false, timer, queue = Promise.resolve(), fatalConflict = false;
-let filter = 'all', search = '';
+let filter = 'all', search = '', errorTypeFilter = '';
 let defaultOwner = '';
 try {defaultOwner=localStorage.getItem('badcase-default-owner')||'';} catch {}
 let baseRevision = 0, remotePending = false, syncing = false;
@@ -21,6 +21,10 @@ function trialResults(trial) {
 function trialPanel() {
   const trial=trialFor();
   return `<section id="trial-panel" class="card"><h2>尝试检索</h2><p class="model-note">针对当前记录尝试新的 query，按案例 ID 检查是否命中 GT。尝试结果仅在当前页面保留。</p><form id="trial-form"><label class="form-field"><span>检索 query</span><textarea id="trial-query" required maxlength="10000" placeholder="输入想尝试的 query">${esc(trial.query)}</textarea></label><div class="toolbar"><button class="primary" id="trial-submit" ${trial.loading?'disabled':''}>${trial.loading?'正在检索…':'尝试检索'}</button><button type="button" data-trial-fill="query">填入原 query</button><button type="button" data-trial-fill="gt">填入 GT 标题</button></div></form><div id="trial-results" aria-live="polite">${trialResults(trial)}</div></section>`;
+}
+function gtTitlePanel(r) {
+  const result=r.gt_title_retrieval;if(!result)return '';
+  return `<section id="gt-title-results" class="card"><h2>GT 案例标题检索结果</h2><p class="model-note">使用 GT 案例标题检索的已保存结果${result.created_at?` · ${esc(result.created_at)}`:''}。下方正文来自当前案例库。</p>${trialResults({result})}</section>`;
 }
 function renderTrial() {
   const panel=$('trial-panel');if(!panel)return;
@@ -52,10 +56,20 @@ function showConflict() {
   saving('当前记录有冲突 · 草稿已保留',true);pageInfo();
 }
 function updateTypes() {
+  renderErrorTypeFilter();
   const select=$('error-type');
   if(select){const names=[...state.error_types];if(draft.error_type&&!names.includes(draft.error_type))names.push(draft.error_type);select.innerHTML='<option value="">请选择错误类型</option>'+names.map(t=>`<option value="${esc(t)}" ${draft.error_type===t?'selected':''}>${esc(t)}${state.error_types.includes(t)?'':'（已删除，请重选）'}</option>`).join('');}
   if($('types-dialog').open)renderTypes();
   updateOwners();
+}
+function renderErrorTypeFilter() {
+  const select=$('error-type-filter');
+  const names=[...new Set([...state.error_types,...Object.values(state.annotations).map(a=>a.error_type).filter(Boolean)])];
+  const selected=errorTypeFilter;
+  // Keep an active deleted type visible until the user changes the filter.
+  if(selected.startsWith('type:')&&!names.includes(selected.slice(5)))names.push(selected.slice(5));
+  select.innerHTML='<option value="">全部错误类型</option><option value="unset">未分类</option>'+names.map(name=>`<option value="${esc('type:'+name)}">${esc(name)}</option>`).join('');
+  select.value=selected;
 }
 function applyRemote(result) {
   if(result.state.revision < state.revision)return;
@@ -119,7 +133,8 @@ function visible() {
   return data.records.filter(r => {
     const a=state.annotations[r.key];
     const match=filter==='all' || filter==='pending'&&!a?.completed || filter==='complete'&&a?.completed || filter==='alternative'&&hasYes(a) || filter==='genuine'&&a?.completed&&!hasYes(a)&&!hasUncertain(a) || filter==='uncertain'&&hasUncertain(a)&&!hasYes(a) || filter==='model'&&r.retrieved.some(c=>c.model_same===true&&!c.is_gt) || filter==='model_none'&&r.model_status==='success'&&!r.retrieved.some(c=>c.model_same===true&&!c.is_gt);
-    return match && (!search || [r.key,r.call_sno,r.chat_content,r.query,...r.queries,r.gt.title,...r.retrieved.map(c=>c.title)].join(' ').toLowerCase().includes(search));
+    const typeMatch=!errorTypeFilter || (errorTypeFilter==='unset'?!a?.error_type:a?.error_type===errorTypeFilter.slice(5));
+    return match && typeMatch && (!search || [r.key,r.call_sno,r.chat_content,r.query,...r.queries,r.gt.title,...r.retrieved.map(c=>c.title)].join(' ').toLowerCase().includes(search));
   });
 }
 function renderStats() {
@@ -163,6 +178,8 @@ function renderWorkspace() {
   const selected=r.retrieved.filter(c=>!c.is_gt&&(c.model_same===true||draft.reviews[c.case_id]));
   $('workspace').innerHTML=`<div class="column"><section class="card"><div class="card-heading"><h2>用户与客服对话</h2><span class="tag">样本 ${esc(r.key)}</span></div><div class="model-note">会话编号 ${esc(r.call_sno||'未提供')}</div><div class="content scroll-content">${esc(typeof r.chat_content==='string'?r.chat_content:JSON.stringify(r.chat_content,null,2))||'未提供对话'}</div></section><section class="card"><h2>检索 Query</h2><div class="label">QUERY</div><div class="query">${esc(r.query)||'未提供'}</div><div class="label">QUERIES · ${r.queries.length} 条</div>${r.queries.length?r.queries.map((q,i)=>`<div class="query">${i+1}. ${esc(q)}</div>`).join(''):'<p class="muted">未提供多路 query</p>'}</section><section class="card"><div class="card-heading"><h2>GT 案例</h2><span class="tag green">标注正确案例</span></div><h3>${esc(r.gt.title)}</h3><span class="case-id">${esc(r.gt.case_id)}</span><div class="content scroll-content">${esc(r.gt.text)||'<span class="tag red">GT正文缺失</span>'}</div></section><section class="card"><h2>召回 Top-10</h2><p class="model-note">可查看正文，并补充核验模型漏选的非GT案例。</p><table class="retrieval"><tbody>${r.retrieved.map(c=>`<tr><td>${c.rank}</td><td><details><summary>${esc(c.title)}</summary><span class="case-id">${esc(c.case_id)}</span><div class="content">${esc(c.text)||'案例正文缺失'}</div>${c.model_reason?`<div class="model-note">模型理由：${esc(c.model_reason)}</div>`:''}</details>${c.is_gt?'<span class="tag">GT本身，不计入其他正确案例</span>':c.model_same===true?'<span class="tag green">模型认为正确</span>':c.model_same===false?'<span class="tag">模型否决</span>':'<span class="tag gold">未判断 / 未选中</span>'}</td><td>${c.is_gt?'':`<button data-add="${esc(c.case_id)}" ${selected.includes(c)?'disabled':''}>${selected.includes(c)?'已列入':'补充核验'}</button>`}</td></tr>`).join('')}</tbody></table>${histogram()}</section></div><div class="column"><section class="card"><div class="card-heading"><h2>人工核验</h2><span class="tag">${selected.length} 个待核验案例</span></div><p class="muted">核验召回案例能否直接或间接解决对话中的用户问题。每个案例分别填写判断和负责人。对模型推荐案例选“是”时可留空理由，表示接受模型理由；选“否”时需填写理由，“不确定”无需理由。</p>${r.model_status!=='success'?`<div class="model-reason"><span class="tag gold">模型分析${r.model_status==='missing'?'缺失':'失败'}</span><p>${esc(r.model_error||'请查看召回列表并手动补充需要核验的案例。')}</p></div>`:''}${r.stage1_reason?`<details><summary>查看模型初筛依据</summary><p class="content model-note">${esc(r.stage1_reason)}</p></details>`:''}${selected.length?selected.map(reviewCard).join(''):'<p class="muted">模型没有建议核验的正确案例。请复核左侧召回列表，必要时补充核验；确认没有其他正确案例后填写错误分类。</p>'}</section><div id="classification">${errorPanel()}</div></div>`;
   $('classification').insertAdjacentHTML('beforebegin',trialPanel());
+  const left=$('workspace').querySelector('.column');
+  left.children[2].insertAdjacentHTML('afterend',gtTitlePanel(r));
   pageInfo();
 }
 function openRecord(key) {
@@ -217,7 +234,8 @@ async function nextPending() {
   }catch{}finally{button.disabled=false;}
 }
 async function changeView() {
-  try {await flush();filter=$('filter').value;search=$('search').value.trim().toLowerCase();const list=visible();openRecord(list.some(r=>r.key===currentKey)?currentKey:list[0]?.key);}catch{}
+  const nextFilter=$('filter').value, nextType=$('error-type-filter').value, nextSearch=$('search').value.trim().toLowerCase();
+  try {await flush();filter=nextFilter;errorTypeFilter=nextType;search=nextSearch;renderErrorTypeFilter();const list=visible();openRecord(list.some(r=>r.key===currentKey)?currentKey:list[0]?.key);}catch{renderErrorTypeFilter();}
 }
 $('workspace').addEventListener('input',event=>{
   const el=event.target, card=el.closest('[data-cid]');
@@ -236,6 +254,7 @@ $('prev').onclick=()=>navigate(-1);$('next').onclick=()=>navigate(1);
 $('next-pending').onclick=nextPending;
 $('jump-go').onclick=async()=>{try{await flush();const list=visible(),n=Number($('jump').value);if(Number.isInteger(n)&&n>=1&&n<=list.length){openRecord(list[n-1].key);window.scrollTo(0,0);}else notice('请输入筛选范围内的有效页码');}catch{}};
 $('filter').onchange=changeView;$('search').onchange=changeView;
+$('error-type-filter').onchange=changeView;
 $('complete').onclick=async()=>{
   const r=record();if(!r)return;
   applyDefaultOwner();
@@ -281,4 +300,4 @@ $('use-draft').onclick=async()=>{
 $('download-draft').onclick=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify({record_key:currentKey,baseRevision,draft},null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=`badcase-${currentKey}-draft.json`;a.click();URL.revokeObjectURL(url);};
 document.addEventListener('focusout',()=>{setTimeout(()=>{if(remotePending&&!dirty&&!fatalConflict&&!$('workspace').contains(document.activeElement)){remotePending=false;baseRevision=revisionOf(currentKey);draft=structuredClone(state.annotations[currentKey]||blank());renderWorkspace();notice('已同步当前记录的最新标注。');}},0);});
 setInterval(sync,3000);
-(async()=>{try{const response=await fetch('/api/data');if(!response.ok)throw Error('数据加载失败');data=await response.json();state=data.state;stats=data.summary;renderStats();openRecord(data.records[0]?.key);saving('已连接 · 自动保存');$('save-state').title=`输出文件：${data.output}`;renderDefaultOwner();}catch(e){notice(e.message);saving('加载失败',true);$('workspace').innerHTML='<div class="empty">请检查本地服务及输入文件后刷新页面。</div>';}})();
+(async()=>{try{const response=await fetch('/api/data');if(!response.ok)throw Error('数据加载失败');data=await response.json();state=data.state;stats=data.summary;renderStats();renderErrorTypeFilter();openRecord(data.records[0]?.key);saving('已连接 · 自动保存');$('save-state').title=`输出文件：${data.output}`;renderDefaultOwner();}catch(e){notice(e.message);saving('加载失败',true);$('workspace').innerHTML='<div class="empty">请检查本地服务及输入文件后刷新页面。</div>';}})();
