@@ -79,6 +79,32 @@ class AnnotationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.save("12", {"reviews": {"DEMO_GT_RESET": {"verdict": "yes"}}})
 
+    def test_chart_counts_include_mixed_drafts_and_model_scopes(self):
+        self.save("12", {"reviews": {
+            "DEMO_RESET": {"verdict": "yes"},
+            "DEMO_CACHE": {"verdict": "uncertain"}}, "error_type": "其他"})
+        self.save("15", {"reviews": {"DEMO_PHONE": {"verdict": "uncertain"}}})
+        self.save("20", {"error_type": "其他"})
+        self.save("27", {"error_type": "其他"})
+        summary = self.store.summary()
+        self.assertEqual(summary["human_review_counts"], {"yes": 1, "no": 0, "uncertain": 2})
+        scopes = summary["error_counts_by_scope"]
+        self.assertEqual(scopes["genuine"], {"其他": 0})
+        self.assertEqual(scopes["model_positive"], {"其他": 1, "": 1})
+        self.assertEqual(scopes["model_none"], {"其他": 1, "": 0})
+        # Negative drafts are not confirmed badcases; failed analysis is not model-negative.
+        self.save("20", {"completed": True, "error_type": "其他", "error_detail": "无正确案例", "owner": "测试人"})
+        self.save("27", {"completed": True, "error_type": "其他", "error_detail": "无正确案例", "owner": "测试人"})
+        summary = self.store.summary()
+        self.assertEqual(summary["human_review_counts"], {"yes": 1, "no": 2, "uncertain": 2})
+        self.assertEqual(summary["error_counts_by_scope"]["genuine"], summary["error_counts"])
+        self.assertEqual(summary["error_counts"]["其他"], 2)
+        # Unannotated records remain visible as unclassified; GT positives do not count.
+        self.store.state["annotations"].pop("20")
+        self.store.by_key["20"]["retrieved"].append({"model_same": True, "is_gt": True})
+        self.store.by_key["27"]["model_status"] = "missing"
+        self.assertEqual(self.store.summary()["error_counts_by_scope"]["model_none"], {"其他": 0, "": 1})
+
     def test_input_change_rejected(self):
         self.save("20", {})
         self.records[0]["query"] = "变化的query"

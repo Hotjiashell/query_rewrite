@@ -221,8 +221,20 @@ class Store:
         counts = {name: 0 for name in self.state["error_types"]}
         for a in genuine:
             counts[a["error_type"]] = counts.get(a["error_type"], 0) + 1
+        human_uncertain = sum(any(r.get("verdict") == "uncertain" for r in a.get("reviews", {}).values()) for a in values)
+        model_counts = {scope: {**{name: 0 for name in self.state["error_types"]}, "": 0}
+                        for scope in ("model_none", "model_positive")}
+        for record in self.records:
+            positive = any(c["model_same"] is True and not c["is_gt"] for c in record["retrieved"])
+            if not positive and record["model_status"] != "success":
+                continue
+            scope = "model_positive" if positive else "model_none"
+            error_type = annotations.get(record["key"], {}).get("error_type", "")
+            model_counts[scope][error_type] = model_counts[scope].get(error_type, 0) + 1
         return {"total": len(self.records), "completed": len(completed), "drafts": len(values) - len(completed),
                 "alternative": len(alternative), "genuine": len(genuine), "uncertain": len(uncertain), "error_counts": counts,
+                "human_review_counts": {"yes": len(alternative), "no": len(genuine), "uncertain": human_uncertain},
+                "error_counts_by_scope": {"genuine": counts, **model_counts},
                 "model_positive": sum(any(c["model_same"] is True and not c["is_gt"] for c in r["retrieved"]) for r in self.records)}
 
     def snapshot(self):

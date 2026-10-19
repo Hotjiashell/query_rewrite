@@ -3,6 +3,7 @@ const $ = id => document.getElementById(id);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let data, state, stats, currentKey, draft, dirty = false, timer, queue = Promise.resolve(), fatalConflict = false;
 let filter = 'all', search = '', errorTypeFilter = '', humanReviewFilter = '';
+let histogramScope = 'genuine';
 let defaultOwner = '';
 try {defaultOwner=localStorage.getItem('badcase-default-owner')||'';} catch {}
 let baseRevision = 0, remotePending = false, syncing = false;
@@ -158,10 +159,19 @@ function renderStats() {
     ['真实 badcase',stats.genuine,'仅统计完成且没有其他正确案例'],
     ['模型认为有其他正确案例',stats.model_positive,'模型建议，等待人工核验']
   ].map(([title,value,sub],i)=>`<div class="stat ${i===2?'highlight':''}"><span>${title}</span><strong>${value}</strong><small>${sub}</small>${i===1?`<div class="progress"><i style="width:${percent}%"></i></div>`:''}</div>`).join('');
+  const counts=stats.human_review_counts;
+  const rows=[['人认为有正确案例',counts.yes],['人认为没有正确案例',counts.no],['人认为有不确定的案例',counts.uncertain]];
+  $('human-review-chart').innerHTML=`<h3>人工核验结果数量</h3><p class="model-note">全量数据 · 按 badcase 条数统计；有正确案例、有不确定均包含已保存草稿，二者可重叠；没有正确案例仅统计已完成且无“是”或“不确定”的记录。</p>${chartRows(rows)}`;
+}
+function chartRows(rows) {
+  const max=Math.max(1,...rows.map(([,count])=>count));
+  return rows.map(([name,count])=>`<div class="hist-row"><span>${esc(name)}</span><div class="hist-bar"><i style="width:${count/max*100}%"></i></div><b>${count}</b></div>`).join('');
 }
 function histogram() {
-  const max=Math.max(1,...Object.values(stats.error_counts));
-  return `<div class="histogram"><h3>错误类型分布</h3><div class="model-note">仅统计已完成的真实 badcase</div>${Object.entries(stats.error_counts).map(([name,count])=>`<div class="hist-row"><span>${esc(name)}</span><div class="hist-bar"><i style="width:${count/max*100}%"></i></div><b>${count}</b></div>`).join('')}</div>`;
+  const scopes=[['genuine','统计已完成的真实badcase'],['model_none','统计模型认为没有正确案例的'],['model_positive','统计模型认为有正确案例的']];
+  const rows=Object.entries(stats.error_counts_by_scope[histogramScope]);
+  const total=rows.reduce((sum,[,count])=>sum+count,0);
+  return `<div class="histogram"><h3>错误类型分布</h3><label class="histogram-filter">统计范围 <select id="histogram-scope">${scopes.map(([value,label])=>`<option value="${value}" ${histogramScope===value?'selected':''}>${label}</option>`).join('')}</select></label><p class="model-note">全量数据中的所选范围 · 共 ${total} 条。${histogramScope==='genuine'?'仅统计已完成且无“是”或“不确定”的记录。':'按模型判断筛选，统计已保存分类（包含草稿），未填写类型计入“未分类”。模型认为没有正确案例仅限分析成功的记录。'}</p>${chartRows(rows.map(([name,count])=>[name||'未分类',count]))}${total?'':'<p class="model-note">当前统计范围暂无数据。</p>'}</div>`;
 }
 function pageInfo() {
   const list=visible(), index=list.findIndex(r=>r.key===currentKey);
@@ -254,6 +264,11 @@ $('workspace').addEventListener('input',event=>{
   if(el.id==='trial-query'){trialFor().query=el.value;return;}
   if(card&&el.dataset.reviewField){const cid=card.dataset.cid;draft.reviews[cid]??={verdict:'',reason:'',owner:''};draft.reviews[cid][el.dataset.reviewField]=el.value;changed();}
   else if(['error-type','error-detail','error-owner'].includes(el.id)){draft[{'error-type':'error_type','error-detail':'error_detail','error-owner':'owner'}[el.id]]=el.value;changed();}
+});
+$('workspace').addEventListener('change',event=>{
+  if(event.target.id!=='histogram-scope')return;
+  histogramScope=event.target.value;
+  event.target.closest('.histogram').outerHTML=histogram();
 });
 $('workspace').addEventListener('click',event=>{
   const el=event.target.closest('button');if(!el)return;
