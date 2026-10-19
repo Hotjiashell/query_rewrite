@@ -94,6 +94,46 @@ python label_badcase/import_gt_retrieval.py \
   --cases data/case_summary.json
 ```
 
+## 导出包含多个正确案例的测试数据
+
+在项目根目录执行（将标注文件路径替换为实际路径）：
+
+```bash
+python label_badcase/export_test_data.py \
+  --input data/dialog_example.json \
+  --annotations label_badcase/annotations.json \
+  --output data/dialog_multi_case.json
+```
+
+脚本默认从标注文件的 `sources.badcases` 读取对应的原 badcases 文件。
+如果文件已移动，可增加 `--badcases results/badcases.json` 显式指定。
+相对路径均相对于执行命令时的当前目录。
+
+输出仍为完整测试数据数组，顺序、原 `caseID` 和其他字段保留，每条新增
+`m_caseID` 数组：原正确案例 ID 在首位，随后合并人工核验 `verdict: "yes"`
+的案例 ID，并去重。未获得人工补充的记录也会有 `m_caseID: [原caseID]`。
+“否”“不确定”和仅模型认为正确的案例不会加入。
+默认包含已保存草稿中的“是”，与页面“人认为有正确案例”统计一致；
+如只接受已完成标注，增加 `--completed-only`。
+输入已有 `m_caseID` 数组时会保留其中的 ID 并合并去重，支持重复导出。
+
+例如：
+
+```json
+{
+  "call_sno": "00000001",
+  "chat_content": "客服：您好\n用户：电脑连不上网",
+  "caseID": "KT0000001",
+  "m_caseID": ["KT0000001", "KT0000099", "KT0000100"]
+}
+```
+
+按原测试数据从 0 开始的 `sample_index` 定位，只给对应对话增加正确案例，
+不会扩散到其他具有相同 GT 的对话。合并前校验原 `caseID`、对话和会话编号，
+并检查人工案例来自原 Top-10；匹配失败时终止，不写输出。
+输出不能覆盖原测试数据、标注文件或 badcases 文件。运行结束打印新增案例数
+和获得补充的样本数。脚本只导出数据，现有评估器仍按 `caseID` 评估。
+
 ## 数据来源
 
 | 输入 | 用途 |
