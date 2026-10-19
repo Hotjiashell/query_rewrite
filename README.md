@@ -902,3 +902,27 @@ tracing, and Recall@K calculation can all remain unchanged.
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+### 为测试数据增加标题可检索标记
+
+使用 `check_gt_retrieval.py` 输出的完整标题检索报告，为原测试数据新增布尔字段 `can_retrieve`：
+
+```bash
+python3 add_can_retrieve.py \
+  --input data/dialog_example.json \
+  --report results/gt_title_retrieval_check.json \
+  --output data/dialog_with_can_retrieve.json
+```
+
+按每条数据原 `caseID` 匹配报告的 `expected_case_id`，原数组顺序和其他字段
+（包括已有的 `m_caseID`）均保留。`can_retrieve` 只表示原 `caseID` 的标题检索
+是否返回该案例，不根据 `m_caseID` 中的额外正确案例推断。
+
+- 返回了该案例即为 `true`，即使排名超出报告的 cutoff、`outcome` 为 `miss` 也算可检索。
+- 成功检索但没有返回该案例为 `false`。
+- 缺少标题或请求失败也写 `false`，并在终端分别打印数量；这些记录可以重试标题检索后重新导出。
+- 报告缺少对应案例时终止，不把未检查的案例推断为不可检索。仅含 `misses` 的报告不支持，需提供完整 `records`。
+- 输出不能覆盖原数据或报告。已有 `can_retrieve` 会按当前报告重新计算。
+
+注意：`analyze_badcases.py` 输出的 `badcase_analysis` 是模型对候选案例的判断，
+不包含标题检索结果，不能作为本脚本的 `--report`。
