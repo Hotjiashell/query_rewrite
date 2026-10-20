@@ -1,4 +1,4 @@
-"""Local badcase annotation app; Python standard library only."""
+"""Local badcase annotation app with optional retrieval and model-backed trials."""
 from __future__ import annotations
 
 import argparse
@@ -10,12 +10,19 @@ import re
 import sys
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_TYPES = ["其他"]
+
+
+def project_imports():
+    project_root = str(ROOT.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
 
 
 def retrieve_cases(query, *, url=None, timeout=30):
@@ -145,13 +152,16 @@ def load_gt_title_results(report, cases):
 
 
 class Store:
-    def __init__(self, records, output, sources, *, retriever=None, gt_title_results=None):
+    def __init__(self, records, output, sources, *, retriever=None, gt_title_results=None,
+                 query_generator=None, llm_config=None):
         self.records = records
         self.by_key = {r["key"]: r for r in records}
         self.output = output
         self.lock = threading.Lock()
         self.retriever = retriever or retrieve_cases
         self.gt_title_results = gt_title_results or {}
+        self.query_generator = query_generator
+        self.llm_config = llm_config or ROOT.parent / "config.json"
         fingerprint = hashlib.sha256(json.dumps(records, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         self.state = {"schema_version": 1, "artifact_type": "badcase_annotations",
                       "dataset_fingerprint": fingerprint, "sources": sources, "revision": 0,
@@ -210,6 +220,70 @@ class Store:
                 "gt_available": bool(gt_id), "gt_hit": matched_rank is not None,
                 "matched_rank": matched_rank, "cases": cases}
 
+    def try_multi_query(self, body):
+        if not isinstance(body, dict):
+            raise ValueError("多 query 请求必须是对象")
+        key = str(body.get("key"))
+        if key not in self.by_key:
+            raise ValueError("无效badcase")
+        prompt = body.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 100000:
+            raise ValueError("请输入不超过100000字的提示词")
+        if "{dialogue}" not in prompt:
+            raise ValueError("提示词必须包含 {dialogue}，用于填入当前对话")
+        method, top_k = body.get("fusion_method", "round_robin"), body.get("top_k", 10)
+        if method not in ("round_robin", "score") or type(top_k) is not int or not 1 <= top_k <= 100:
+            raise ValueError("融合方式无效或最终案例数量不在1–100之间")
+        dialogue = self.by_key[key]["chat_content"]
+        if not isinstance(dialogue, str) or not dialogue.strip():
+            raise ValueError("当前记录没有可用对话")
+        project_imports()
+        # Reuse the exact fusion functions used by evaluate.py.
+        try:
+            from evaluate import FUSION_METHODS, RetrievedCase
+        except ImportError as exc:
+            raise RuntimeError("多 query 测试需要 Python 3.11 或更新版本及项目依赖") from exc
+        try:
+            if self.query_generator:
+                queries = self.query_generator(prompt, dialogue)
+            else:
+                from label_badcase.multi_query import generate_queries
+                queries = generate_queries(prompt, dialogue, self.llm_config)
+        except Exception as exc:
+            # SDK exceptions may contain request URLs or credentials; keep them server-side.
+            raise RuntimeError(f"生成 query 失败（{type(exc).__name__}），请检查服务端模型配置、API Key、依赖和模型返回格式") from exc
+        if not isinstance(queries, list) or not 1 <= len(queries) <= 3 or any(
+            not isinstance(q, str) or not q.strip() or len(q.strip()) > 10000 for q in queries
+        ):
+            raise RuntimeError("模型必须生成1–3条非空 query，每条不超过10000字")
+        queries = list(dict.fromkeys(q.strip() for q in queries))
+
+        def retrieve(query):
+            try:
+                return {"status": "success", **self.try_retrieval({"key": key, "query": query})}
+            except RuntimeError as exc:
+                return {"status": "failed", "query": query, "error": str(exc), "cases": []}
+
+        with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+            results = list(executor.map(retrieve, queries))
+        traces = [[RetrievedCase(c["rank"], c["case_id"], c["title"], c["score"]) for c in r["cases"]] for r in results]
+        fused = FUSION_METHODS[method](traces, top_k)
+        gt_id = self.by_key[key]["gt"]["case_id"]
+        cases = []
+        for case in fused:
+            origins = [{"query_index": i + 1, "rank": c["rank"], "score": c["score"]}
+                       for i, result in enumerate(results) for c in result["cases"] if c["case_id"] == case.case_id]
+            candidates = [c for result in results for c in result["cases"] if c["case_id"] == case.case_id]
+            selected = next((c for c in candidates if c["score"] == case.score), candidates[0])
+            cases.append({**selected, "rank": case.rank, "sources": origins})
+        matched_rank = next((c["rank"] for c in cases if c["is_gt"]), None)
+        successful = sum(r["status"] == "success" for r in results)
+        return {"record_key": key, "prompt": prompt, "queries": queries, "query_results": results,
+                "fusion_method": method, "top_k": top_k,
+                "status": "success" if successful == len(results) else "partial_success" if successful else "failed",
+                "fused": {"query": "多 query 融合结果", "gt_case_id": gt_id, "gt_available": bool(gt_id),
+                          "gt_hit": matched_rank is not None, "matched_rank": matched_rank, "cases": cases}}
+
     def summary(self):
         annotations = self.state["annotations"]
         values = list(annotations.values())
@@ -238,8 +312,11 @@ class Store:
                 "model_positive": sum(any(c["model_same"] is True and not c["is_gt"] for c in r["retrieved"]) for r in self.records)}
 
     def snapshot(self):
+        project_imports()
+        from prompt import MULTI_QUERY_PROMPT
         records = [{**r, "gt_title_retrieval": self.gt_title_results.get(r["gt"]["case_id"])} for r in self.records]
-        return {"records": records, "state": self.state, "summary": self.summary(), "output": str(self.output)}
+        return {"records": records, "state": self.state, "summary": self.summary(), "output": str(self.output),
+                "multi_query_prompt": MULTI_QUERY_PROMPT}
 
     def validate_annotation(self, key, raw):
         if key not in self.by_key or not isinstance(raw, dict):
@@ -375,7 +452,7 @@ def handler(store):
             self.wfile.write(data)
 
         def do_POST(self):
-            if self.path not in ("/api/save", "/api/retrieve"):
+            if self.path not in ("/api/save", "/api/retrieve", "/api/multi-query"):
                 self.respond(404, {"error": "Not found"})
                 return
             # Only same-origin browser writes are accepted by this local service.
@@ -388,9 +465,11 @@ def handler(store):
                 if not 0 < length <= 2_000_000:
                     raise ValueError("请求大小不合法")
                 body = json.loads(self.rfile.read(length))
-                self.respond(200, store.try_retrieval(body) if self.path == "/api/retrieve" else store.mutate(body))
+                action = {"/api/retrieve": store.try_retrieval, "/api/multi-query": store.try_multi_query,
+                          "/api/save": store.mutate}[self.path]
+                self.respond(200, action(body))
             except RuntimeError as exc:
-                self.respond(502 if self.path == "/api/retrieve" else 409, {"error": str(exc)})
+                self.respond(409 if self.path == "/api/save" else 502, {"error": str(exc)})
             except (ValueError, TypeError, KeyError) as exc:
                 self.respond(400, {"error": str(exc)})
             except OSError as exc:
@@ -413,6 +492,7 @@ def main():
     parser.add_argument("--retrieval-url", help="尝试检索接口地址，默认使用 search.py 中的地址")
     parser.add_argument("--gt-title-report", help="check_gt_retrieval.py 输出；在左栏展示所有GT标题检索结果")
     parser.add_argument("--retrieval-timeout", type=float, default=30, help="尝试检索超时秒数（默认30）")
+    parser.add_argument("--llm-config", default=str(ROOT.parent / "config.json"), help="多 query 测试使用的模型配置 JSON，读取 llm 段")
     args = parser.parse_args()
     if not 0 < args.retrieval_timeout <= 300:
         parser.error("--retrieval-timeout 需要大于0且不超过300秒")
@@ -435,7 +515,7 @@ def main():
             parser.error("输出路径不能覆盖GT标题检索报告")
         cases = demo["cases"] if args.demo else load(sources["cases"])
         gt_title_results = load_gt_title_results(load(args.gt_title_report), cases)
-    store = Store(records, output.resolve(), sources, gt_title_results=gt_title_results,
+    store = Store(records, output.resolve(), sources, gt_title_results=gt_title_results, llm_config=Path(args.llm_config).resolve(),
                   retriever=lambda query: retrieve_cases(query, url=args.retrieval_url, timeout=args.retrieval_timeout))
     server = ThreadingHTTPServer(("0.0.0.0", args.port), handler(store))
     print(f"标注器已启动：http://0.0.0.0:{args.port}\n共{len(records)}条，实时保存到：{store.output}", flush=True)

@@ -8,6 +8,46 @@ let defaultOwner = '';
 try {defaultOwner=localStorage.getItem('badcase-default-owner')||'';} catch {}
 let baseRevision = 0, remotePending = false, syncing = false;
 const retrievalTrials = new Map();
+const multiQueryTrials = new Map();
+let lastMultiPrompt = '';
+function multiTrialFor(key=currentKey) {
+  if(!multiQueryTrials.has(key))multiQueryTrials.set(key,{prompt:lastMultiPrompt||data.multi_query_prompt||'',fusion:'round_robin',topK:10,loading:false,result:null,error:''});
+  return multiQueryTrials.get(key);
+}
+function multiResults(trial) {
+  if(trial.loading)return '<p class="muted" role="status">正在生成 query 并分别检索，请稍候…</p>';
+  if(trial.error)return `<p class="trial-error" role="alert">${esc(trial.error)}</p>`;
+  const result=trial.result;
+  if(!result)return '<p class="muted">输入提示词，使用当前对话测试生成 query、逐条检索和融合效果。</p>';
+  const status=result.status==='success'?'全部 query 检索成功':result.status==='partial_success'?'部分 query 检索失败，使用成功结果融合':'全部 query 检索失败';
+  return `<p class="model-note">${esc(status)} · 本次生成 ${result.queries.length} 条 query</p><details><summary>查看本次使用的提示词</summary><div class="content">${esc(result.prompt)}</div></details>${result.query_results.map((r,i)=>`<section class="multi-query-result"><h3>Query ${i+1}</h3>${r.status==='failed'?`<div class="query">${esc(r.query)}</div><p class="trial-error">${esc(r.error)}</p>`:trialResults({result:r})}</section>`).join('')}<section class="multi-query-result"><h3>最终融合案例列表 · ${result.fusion_method==='score'?'按分数排序':'轮询融合'} · Top-${result.top_k}</h3>${trialResults({result:result.fused})}${result.fused.cases.length?`<details><summary>查看融合案例来源</summary><ul class="fusion-sources">${result.fused.cases.map(c=>`<li>#${c.rank} ${esc(c.title||c.case_id)}：${c.sources.map(s=>`Query ${s.query_index} 排名 #${s.rank}`).join('；')}</li>`).join('')}</ul></details>`:''}</section>`;
+}
+function multiPanel() {
+  const trial=multiTrialFor();
+  return `<section id="multi-query-panel" class="card"><h2>多 query 提示词测试</h2><p class="model-note">使用当前用户与客服对话生成最多 3 条 query。提示词需包含 {dialogue}，要求模型返回 {"query":["query1","query2"]}。模型连接使用服务端配置，结果仅在当前页面保留。</p><form id="multi-query-form"><label class="form-field"><span>多 query 提示词</span><textarea id="multi-query-prompt" rows="10" maxlength="100000" required>${esc(trial.prompt)}</textarea></label><div class="toolbar"><label>融合方式 <select id="multi-query-fusion"><option value="round_robin" ${trial.fusion==='round_robin'?'selected':''}>轮询融合</option><option value="score" ${trial.fusion==='score'?'selected':''}>按分数排序</option></select></label><label>最终案例数 <input id="multi-query-top-k" type="number" min="1" max="100" required value="${esc(trial.topK)}"></label></div><p class="model-note">轮询按 query 顺序交替取案例；按分数排序保留同一案例的最高分。两种方式均按案例 ID 去重。</p><div class="toolbar"><button class="primary" id="multi-query-submit" ${trial.loading?'disabled':''}>${trial.loading?'正在生成并检索…':'生成 query 并检索'}</button><button type="button" data-multi-default>填入默认提示词</button></div></form><div id="multi-query-results" aria-live="polite">${multiResults(trial)}</div></section>`;
+}
+function renderMultiTrial() {
+  if(!$('multi-query-panel'))return;
+  const trial=multiTrialFor();
+  $('multi-query-results').innerHTML=multiResults(trial);
+  $('multi-query-submit').disabled=trial.loading;
+  $('multi-query-submit').textContent=trial.loading?'正在生成并检索…':'生成 query 并检索';
+}
+async function tryMultiQuery() {
+  const key=currentKey,trial=multiTrialFor(key);if(trial.loading)return;
+  trial.prompt=$('multi-query-prompt').value;trial.fusion=$('multi-query-fusion').value;trial.topK=Number($('multi-query-top-k').value);
+  if(!trial.prompt.includes('{dialogue}')){trial.error='提示词必须包含 {dialogue}，用于填入当前对话';renderMultiTrial();return;}
+  lastMultiPrompt=trial.prompt;
+  const body={key,prompt:trial.prompt,fusion_method:trial.fusion,top_k:trial.topK};
+  trial.loading=true;trial.error='';trial.result=null;renderMultiTrial();
+  try {
+    const response=await fetch('/api/multi-query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(420000)});
+    const result=await response.json();if(!response.ok)throw Error(result.error||'多 query 测试失败');
+    if(result.record_key!==key)throw Error('返回结果与发起请求的记录不匹配');
+    trial.result=result;
+  }catch(error){trial.error=error.message||'多 query 测试失败，请重试';}
+  finally{trial.loading=false;if(currentKey===key)renderMultiTrial();}
+}
 function trialFor(key=currentKey) {
   if(!retrievalTrials.has(key))retrievalTrials.set(key,{query:data.records.find(r=>r.key===key)?.query||'',loading:false,result:null,error:''});
   return retrievalTrials.get(key);
@@ -199,7 +239,7 @@ function renderWorkspace() {
   if(!r) { $('workspace').innerHTML='<div class="empty"><h2>没有匹配的 badcase</h2><p>调整筛选条件或检查输入数据。</p></div>';pageInfo();return; }
   const selected=r.retrieved.filter(c=>!c.is_gt&&(c.model_same===true||draft.reviews[c.case_id]));
   $('workspace').innerHTML=`<div class="column"><section class="card"><div class="card-heading"><h2>用户与客服对话</h2><span class="tag">样本 ${esc(r.key)}</span></div><div class="model-note">会话编号 ${esc(r.call_sno||'未提供')}</div><div class="content scroll-content">${esc(typeof r.chat_content==='string'?r.chat_content:JSON.stringify(r.chat_content,null,2))||'未提供对话'}</div></section><section class="card"><h2>检索 Query</h2><div class="label">QUERY</div><div class="query">${esc(r.query)||'未提供'}</div><div class="label">QUERIES · ${r.queries.length} 条</div>${r.queries.length?r.queries.map((q,i)=>`<div class="query">${i+1}. ${esc(q)}</div>`).join(''):'<p class="muted">未提供多路 query</p>'}</section><section class="card"><div class="card-heading"><h2>GT 案例</h2><span class="tag green">标注正确案例</span></div><h3>${esc(r.gt.title)}</h3><span class="case-id">${esc(r.gt.case_id)}</span><div class="content scroll-content">${esc(r.gt.text)||'<span class="tag red">GT正文缺失</span>'}</div></section><section class="card"><h2>召回 Top-10</h2><p class="model-note">可查看正文，并补充核验模型漏选的非GT案例。</p><table class="retrieval"><tbody>${r.retrieved.map(c=>`<tr><td>${c.rank}</td><td><details><summary>${esc(c.title)}</summary><span class="case-id">${esc(c.case_id)}</span><div class="content">${esc(c.text)||'案例正文缺失'}</div>${c.model_reason?`<div class="model-note">模型理由：${esc(c.model_reason)}</div>`:''}</details>${c.is_gt?'<span class="tag">GT本身，不计入其他正确案例</span>':c.model_same===true?'<span class="tag green">模型认为正确</span>':c.model_same===false?'<span class="tag">模型否决</span>':'<span class="tag gold">未判断 / 未选中</span>'}</td><td>${c.is_gt?'':`<button data-add="${esc(c.case_id)}" ${selected.includes(c)?'disabled':''}>${selected.includes(c)?'已列入':'补充核验'}</button>`}</td></tr>`).join('')}</tbody></table>${histogram()}</section></div><div class="column"><section class="card"><div class="card-heading"><h2>人工核验</h2><span class="tag">${selected.length} 个待核验案例</span></div><p class="muted">核验召回案例能否直接或间接解决对话中的用户问题。每个案例分别填写判断和负责人。对模型推荐案例选“是”时可留空理由，表示接受模型理由；选“否”时需填写理由，“不确定”无需理由。</p>${r.model_status!=='success'?`<div class="model-reason"><span class="tag gold">模型分析${r.model_status==='missing'?'缺失':'失败'}</span><p>${esc(r.model_error||'请查看召回列表并手动补充需要核验的案例。')}</p></div>`:''}${r.stage1_reason?`<details><summary>查看模型初筛依据</summary><p class="content model-note">${esc(r.stage1_reason)}</p></details>`:''}${selected.length?selected.map(reviewCard).join(''):'<p class="muted">模型没有建议核验的正确案例。请复核左侧召回列表，必要时补充核验；确认没有其他正确案例后填写错误分类。</p>'}</section><div id="classification">${errorPanel()}</div></div>`;
-  $('classification').insertAdjacentHTML('beforebegin',trialPanel());
+  $('classification').insertAdjacentHTML('beforebegin',trialPanel()+multiPanel());
   const left=$('workspace').querySelector('.column');
   left.children[2].insertAdjacentHTML('afterend',gtTitlePanel(r));
   pageInfo();
@@ -261,17 +301,21 @@ async function changeView() {
 }
 $('workspace').addEventListener('input',event=>{
   const el=event.target, card=el.closest('[data-cid]');
+  if(el.id==='multi-query-prompt'){multiTrialFor().prompt=el.value;lastMultiPrompt=el.value;return;}
+  if(el.id==='multi-query-top-k'){multiTrialFor().topK=el.value;return;}
   if(el.id==='trial-query'){trialFor().query=el.value;return;}
   if(card&&el.dataset.reviewField){const cid=card.dataset.cid;draft.reviews[cid]??={verdict:'',reason:'',owner:''};draft.reviews[cid][el.dataset.reviewField]=el.value;changed();}
   else if(['error-type','error-detail','error-owner'].includes(el.id)){draft[{'error-type':'error_type','error-detail':'error_detail','error-owner':'owner'}[el.id]]=el.value;changed();}
 });
 $('workspace').addEventListener('change',event=>{
+  if(event.target.id==='multi-query-fusion'){multiTrialFor().fusion=event.target.value;return;}
   if(event.target.id!=='histogram-scope')return;
   histogramScope=event.target.value;
   event.target.closest('.histogram').outerHTML=histogram();
 });
 $('workspace').addEventListener('click',event=>{
   const el=event.target.closest('button');if(!el)return;
+  if(el.hasAttribute('data-multi-default')){const trial=multiTrialFor();trial.prompt=data.multi_query_prompt||'';lastMultiPrompt=trial.prompt;$('multi-query-prompt').value=trial.prompt;return;}
   if(el.dataset.trialFill){const value=el.dataset.trialFill==='gt'?record().gt.title:record().query||'';trialFor().query=value;$('trial-query').value=value;$('trial-query').focus();return;}
   if(el.dataset.verdict){const card=el.closest('[data-cid]'),cid=card.dataset.cid;draft.reviews[cid]??={verdict:'',reason:'',owner:''};draft.reviews[cid].verdict=el.dataset.verdict;changed();card.querySelectorAll('[data-verdict]').forEach(b=>{b.classList.toggle('selected',b===el);b.setAttribute('aria-pressed',b===el?'true':'false');});$('classification').innerHTML=errorPanel();}
   if(el.hasAttribute('data-remove-review')){
@@ -282,7 +326,10 @@ $('workspace').addEventListener('click',event=>{
   }
   if(el.dataset.add){draft.reviews[el.dataset.add]={verdict:'',reason:'',owner:''};changed();renderWorkspace();}
 });
-$('workspace').addEventListener('submit',event=>{if(event.target.id==='trial-form'){event.preventDefault();tryRetrieval();}});
+$('workspace').addEventListener('submit',event=>{
+  if(event.target.id==='trial-form'){event.preventDefault();tryRetrieval();}
+  if(event.target.id==='multi-query-form'){event.preventDefault();tryMultiQuery();}
+});
 $('prev').onclick=()=>navigate(-1);$('next').onclick=()=>navigate(1);
 $('next-pending').onclick=nextPending;
 $('jump-go').onclick=async()=>{try{await flush();const list=visible(),n=Number($('jump').value);if(Number.isInteger(n)&&n>=1&&n<=list.length){openRecord(list[n-1].key);window.scrollTo(0,0);}else notice('请输入筛选范围内的有效页码');}catch{}};

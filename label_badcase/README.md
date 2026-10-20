@@ -55,6 +55,55 @@ GT 已返回但超出报告 cutoff 时另外注明。旧版仅含 `misses` 的�
 --retrieval-url http://host:8276/run_case_retrieval --retrieval-timeout 60
 ```
 
+## 多 query 提示词测试
+
+右栏“尝试检索”下方新增“多 query 提示词测试”，可以直接编辑提示词，
+用当前 badcase 的对话生成 query，并查看每条 query 的召回和最终融合列表。
+
+在原启动命令后增加模型配置路径（不传时读取项目根目录 `config.json`）：
+
+```bash
+--llm-config config.json
+```
+
+此功能需要 Python 3.11 或更新版本，以及项目依赖中的 `openai`、`requests`。
+配置文件使用与评估脚本相同的 `llm` 段：`base_url`、`model_name`、`api_key`
+或 `api_key_env`，以及可选的 `temperature`（默认 0）。空的连接参数可从
+`OPENAI_BASE_URL`、`OPENAI_MODEL`、`OPENAI_API_KEY` 环境变量读取。
+配置及 API Key 只在服务端使用，不发送给页面；配置文件在每次测试时重新读取。
+模型调用关闭思考，超时 60 秒且不自动重试。
+仅运行原有标注功能时无需配置模型。
+
+操作步骤：
+
+1. 编辑提示词，或点击“填入默认提示词”使用 `prompt.py` 的 `MULTI_QUERY_PROMPT`。
+2. 保留 `{dialogue}` 占位符，运行时填入当前对话；要求模型返回
+   `{"query":["query1","query2","query3"]}`。复用 `custom_multi` 的解析逻辑，
+   去除空值和重复 query，最多保留 3 条。
+3. 选择融合方式和最终案例数量（默认轮询融合、Top-10，可选择 1–100）。
+4. 点击“生成 query 并检索”。每条 query 分别调用原“尝试检索”的接口，
+   沿用 `--retrieval-url` 和 `--retrieval-timeout`，并发请求。
+5. 页面按生成顺序展示每个 query、完整返回的召回列表、排名、标题、ID、分数、
+   可展开正文和 GT 命中提示。随后展示最终融合列表及每个案例来自哪条 query、
+   在该 query 中的原排名；本次使用的提示词也可展开查看。
+
+融合直接复用 `evaluate.py`：轮询按 query 顺序交替取不同案例；按分数排序
+保留同一案例的最高分，再按分数降序排列。均按案例 ID 去重。
+部分 query 失败时单独显示错误，用成功的结果继续融合；全部失败仍显示已生成的
+query 和各自错误。成功但返回空列表会单独展示无结果提示。
+
+提示词输入、融合设置及测试结果按 badcase 保存在当前页面内，翻页后回来仍可查看；
+新访问的 badcase 会使用最近编辑的提示词，已访问的记录保留各自输入。
+请求期间可继续标注或翻页，返回结果只写入发起请求的记录，刷新页面清空测试内容。
+测试不修改原 query、原召回列表、人工标注或统计。
+
+验证新增链路（不调用真实模型或检索服务）：
+
+```bash
+python3 -m unittest discover -s label_badcase -p 'test_*.py'
+node label_badcase/test_multi_query_ui.js
+```
+
 ## 一键导入 GT 标题检索失败结果
 
 先停止正在运行的标注器，在项目根目录执行：
