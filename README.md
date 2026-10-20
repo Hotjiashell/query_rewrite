@@ -926,3 +926,53 @@ python3 add_can_retrieve.py \
 
 注意：`analyze_badcases.py` 输出的 `badcase_analysis` 是模型对候选案例的判断，
 不包含标题检索结果，不能作为本脚本的 `--report`。
+
+### 根据人工多正确案例和可检索标记重算召回率
+
+已有 `evaluate.py` 的检索结果时，可直接离线计算，无需重新生成 query 或请求检索服务。
+使用 Python 3.11 或更新版本：
+
+```bash
+python3 evaluate_annotated.py \
+  --results results/baseline.json \
+  --dataset data/dialog_annotated.json \
+  --output results/baseline_annotated.json
+```
+
+`--results`（也可写 `--input`）指定 `artifact_type: retrieval_evaluation` 的结果文件；
+`--dataset` 指定包含 `caseID`、`m_caseID` 数组和布尔值 `can_retrieve` 的新数据集。
+数据集应保留原测试数据顺序；脚本按 `sample_index` 关联，并校验原 GT、结果中已有的
+对话及会话编号，索引重复、错位或标注字段类型不合法时会报错。
+
+终端输出四组 Recall@1/3/5/10；新结果保留原来的 `metrics` 和 `records`，
+额外增加 `annotated_metrics`：
+
+| 字段 | 正确案例集合 | 统计样本范围 |
+| --- | --- | --- |
+| `original` | 原 `caseID` | 所有评估结果记录 |
+| `multi_case` | 原 `caseID` 与 `m_caseID` 的并集 | 所有评估结果记录 |
+| `retrievable_only` | 原 `caseID` | 排除 `can_retrieve=false` |
+| `multi_case_retrievable_only` | 原 `caseID` 与 `m_caseID` 的并集 | 排除 `can_retrieve=false` |
+
+每组提供 `total_samples`、`successful_samples`、`failed_samples`、
+`hits_at_K` 和 `recall_at_K`。按现有评估的样本命中率定义，Top-K 返回任一正确案例
+就算该条命中，多次命中只计一次；排名从保存的 `retrieval_trace` 重新计算。
+所选范围内的生成/检索失败记录仍进入分母，计为未命中。空范围的召回率为 0。
+这里“同时考虑多正确案例和可检索性”指排除不可检索记录，不是只评估不可检索记录。
+
+`coverage` 显示数据集总数、实际评估记录数、没有结果的样本数和被排除的不可检索数。
+若结果只包含数据集的部分样本，指标仅针对结果中实际存在的记录；数据集中没有结果的
+样本不会自动计为失败。输出文件不能覆盖输入结果或数据集。
+
+也可以直接使用 `evaluate.py` 的等价命令：
+
+```bash
+python3 evaluate.py metrics \
+  --input results/baseline.json \
+  --dataset data/dialog_annotated.json \
+  --output results/baseline_annotated.json
+```
+
+后续正常运行 `evaluate.py retrieve` 或 `evaluate.py all` 时，添加
+`--dataset data/dialog_annotated.json` 即可在检索结果中同时生成这些指标。
+不传 `--dataset` 时沿用原有行为。

@@ -681,6 +681,94 @@ def calculate_metrics(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return metrics
 
 
+def calculate_annotated_metrics(
+    records: Sequence[Mapping[str, Any]], samples: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Rescore saved traces against annotations without calling any service.
+
+    Recall retains the existing sample-hit definition: any acceptable case in
+    top K counts once. Failed samples remain in the selected denominator.
+    """
+    if not isinstance(samples, list) or any(not isinstance(s, Mapping) for s in samples):
+        raise ValueError("annotated dataset must be a JSON array of objects")
+    seen = set()
+    original, multi, retrievable, multi_retrievable = [], [], [], []
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ValueError("retrieval records must be objects")
+        index = record.get("sample_index")
+        if type(index) is not int or not 0 <= index < len(samples) or index in seen:
+            raise ValueError(f"invalid, duplicate or out-of-range sample_index: {index}")
+        seen.add(index)
+        sample = samples[index]
+        gt = _normalise_optional_string(sample.get("caseID"))
+        if not gt or gt != _normalise_optional_string(record.get("expected_case_id")):
+            raise ValueError(f"sample {index}: caseID does not match retrieval result")
+        for field in ("chat_content", "call_sno"):
+            if record.get(field) is not None and _normalise_optional_string(record[field]) != _normalise_optional_string(sample.get(field)):
+                raise ValueError(f"sample {index}: {field} does not match retrieval result")
+        ids = sample.get("m_caseID")
+        if not isinstance(ids, list) or any(not isinstance(cid, str) or not cid.strip() for cid in ids):
+            raise ValueError(f"sample {index}: m_caseID must be an array of nonempty case IDs")
+        if type(sample.get("can_retrieve")) is not bool:
+            raise ValueError(f"sample {index}: can_retrieve must be a JSON boolean")
+        accepted = {gt, *(cid.strip() for cid in ids)}
+        trace = record.get("retrieval_trace")
+        if not isinstance(trace, list) or any(
+            not isinstance(c, Mapping) or type(c.get("rank")) is not int or c["rank"] < 1
+            or not isinstance(c.get("case_id"), str) for c in trace
+        ):
+            raise ValueError(f"sample {index}: invalid retrieval_trace")
+        original_rank = min((c["rank"] for c in trace if c["case_id"] == gt), default=None)
+        multi_rank = min((c["rank"] for c in trace if c["case_id"] in accepted), default=None)
+        original_record = {**record, "matched_rank": original_rank}
+        multi_record = {**record, "matched_rank": multi_rank}
+        original.append(original_record)
+        multi.append(multi_record)
+        if sample["can_retrieve"]:
+            retrievable.append(original_record)
+            multi_retrievable.append(multi_record)
+    return {
+        "original": calculate_metrics(original),
+        "multi_case": calculate_metrics(multi),
+        "retrievable_only": calculate_metrics(retrievable),
+        "multi_case_retrievable_only": calculate_metrics(multi_retrievable),
+        "coverage": {"dataset_samples": len(samples), "evaluated_samples": len(records),
+                     "dataset_samples_without_results": len(samples) - len(seen),
+                     "excluded_can_retrieve_false": len(original) - len(retrievable)},
+    }
+
+
+def _attach_annotated_metrics(artifact: dict[str, Any], dataset_path: str) -> None:
+    artifact["annotated_metrics"] = calculate_annotated_metrics(
+        artifact["records"], _load_json(dataset_path, "annotated dataset"),
+    )
+    artifact.setdefault("configuration", {})["annotated_dataset_path"] = str(dataset_path)
+
+
+def _print_annotated_metrics(metrics: Mapping[str, Any]) -> None:
+    for name in ("original", "multi_case", "retrievable_only", "multi_case_retrievable_only"):
+        group = metrics[name]
+        recalls = " ".join(f"R@{k}={group[f'recall_at_{k}']:.4f}" for k in METRIC_CUTOFFS)
+        print(f"{name}: total={group['total_samples']} failed={group['failed_samples']} {recalls}")
+    print("Coverage: " + json.dumps(metrics["coverage"], ensure_ascii=False))
+
+
+def _run_metrics(args: argparse.Namespace) -> int:
+    if not args.input or not args.output or not args.dataset:
+        raise ValueError("metrics requires --input, --dataset and --output")
+    if Path(args.output).resolve() in {Path(args.input).resolve(), Path(args.dataset).resolve()}:
+        raise ValueError("metrics output must not overwrite the input artifact or dataset")
+    artifact = _load_json(args.input, "retrieval artifact")
+    if not isinstance(artifact, dict) or artifact.get("artifact_type") != RETRIEVAL_ARTIFACT_TYPE or not isinstance(artifact.get("records"), list):
+        raise ValueError("metrics input must be a retrieval_evaluation artifact with records")
+    _attach_annotated_metrics(artifact, args.dataset)
+    write_json_atomically(artifact, args.output)
+    _print_annotated_metrics(artifact["annotated_metrics"])
+    print(f"Metrics saved to {args.output}")
+    return 0
+
+
 def build_retrieval_artifact(
     records: Sequence[Mapping[str, Any]],
     *,
@@ -891,7 +979,8 @@ def parse_args(
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one stage of query-rewrite evaluation.")
     if forced_stage is None:
-        parser.add_argument("stage", choices=("generate", "retrieve", "all"), help="Stage to run")
+        parser.add_argument("stage", choices=("generate", "retrieve", "all", "metrics"), help="Stage to run")
+    parser.add_argument("--dataset", help="Annotated source dataset with m_caseID and can_retrieve; required for metrics, optional for retrieve/all")
     parser.add_argument("--config", default="config.json", help="Run configuration JSON (default: config.json)")
     parser.add_argument("--input", help="Override the current stage input path")
     parser.add_argument("--output", help="Override the current stage output path")
@@ -993,7 +1082,11 @@ def _run_retrieve(args: argparse.Namespace) -> int:
         fusion_method=config.fusion_method,
         top_k=config.top_k,
     )
+    if args.dataset:
+        _attach_annotated_metrics(artifact, args.dataset)
     write_json_atomically(artifact, config.output_path)
+    if args.dataset:
+        _print_annotated_metrics(artifact["annotated_metrics"])
     metrics = artifact["metrics"]
     print(
         "Retrieval evaluation complete: "
@@ -1066,7 +1159,11 @@ def _run_all(args: argparse.Namespace) -> int:
         fusion_method=retrieval_config.fusion_method,
         top_k=retrieval_config.top_k,
     )
+    if args.dataset:
+        _attach_annotated_metrics(retrieval_artifact, args.dataset)
     write_json_atomically(retrieval_artifact, retrieval_config.output_path)
+    if args.dataset:
+        _print_annotated_metrics(retrieval_artifact["annotated_metrics"])
 
     generation_summary = query_artifact["summary"]
     retrieval_metrics = retrieval_artifact["metrics"]
@@ -1088,6 +1185,8 @@ def _run_all(args: argparse.Namespace) -> int:
 def main(argv: Sequence[str] | None = None, *, forced_stage: str | None = None) -> int:
     args = parse_args(argv, forced_stage=forced_stage)
     try:
+        if args.stage == "metrics":
+            return _run_metrics(args)
         if args.stage == "generate":
             return _run_generate(args)
         if args.stage == "retrieve":
