@@ -548,6 +548,9 @@ class RetrievalEvaluator:
             "retrieval_error": None,
             "retrieval_trace": [],
             "matched_rank": None,
+            "union_matched_rank": None,
+            "union_top_k": {str(k): False for k in sorted({*METRIC_CUTOFFS, self._top_k})},
+            "per_query_traces": [],
             "status": "failed",
             "error": query_record.error,
         }
@@ -566,8 +569,21 @@ class RetrievalEvaluator:
                 retrieval_error = "; ".join(retrieval_errors) or None
             else:
                 trace = extract_retrieval_trace(self._retriever.retrieve(query_record.query))
+                traces = [trace]
                 retrieval_status = "success"
                 retrieval_error = None
+            # Keep ranks from each original query, before fusion/truncation.
+            union_rank = min(
+                (case.rank for per_query in traces for case in per_query
+                 if case.case_id == query_record.expected_case_id),
+                default=None,
+            )
+            record.update({
+                "per_query_traces": [[asdict(case) for case in per_query] for per_query in traces],
+                "union_matched_rank": union_rank,
+                "union_top_k": {str(k): union_rank is not None and union_rank <= k
+                                for k in sorted({*METRIC_CUTOFFS, self._top_k})},
+            })
             gt_case_title = next(
                 (case.case_title for case in trace if case.case_id == query_record.expected_case_id),
                 None,
@@ -754,6 +770,14 @@ def _print_annotated_metrics(metrics: Mapping[str, Any]) -> None:
     print("Coverage: " + json.dumps(metrics["coverage"], ensure_ascii=False))
 
 
+def _print_union_metrics(artifact: Mapping[str, Any]) -> None:
+    metrics = artifact["union_top_k"]
+    cutoffs = sorted({*METRIC_CUTOFFS, artifact["configuration"]["top_k"]})
+    print("Union Top-K (any query): " + " ".join(
+        f"R@{k}={metrics[f'recall_at_{k}']:.4f}" for k in cutoffs
+    ))
+
+
 def _run_metrics(args: argparse.Namespace) -> int:
     if not args.input or not args.output or not args.dataset:
         raise ValueError("metrics requires --input, --dataset and --output")
@@ -781,7 +805,7 @@ def build_retrieval_artifact(
 ) -> dict[str, Any]:
     """Build the final artifact containing traces and recall metrics."""
 
-    return {
+    artifact = {
         "schema_version": 1,
         "artifact_type": RETRIEVAL_ARTIFACT_TYPE,
         "created_at": datetime.now(UTC).isoformat(),
@@ -796,6 +820,17 @@ def build_retrieval_artifact(
         "metrics": calculate_metrics(records),
         "records": list(records),
     }
+    union_records = [{**record, "matched_rank": record.get("union_matched_rank")}
+                     for record in records]
+    union_metrics = calculate_metrics(union_records)
+    # Include the configured cutoff even when it is not a standard metric K.
+    hits = sum(record.get("status") == "success"
+               and type(record.get("union_matched_rank")) is int
+               and 1 <= record["union_matched_rank"] <= top_k for record in records)
+    union_metrics[f"hits_at_{top_k}"] = hits
+    union_metrics[f"recall_at_{top_k}"] = hits / len(records) if records else 0.0
+    artifact["union_top_k"] = union_metrics
+    return artifact
 
 
 def write_json_atomically(payload: Mapping[str, Any], output_path: str | Path) -> None:
@@ -1087,6 +1122,7 @@ def _run_retrieve(args: argparse.Namespace) -> int:
     write_json_atomically(artifact, config.output_path)
     if args.dataset:
         _print_annotated_metrics(artifact["annotated_metrics"])
+    _print_union_metrics(artifact)
     metrics = artifact["metrics"]
     print(
         "Retrieval evaluation complete: "
@@ -1162,6 +1198,7 @@ def _run_all(args: argparse.Namespace) -> int:
     if args.dataset:
         _attach_annotated_metrics(retrieval_artifact, args.dataset)
     write_json_atomically(retrieval_artifact, retrieval_config.output_path)
+    _print_union_metrics(retrieval_artifact)
     if args.dataset:
         _print_annotated_metrics(retrieval_artifact["annotated_metrics"])
 
