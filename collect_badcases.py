@@ -12,6 +12,8 @@ ground-truth case happens to appear in the retrieval trace:
 
 Only the compact fields needed for case review are copied into the report;
 arbitrary fields such as case content are never propagated.
+``gt_case_frequency`` ranks ground-truth cases among the collected badcases
+by descending occurrence count and includes their associated conversations.
 """
 
 from __future__ import annotations
@@ -218,6 +220,27 @@ def collect_badcases(
             }
         )
 
+    gt_cases: dict[str | None, dict[str, Any]] = {}
+    for badcase in badcases:
+        raw_case_id = badcase["expected_case_id"]
+        case_id = str(raw_case_id) if raw_case_id is not None else None
+        if case_id not in gt_cases:
+            gt_cases[case_id] = {
+                "gt_case_id": case_id,
+                "gt_case_title": badcase["gt_case_title"],
+                "frequency": 0,
+                "conversations": [],
+            }
+        group = gt_cases[case_id]
+        group["frequency"] += 1
+        group["conversations"].append(
+            {
+                "sample_index": badcase["sample_index"],
+                "call_sno": badcase["call_sno"],
+                "chat_content": badcase["chat_content"],
+            }
+        )
+
     return {
         "schema_version": 1,
         "artifact_type": "badcase_report",
@@ -234,6 +257,7 @@ def collect_badcases(
             "unresolved_gt_case_count": sum(not item["gt_case_found"] for item in badcases),
         },
         "records": badcases,
+        "gt_case_frequency": sorted(gt_cases.values(), key=lambda item: -item["frequency"]),
     }
 
 

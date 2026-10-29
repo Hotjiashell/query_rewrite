@@ -14,6 +14,41 @@ def _artifact(records, *, source_query_path=None):
 
 
 class CollectBadcasesTests(unittest.TestCase):
+    def test_ranks_gt_cases_and_lists_associated_conversations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            results_path = root / "results.json"
+            cases_path = root / "cases.json"
+            records = [
+                {
+                    "sample_index": index,
+                    "call_sno": f"call-{index}",
+                    "chat_content": f"对话{index}",
+                    "expected_case_id": case_id,
+                    "status": "success",
+                    "matched_rank": rank,
+                }
+                for index, (case_id, rank) in enumerate(
+                    [("unknown", None), ("KT2", None), ("KT2", 11), ("KT2", 1), (None, None)]
+                )
+            ]
+            results_path.write_text(json.dumps(_artifact(records)), encoding="utf-8")
+            cases_path.write_text(json.dumps({"KT2": {"case_name": "案例2"}}), encoding="utf-8")
+
+            report = collect_badcases(results_path, cases_path)
+            groups = report["gt_case_frequency"]
+            self.assertEqual([item["gt_case_id"] for item in groups], ["KT2", "unknown", None])
+            self.assertEqual([item["frequency"] for item in groups], [2, 1, 1])
+            self.assertEqual(groups[0]["gt_case_title"], "案例2")
+            self.assertEqual(groups[0]["conversations"], [
+                {"sample_index": 1, "call_sno": "call-1", "chat_content": "对话1"},
+                {"sample_index": 2, "call_sno": "call-2", "chat_content": "对话2"},
+            ])
+            self.assertIsNone(groups[1]["gt_case_title"])
+
+            results_path.write_text(json.dumps(_artifact([])), encoding="utf-8")
+            self.assertEqual(collect_badcases(results_path, cases_path)["gt_case_frequency"], [])
+
     def test_collects_only_successful_misses_within_cutoff(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
