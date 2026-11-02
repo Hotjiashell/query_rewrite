@@ -147,6 +147,20 @@ def validate(stage, obj):
     return obj
 
 
+def model_input(stage, data):
+    """Whitelist semantic fields at the model boundary; retain metadata locally."""
+    def example(row):
+        return {name: row[name] for name in ("chat_content", "gt_case_title", "queries")}
+
+    if stage == "keywords":
+        return {"records": [example(row) for row in data["records"]]}
+    if stage == "filter":
+        return {name: data[name] for name in ("keyword", "existing_knowledge")}
+    if stage == "extract":
+        return {"keyword": data["keyword"], "examples": [example(row) for row in data["examples"]]}
+    raise ValueError(f"未知模型阶段：{stage}")
+
+
 class Model:
     def __init__(self, args, llm):
         from openai import OpenAI
@@ -158,6 +172,7 @@ class Model:
         self.identity = {k: llm[k] for k in ("base_url", "model_name", "temperature")}
 
     def task(self, stage, data):
+        data = model_input(stage, data)
         templates = self.templates
         prompt = templates[stage].replace("{input}", json.dumps(data, ensure_ascii=False))
         key = digest([stage, prompt, self.identity, self.args.max_tokens])

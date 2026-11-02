@@ -71,6 +71,18 @@ python3 -m extract_knowledge --config extract_knowledge/config.production.json
 5. 对保留簇并行提炼知识。每簇最多 `--max-examples` 条（1～10，默认 10），按 GT 轮询优先覆盖不同 GT。extract 返回完整 knowledge 条目及 reason 依据，缺失或为空时按失败重试。
 6. 最终按每个关键词簇的**去重对话数**降序排列，相同数量按关键词稳定排序。JSON 同时保留 `gt_case_count`（不同 GT 案例数量）。计数用完整簇，不受最多十条抽样影响。
 
+## 模型输入字段
+
+模型调用前统一按白名单构造输入，避免将过程管理字段传入模型：
+
+| 阶段 | 实际传入内容 |
+| --- | --- |
+| keywords | records 数组，每条只有 chat_content、gt_case_title、queries |
+| filter | keyword、existing_knowledge |
+| extract | keyword、examples 数组，每条只有 chat_content、gt_case_title、queries |
+
+记录 ID、GT ID、call_sno、cluster_id、sources、文件路径、记录序号等仅保留在本地记录和聚类文件，用于去重、计数和追溯。calls 中的 input 和 prompt 记录的是实际发给模型的精简内容。缓存键也基于精简后的提示词，来源路径等元数据变化不再导致重复调用。旧的含元数据请求与新的精简请求具有不同缓存键，首次运行会重新调用相关任务。
+
 ## 输出文件
 
 | 文件 | 内容 |

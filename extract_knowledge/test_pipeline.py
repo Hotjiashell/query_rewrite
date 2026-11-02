@@ -73,6 +73,42 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn('cached', model.task('keywords', {'records': []}))
             self.assertEqual(len(list(Path(directory).rglob('*.json'))), 2)
 
+    def test_model_requests_exclude_metadata(self):
+        row = {'id': 'secret-id', 'expected_case_id': 'secret-case',
+               'call_sno': 'secret-call', 'sources': [{'file': '/secret/path', 'record_index': 9}],
+               'chat_content': '用户：外网无法访问', 'gt_case_title': 'WebG 访问问题',
+               'queries': ['外网无法访问'], 'future_metadata': 'secret-future'}
+        expected = {key: row[key] for key in ('chat_content', 'gt_case_title', 'queries')}
+        tasks = {
+            'keywords': ({'case_id': 'secret-case', 'records': [row]}, {'records': [expected]}),
+            'filter': ({'keyword': 'WebG', 'existing_knowledge': '已有条目', 'source': '/secret/path'},
+                       {'keyword': 'WebG', 'existing_knowledge': '已有条目'}),
+            'extract': ({'cluster_id': 'secret-cluster', 'keyword': 'WebG', 'examples': [row]},
+                        {'keyword': 'WebG', 'examples': [expected]})}
+        outputs = {'keywords': {'keywords': []},
+                   'filter': {'covered': False, 'reason': '未覆盖'},
+                   'extract': {'knowledge': 'WebG：外网访问时考虑', 'reason': '依据'}}
+        with tempfile.TemporaryDirectory() as directory:
+            model = object.__new__(p.Model)
+            model.args = argparse.Namespace(output_dir=directory, max_tokens=512, resume=True, retries=0)
+            model.model, model.identity = 'fake', {'model_name': 'fake', 'temperature': 0}
+            model.templates = {stage: '{input}' for stage in tasks}
+            for stage, (task, payload) in tasks.items():
+                def create(**kwargs):
+                    actual = json.loads(kwargs['messages'][0]['content'])
+                    self.assertEqual(actual, payload)
+                    self.assertNotIn('secret-', kwargs['messages'][0]['content'])
+                    return SimpleNamespace(choices=[SimpleNamespace(finish_reason='stop',
+                        message=SimpleNamespace(content=json.dumps(outputs[stage])))])
+                model.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+                result = model.task(stage, task)
+                self.assertEqual(result['status'], 'success')
+                self.assertEqual(result['input'], payload)
+                # Metadata changes do not invalidate semantic model-call caches.
+                task['irrelevant_metadata'] = 'changed'
+                self.assertTrue(model.task(stage, task)['cached'])
+            self.assertEqual(row['sources'][0]['file'], '/secret/path')
+
     def test_extract_new_schema(self):
         result = {'knowledge': 'WebG：外网网关；访问外网时考虑 WebG', 'reason': '对话依据'}
         self.assertEqual(p.validate('extract', result), result)
