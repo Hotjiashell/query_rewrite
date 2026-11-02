@@ -1,0 +1,131 @@
+"""Offline regression tests: python3 -m unittest extract_knowledge.test_pipeline."""
+import argparse
+import json
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+from extract_knowledge import pipeline as p
+
+
+class PipelineTests(unittest.TestCase):
+    def test_end_to_end_dedup_filter_failure_and_sort(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = []
+            for i, keyword in enumerate(['Alpha', 'Alpha', 'Beta', 'Existing', 'Broken']):
+                rows.append({'expected_case_id': str(i), 'chat_content': f'用户需求{i}',
+                             'gt_case_title': keyword + ' 登录', 'query': '登录不了'})
+            source = root / 'bad.json'
+            p.save(source, {'artifact_type': 'badcase_report', 'records': rows + [rows[0], None]})
+            knowledge = root / 'existing.txt'
+            knowledge.write_text('Existing：当用户登录时可考虑', encoding='utf-8')
+            class FakeModel:
+                identity = {'model_name': 'fake'}
+                templates = {}
+                def __init__(self, *args):
+                    pass
+                def task(self, stage, data):
+                    if stage == 'keywords':
+                        result = {'keywords': [{'keyword': data['records'][0]['gt_case_title'].split()[0], 'reason': 'query遗漏'}]}
+                    elif stage == 'filter':
+                        if data['keyword'] == 'Broken':
+                            return {'status': 'failed'}
+                        result = {'covered': data['keyword'] == 'Existing', 'reason': '比较', 'matched_knowledge': '已有'}
+                    else:
+                        assert len(data['examples']) <= 10
+                        result = p.validate('extract', {'knowledge': data['keyword'] + '：登录时可考虑', 'reason': '依据'})
+                    return {'status': 'success', 'result': result}
+            args = argparse.Namespace(output_dir=str(root / 'out'), knowledge=str(knowledge), cases=None,
+                                      dialogues=None, badcases=[str(source)], keyword_batch_size=1,
+                                      concurrency=4, max_examples=10)
+            with patch.object(p, 'Model', FakeModel):
+                self.assertEqual(p.run(args, {}), 1)
+            entries = p.read_json(root / 'out/knowledge.json')
+            self.assertEqual([r['keyword'] for r in entries], ['Alpha', 'Beta'])
+            self.assertEqual([r['cluster_count'] for r in entries], [2, 1])
+            self.assertEqual((root / 'out/knowledge.txt').read_text(),
+                             '1. Alpha：登录时可考虑\n2. Beta：登录时可考虑\n')
+            self.assertEqual(p.read_json(root / 'out/existing_knowledge.json')['content'], knowledge.read_text())
+            self.assertEqual(len(p.read_json(root / 'out/01_records.json')), 5)
+            self.assertTrue(p.read_json(root / 'out/summary.json')['partial'])
+
+    def test_retry_checkpoint_and_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = argparse.Namespace(output_dir=directory, max_tokens=512, resume=True, retries=1)
+            model = object.__new__(p.Model)
+            model.args, model.model, model.identity = args, 'fake', {'model_name': 'fake', 'temperature': 0}
+            responses = iter(['invalid', '{"keywords":[]}', '{"keywords":[]}'])
+            def create(**kwargs):
+                self.assertFalse(kwargs['extra_body']['chat_template_kwargs']['enable_thinking'])
+                return SimpleNamespace(choices=[SimpleNamespace(finish_reason='stop', message=SimpleNamespace(content=next(responses)))])
+            model.templates = p.load_prompts(p.HERE / 'prompts.md')
+            model.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+            with patch.object(p.time, 'sleep'):
+                result = model.task('keywords', {'records': []})
+            self.assertEqual(result['status'], 'success')
+            self.assertEqual(len(result['attempts']), 2)
+            self.assertTrue(model.task('keywords', {'records': []})['cached'])
+            self.assertEqual(len(list(Path(directory).rglob('*.json'))), 1)
+            model.templates['keywords'] += '\n新增人工调整'
+            self.assertNotIn('cached', model.task('keywords', {'records': []}))
+            self.assertEqual(len(list(Path(directory).rglob('*.json'))), 2)
+
+    def test_extract_new_schema(self):
+        result = {'knowledge': 'WebG：外网网关；访问外网时考虑 WebG', 'reason': '对话依据'}
+        self.assertEqual(p.validate('extract', result), result)
+        for invalid in ({'reason': '依据'}, {'knowledge': '', 'reason': '依据'},
+                        {'knowledge': '条目', 'reason': ''}, {'knowledge': [], 'reason': '依据'}):
+            with self.assertRaises(ValueError):
+                p.validate('extract', invalid)
+
+    def test_prompt_file_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'prompts.md'
+            path.write_text('## keywords\n{input}\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, '缺少阶段'):
+                p.load_prompts(path)
+            path.write_text('## keywords\n{input}\n## filter\n无占位符\n## extract\n{input}', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, '占位符'):
+                p.load_prompts(path)
+
+    def test_config_only_and_cli_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            p.save(root / 'bad1.json', {})
+            config = root / 'config.json'
+            p.save(config, {'llm': {'base_url': 'http://fake/v1', 'model_name': 'fake', 'api_key': 'test'},
+                            'extract_knowledge': {'badcases': [str(root / 'bad*.json')],
+                                                  'output_dir': 'extract_knowledge/outputs/test',
+                                                  'concurrency': 7, 'resume': True}})
+            with patch.object(p, 'run', return_value=0) as run:
+                self.assertEqual(p.main(['--config', str(config)]), 0)
+                args, llm = run.call_args.args
+                self.assertEqual(args.concurrency, 7)
+                self.assertEqual(args.knowledge, str(p.HERE / 'existing_knowledge.txt'))
+                self.assertTrue(args.resume)
+                self.assertEqual(args.badcases, [str(root / 'bad1.json')])
+                self.assertEqual(args.output_dir, str(p.ROOT / 'extract_knowledge/outputs/test'))
+                self.assertEqual(llm['model_name'], 'fake')
+                self.assertEqual(p.main(['--config', str(config), '--concurrency', '3', '--no-resume']), 0)
+                args = run.call_args.args[0]
+                self.assertEqual(args.concurrency, 3)
+                self.assertFalse(args.resume)
+            with patch.object(p, 'HERE', root), patch.object(p, 'run', return_value=0) as run:
+                self.assertEqual(p.main([]), 0)
+                self.assertTrue(run.called)
+
+    def test_diverse_sampling_and_validation(self):
+        rows = [{'expected_case_id': 'A', 'n': i} for i in range(15)] + [{'expected_case_id': 'B', 'n': 99}]
+        chosen = p.diverse(rows, 10)
+        self.assertEqual(len(chosen), 10)
+        self.assertEqual(chosen[1]['expected_case_id'], 'B')
+        with self.assertRaises(ValueError):
+            p.validate('filter', {'covered': 'false', 'reason': 'bad boolean'})
+        self.assertEqual(p.canonical('ＷｅｂＧ '), p.canonical('WebG'))
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,0 +1,25 @@
+{
+  "llm": {
+    "base_url": "",
+    "model_name": "",
+    "api_key_env": "OPENAI_API_KEY",
+    "temperature": 0
+  },
+  "extract_knowledge": {
+    "badcases": [
+      "results/badcases*.json"
+    ],
+    "knowledge": "extract_knowledge/existing_knowledge.txt",
+    "cases": null,
+    "dialogues": null,
+    "output_dir": "extract_knowledge/outputs/run_001",
+    "concurrency": 16,
+    "timeout": 120,
+    "retries": 2,
+    "max_tokens": 4096,
+    "keyword_batch_size": 10,
+    "max_examples": 10,
+    "resume": true,
+    "prompts_file": "extract_knowledge/prompts.md"
+  }
+}
