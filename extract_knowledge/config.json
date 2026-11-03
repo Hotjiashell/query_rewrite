@@ -21,6 +21,9 @@
     "max_examples": 10,
     "resume": true,
     "prompts_file": "extract_knowledge/prompts.md",
-    "min_cluster_size": 1
+    "min_cluster_size": 1,
+    "precluster_edit_threshold": 0.8,
+    "precluster_dice_threshold": 0.8,
+    "precluster_short_threshold": 0.9
   }
 }

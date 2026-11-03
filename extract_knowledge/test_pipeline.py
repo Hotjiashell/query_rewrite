@@ -40,7 +40,8 @@ class PipelineTests(unittest.TestCase):
                     return {'status': 'success', 'result': result}
             args = argparse.Namespace(output_dir=str(root / 'out'), knowledge=str(knowledge), cases=None,
                                       dialogues=None, badcases=[str(source)], keyword_batch_size=1,
-                                      concurrency=4, max_examples=10, min_cluster_size=0)
+                                      concurrency=4, max_examples=10, min_cluster_size=0, precluster_edit_threshold=0.8,
+                                      precluster_dice_threshold=0.8, precluster_short_threshold=0.9)
             with patch.object(p, 'Model', FakeModel):
                 self.assertEqual(p.run(args, {}), 1)
             entries = p.read_json(root / 'out/knowledge.json')
@@ -138,6 +139,10 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(edges)
         self.assertTrue(similarity('华为wifi', '华为 wi‑fi')['candidate'])
         self.assertFalse(similarity('AB', 'AC')['candidate'])
+        self.assertTrue(similarity('abcde', 'abcdf', 0.8, 1)['candidate'])
+        self.assertFalse(similarity('abcde', 'abcdf', 0.9, 1)['candidate'])
+        self.assertTrue(similarity('abcde', 'abcdf', 1, 0.75)['candidate'])
+        self.assertTrue(similarity('AB', 'AC', 0.5, 1, 0.5)['candidate'])
         task = {'keywords': words[:2]}
         result = {'groups': [{'keyword': words[0], 'keywords': words[:2], 'reason': '连接符差异'}]}
         merged = fuse(clusters, [task], [{'status': 'success', 'result': result}], p.digest)
@@ -190,7 +195,8 @@ class PipelineTests(unittest.TestCase):
                     return {'status': 'success', 'result': result}
             args = argparse.Namespace(output_dir=str(root / 'out'), knowledge=str(knowledge),
                                       cases=None, dialogues=None, badcases=[str(source)],
-                                      keyword_batch_size=10, concurrency=2, max_examples=10, min_cluster_size=1)
+                                      keyword_batch_size=10, concurrency=2, max_examples=10, min_cluster_size=1, precluster_edit_threshold=0.8,
+                                      precluster_dice_threshold=0.8, precluster_short_threshold=0.9)
             with patch.object(p, 'Model', FakeModel), patch.object(p, 'candidates', wraps=p.candidates) as candidates:
                 self.assertEqual(p.run(args, {}), 0)
                 self.assertEqual([c['keyword'] for c in candidates.call_args.args[0]], ['华为wifi'])
@@ -224,11 +230,13 @@ class PipelineTests(unittest.TestCase):
             p.save(config, {'llm': {'base_url': 'http://fake/v1', 'model_name': 'fake', 'api_key': 'test'},
                             'extract_knowledge': {'badcases': [str(root / 'bad*.json')],
                                                   'output_dir': 'extract_knowledge/outputs/test',
-                                                  'concurrency': 7, 'resume': True}})
+                                                  'concurrency': 7, 'resume': True, 'precluster_edit_threshold': 0.85}})
             with patch.object(p, 'run', return_value=0) as run:
                 self.assertEqual(p.main(['--config', str(config)]), 0)
                 args, llm = run.call_args.args
                 self.assertEqual(args.concurrency, 7)
+                self.assertEqual(args.precluster_edit_threshold, 0.85)
+                self.assertEqual(args.precluster_dice_threshold, 0.8)
                 self.assertEqual(args.min_cluster_size, 1)
                 self.assertEqual(args.knowledge, str(p.HERE / 'existing_knowledge.txt'))
                 self.assertTrue(args.resume)

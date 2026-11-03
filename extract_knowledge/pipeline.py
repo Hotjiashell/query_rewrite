@@ -325,8 +325,11 @@ def run(args, llm):
     save(out / "04_eligible_keyword_clusters.json", eligible)
     print(f"[cluster-size] total={len(ordered)} retained={len(eligible)} "
           f"discarded={len(low_frequency)} threshold={args.min_cluster_size}", file=sys.stderr)
-    candidate_groups, edges = candidates(eligible)
-    save(out / "04_merge_candidates.json", {"groups": candidate_groups, "edges": edges})
+    precluster_config = {"edit_threshold": args.precluster_edit_threshold,
+                         "dice_threshold": args.precluster_dice_threshold,
+                         "short_threshold": args.precluster_short_threshold}
+    candidate_groups, edges = candidates(eligible, **precluster_config)
+    save(out / "04_merge_candidates.json", {"configuration": precluster_config, "groups": candidate_groups, "edges": edges})
     merge_tasks = [{"keywords": words} for words in candidate_groups]
     merged_results = parallel("merge", merge_tasks, model, args.concurrency, out / "04_merge_results.json")
     merged = fuse(eligible, merge_tasks, merged_results, digest)
@@ -366,6 +369,7 @@ def run(args, llm):
                "retained_cluster_count": len(kept), "knowledge_count": len(entries),
                "failed_model_tasks": failures, "partial": bool(failures or issues),
                "concurrency": args.concurrency, "max_examples": args.max_examples,
+               "precluster": precluster_config,
                "llm": model.identity}
     save(out / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -390,6 +394,9 @@ def main(argv=None):
     parser.add_argument("--retries", type=int, default=None, help="首次失败后的重试次数")
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--keyword-batch-size", type=int, default=None)
+    parser.add_argument("--precluster-edit-threshold", type=float)
+    parser.add_argument("--precluster-dice-threshold", type=float)
+    parser.add_argument("--precluster-short-threshold", type=float)
     parser.add_argument("--min-cluster-size", type=int, help="丢弃去重 badcase 数小于等于此值的关键词簇，默认 1；0 表示不丢弃")
     parser.add_argument("--max-examples", type=int, choices=range(1, 11), default=None)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=None, help="复用相同输入/提示词/模型配置的成功调用，重试失败调用")
@@ -405,7 +412,9 @@ def main(argv=None):
                     "cases": None, "dialogues": None, "output_dir": None,
                     "concurrency": 16, "timeout": 120, "retries": 2,
                     "max_tokens": 4096, "keyword_batch_size": 10,
-                    "max_examples": 10, "min_cluster_size": 1, "resume": False}
+                    "max_examples": 10, "min_cluster_size": 1, "resume": False,
+                    "precluster_edit_threshold": 0.8, "precluster_dice_threshold": 0.8,
+                    "precluster_short_threshold": 0.9}
         allowed = set(defaults) | {"badcases"}
         unknown = set(settings) - allowed
         if unknown:
@@ -434,6 +443,10 @@ def main(argv=None):
         for name in ("concurrency", "retries", "max_tokens", "keyword_batch_size", "max_examples", "min_cluster_size"):
             if type(getattr(args, name)) is not int:
                 raise ValueError(f"{name} 必须是整数")
+        for name in ("precluster_edit_threshold", "precluster_dice_threshold", "precluster_short_threshold"):
+            value = getattr(args, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} 必须为 0～1 之间的有限数值")
         if args.min_cluster_size < 0:
             raise ValueError("min_cluster_size 不能为负")
         if not 1 <= args.max_examples <= 10:

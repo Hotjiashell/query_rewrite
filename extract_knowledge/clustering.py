@@ -7,7 +7,7 @@ def compact(word):
     return re.sub(r"[\s\-‐‑‒–—―_]+", "", unicodedata.normalize('NFKC', word).casefold())
 
 
-def similarity(left, right):
+def similarity(left, right, edit_threshold=0.8, dice_threshold=0.8, short_threshold=0.9):
     a, b = compact(left), compact(right)
     if not a or not b:
         return {'edit': 0.0, 'dice': 0.0, 'candidate': False}
@@ -24,11 +24,13 @@ def similarity(left, right):
     bb = {b[i:i+2] for i in range(len(b)-1)}
     dice = 2 * len(aa & bb) / (len(aa) + len(bb)) if aa and bb else 0.0
     # Short names need stricter recall to avoid sending arbitrary two-letter pairs.
-    threshold = 0.9 if min(len(a), len(b)) <= 3 else 0.8
-    return {'edit': edit, 'dice': dice, 'candidate': max(edit, dice) >= threshold}
+    if min(len(a), len(b)) <= 3:
+        edit_threshold = max(edit_threshold, short_threshold)
+        dice_threshold = max(dice_threshold, short_threshold)
+    return {'edit': edit, 'dice': dice, 'candidate': edit >= edit_threshold or dice >= dice_threshold}
 
 
-def candidates(clusters):
+def candidates(clusters, edit_threshold=0.8, dice_threshold=0.8, short_threshold=0.9):
     parent = list(range(len(clusters)))
     def find(i):
         while parent[i] != i:
@@ -43,7 +45,7 @@ def candidates(clusters):
             a, b = compact(left['keyword']), compact(right['keyword'])
             if not a or not b or min(len(a), len(b)) / max(len(a), len(b)) < 0.5:
                 continue
-            scores = similarity(a, b)
+            scores = similarity(a, b, edit_threshold, dice_threshold, short_threshold)
             if scores['candidate']:
                 edges.append({'left': left['keyword'], 'right': right['keyword'], **scores})
                 parent[find(j)] = find(i)
