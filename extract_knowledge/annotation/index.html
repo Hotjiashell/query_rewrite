@@ -12,6 +12,17 @@
 <script>
 let state,candidates=[],active=0,timer,saveQueue=Promise.resolve(),dirty=false;
 const $=id=>document.getElementById(id);
+let localIdSequence=0;
+function newEntryId(){
+ const api=globalThis.crypto;
+ let id;
+ do{
+  if(api&&typeof api.randomUUID==='function')id=api.randomUUID();
+  else if(api&&typeof api.getRandomValues==='function')id='entry-'+Array.from(api.getRandomValues(new Uint32Array(4)),n=>n.toString(16).padStart(8,'0')).join('');
+  else id='entry-'+Date.now().toString(36)+'-'+(++localIdSequence).toString(36)+'-'+Math.random().toString(36).slice(2);
+ }while(state.confirmed.some(item=>item.id===id));
+ return id;
+}
 function el(tag,cls,value){const node=document.createElement(tag);if(cls)node.className=cls;if(value!==undefined)node.textContent=value;return node}
 function toast(message,error=false){$('notice').textContent=message;$('notice').className=error?'error':'';$('notice').style.display='block';if(!error)setTimeout(()=>$('notice').style.display='none',5000)}
 function changed(){dirty=true;$('save-status').textContent='待保存…';clearTimeout(timer);timer=setTimeout(()=>persist(),650)}
@@ -22,10 +33,10 @@ function render(){renderMeta();$('page-count').textContent=candidates.length?`${
 function go(index){if(index<0||index>=candidates.length)return;active=index;state.index=index;changed();render();window.scrollTo({top:0,behavior:'smooth'})}
 $('draft').oninput=()=>{state.drafts[String(active)]=$('draft').value;changed()};$('prev').onclick=()=>go(active-1);$('next').onclick=()=>go(active+1);$('jump-button').onclick=()=>go(Number($('jump').value)-1);$('jump').onkeydown=e=>{if(e.key==='Enter')go(Number(e.target.value)-1)};
 $('next-pending').onclick=()=>{for(let step=1;step<=candidates.length;step++){const i=(active+step)%candidates.length;if(!state.statuses[String(i)])return go(i)}toast('所有模型条目都已处理')};
-$('add').onclick=()=>{const value=$('draft').value.trim();if(!value)return toast('请填写待加入知识',true);const key=String(active);let item=state.confirmed.find(r=>r.candidate===key);if(item)item.text=value;else state.confirmed.push({id:crypto.randomUUID(),text:value,source:'model',candidate:key});state.statuses[key]='added';state.drafts[key]=value;changed();renderConfirmed();render();persist().catch(()=>{});toast(item?'已更新对应的确定知识':'已加入确定知识')};
+$('add').onclick=()=>{const value=$('draft').value.trim();if(!value)return toast('请填写待加入知识',true);const key=String(active);let item=state.confirmed.find(r=>r.candidate===key);if(item)item.text=value;else state.confirmed.push({id:newEntryId(),text:value,source:'model',candidate:key});state.statuses[key]='added';state.drafts[key]=value;changed();renderConfirmed();render();persist().catch(()=>{});toast(item?'已更新对应的确定知识':'已加入确定知识')};
 $('skip').onclick=()=>{if(state.confirmed.some(r=>r.candidate===String(active)))return toast('此条已加入，若不需要请先在左侧移除');state.statuses[String(active)]='skipped';changed();renderMeta()};
 $('reset').onclick=()=>{state.drafts[String(active)]=candidates[active].knowledge;changed();render()};
-$('new-entry').onclick=()=>{state.confirmed.push({id:crypto.randomUUID(),text:'请填写新知识条目',source:'manual'});changed();$('search').value='';renderConfirmed();const fields=$('confirmed-list').querySelectorAll('textarea');fields[fields.length-1].focus();fields[fields.length-1].select()};
+$('new-entry').onclick=()=>{state.confirmed.push({id:newEntryId(),text:'请填写新知识条目',source:'manual'});changed();$('search').value='';renderConfirmed();const fields=$('confirmed-list').querySelectorAll('textarea');fields[fields.length-1].focus();fields[fields.length-1].select()};
 $('search').oninput=renderConfirmed;$('export').onclick=()=>persist(true).catch(()=>{});$('save-status').onclick=()=>persist().catch(()=>{});window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue=''}});
 fetch('/api/data').then(async response=>{if(!response.ok)throw Error('无法加载标注数据');return response.json()}).then(data=>{state=data.state;candidates=data.candidates;active=state.index;$('run-dir').textContent=data.run_dir;$('save-status').textContent='已保存';renderConfirmed();render()}).catch(error=>toast(error.message,true));
 </script></body></html>
