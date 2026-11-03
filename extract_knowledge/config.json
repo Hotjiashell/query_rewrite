@@ -20,6 +20,7 @@
     "keyword_batch_size": 10,
     "max_examples": 10,
     "resume": true,
-    "prompts_file": "extract_knowledge/prompts.md"
+    "prompts_file": "extract_knowledge/prompts.md",
+    "min_cluster_size": 1
   }
 }

@@ -19,7 +19,7 @@ python3 extract_knowledge/pipeline.py
 | 配置项 | 说明 |
 | --- | --- |
 | `badcases` | 输入路径数组，支持 `results/badcases*.json` 等通配符 |
-| `prompts_file` | 三个阶段共用的提示词文件，默认 `extract_knowledge/prompts.md` |
+| `prompts_file` | 四个阶段共用的提示词文件，默认 `extract_knowledge/prompts.md` |
 | `knowledge` | 只包含已有知识条目的独立文本文件，默认 `extract_knowledge/existing_knowledge.txt` |
 | `cases` / `dialogues` | 可选的标题和对话补齐文件，不需要时为 null |
 | `output_dir` | 各阶段结果和检查点输出目录 |
@@ -27,6 +27,7 @@ python3 extract_knowledge/pipeline.py
 | `timeout` / `retries` | 单次请求超时秒数、失败后重试次数 |
 | `max_tokens` | 单次模型输出上限，默认 4096 |
 | `keyword_batch_size` | GT 组提取关键词时每批对话数，默认 10 |
+| `min_cluster_size` | 去重 badcase 数阈值，默认 1；小于等于该值的关键词簇不进入后续模型处理，0 表示不丢弃 |
 | `max_examples` | 最终抽取时每簇样本数，1～10 |
 | `resume` | 是否复用成功调用并重试失败调用，示例已开启 |
 
@@ -55,10 +56,11 @@ python3 -m extract_knowledge --config extract_knowledge/config.production.json
 所有模型提示词集中在 [prompts.md](prompts.md) 中，可以直接编辑，无需修改 Python：
 
 - `## keywords`：从 GT 标题提取遗漏关键词。
+- `## merge`：只根据关键词判断同义分组。
 - `## filter`：判断已有知识是否覆盖关键词。
 - `## extract`：生成知识条目和触发条件。
 
-请保留这三个二级标题，每段保留唯一的 `{input}` 占位符。程序只替换该占位符，JSON 示例中的其他大括号不用转义。输出字段名称与类型由程序校验。extract 阶段现在仅需输出 `{"knowledge":"完整知识条目","reason":"抽取依据"}`，不再要求 applicable、keyword、explanation、trigger。可调整措辞、判断规则和示例。
+请保留这四个二级标题，每段保留唯一的 `{input}` 占位符。程序只替换该占位符，JSON 示例中的其他大括号不用转义。输出字段名称与类型由程序校验。extract 阶段现在仅需输出 `{"knowledge":"完整知识条目","reason":"抽取依据"}`，不再要求 applicable、keyword、explanation、trigger。可调整措辞、判断规则和示例。
 
 通过配置的 `extract_knowledge.prompts_file` 可以切换不同版本的提示词文件，也支持 `--prompts-file` 覆盖。每次启动会加载一次提示词，修改后重新运行即可生效。即使开启 `resume`，修改过提示词的阶段也会自动使用新缓存键重新调用；其他阶段输入和提示词未变时继续复用。当前模板快照保存在输出目录的 `prompt_templates.json`，各调用的完整渲染提示词仍保存在 `calls/` 中。
 
@@ -67,9 +69,21 @@ python3 -m extract_knowledge --config extract_knowledge/config.production.json
 1. 合并输入，以 **GT ID + 完整对话文本** 去重。重复记录合并 query 和来源，避免同一对话在多轮实验中反复失败导致计数膨胀。坏文件/坏记录单独记入 `input_issues.json`，不影响其他文件或记录。缺失对话或标题时可传 `--dialogues data/dialog_example.json`（按 call_sno 匹配）、`--cases data/case_example.json` 补齐。
 2. 按 GT ID 聚类。同一 GT 的对话按 `--keyword-batch-size`（默认 10）拆批，所有批次并行提取标题中的软件名和内部术语，不丢弃大 GT 组后面的对话。一个 GT 可贡献多个关键词；模型可输出空数组。代码检查关键词确实出现在对应 GT 标题中。
 3. 按关键词聚类，匹配时做 Unicode NFKC、大小写和空白归一化；**不自动合并别名或语义相近的不同词**。一个关键词在某个 GT 批次被发现后，聚入该 GT 所有标题含该词的去重对话。一条对话可以属于多个关键词簇。
-4. 每个关键词并行与全部已有知识比较，由模型判断别名、缩写等覆盖关系。已覆盖的不进入抽取；过滤失败的单独保存，不能当成“未覆盖”。
+4. 按词聚类后立即丢弃去重 badcase 对话数 `count <= min_cluster_size` 的关键词簇（默认阈值 1，即至少 2 条才保留）。这里不是按不同 GT 数 `gt_case_count` 判断。保留的簇先进行相似关键词预聚类和模型融合，记录取并集重新计数，再并行与全部已有知识比较，由模型判断别名、缩写等覆盖关系。已覆盖的不进入抽取；过滤失败的单独保存，不能当成“未覆盖”。
 5. 对保留簇并行提炼知识。每簇最多 `--max-examples` 条（1～10，默认 10），按 GT 轮询优先覆盖不同 GT。extract 返回完整 knowledge 条目及 reason 依据，缺失或为空时按失败重试。
 6. 最终按每个关键词簇的**去重对话数**降序排列，相同数量按关键词稳定排序。JSON 同时保留 `gt_case_count`（不同 GT 案例数量）。计数用完整簇，不受最多十条抽样影响。
+
+## 相似关键词融合
+
+流程顺序为：GT 分组抽词 → 按词聚类 → 数量阈值过滤 → 字符串预聚类 → 模型同义分组 → 合并记录并去重计数 → 已有知识过滤 → 抽取知识。
+
+预聚类对关键词做 NFKC、大小写归一化，并去除空白、连接符和下划线，用归一化编辑相似度或字符二元组 Dice 相似度召回候选，任一达到 0.8 即连边；较短词长度不超过 3 时阈值为 0.9。归一化后完全一致也召回。长度比小于 0.5 的词对跳过比较。候选连通分量中的多个关键词交给模型重新分组，单独无候选的词不调用融合模型。当前字符串两两比较复杂度为 O(N²)，适合数百至数千关键词；大规模数据可后续引入索引。
+
+模型只收到 `{"keywords":["华为wifi","华为wi-fi"]}`，不会收到预聚类来源、相似度或“这些可能是一组”的提示。提示词可在 prompts.md 的 merge 段编辑。分组必须精确覆盖全部输入词，每词一次，代表词选自组内；模型可把整个列表拆成多个组。校验失败会重试，最终调用失败则保留该候选组的所有原簇，summary 标记 partial，支持恢复重试。
+
+融合结果保留 aliases，已有知识过滤和知识抽取都能看到这些名称。记录按 ID 取并集，多个别名共享的对话只计一次，合并后重新排序。默认数量阈值 1 在预聚类之前执行，只有一条对话的原始关键词簇直接丢弃，不参与候选召回或模型融合。
+
+新增过程文件：`04_merge_candidates.json` 保存候选组及相似度边，`04_merge_results.json` 保存模型判断，`04_merged_keyword_clusters.json` 保存融合后的簇和别名。融合调用并行运行、显示进度、重试并保存检查点。merge 提示词允许先输出分析再给出 JSON 代码块，解析器读取最后一个 JSON 代码块作为最终分组；原始完整响应保存在 calls 中。接口 enable_thinking 仍为 false，与通过提示词先输出分析的方式独立。
 
 ## 模型输入字段
 
@@ -78,8 +92,9 @@ python3 -m extract_knowledge --config extract_knowledge/config.production.json
 | 阶段 | 实际传入内容 |
 | --- | --- |
 | keywords | records 数组，每条只有 chat_content、gt_case_title、queries |
-| filter | keyword、existing_knowledge |
-| extract | keyword、examples 数组，每条只有 chat_content、gt_case_title、queries |
+| merge | keywords 关键词列表，无案例、对话、ID、相似度或候选分组说明 |
+| filter | keyword、aliases、existing_knowledge |
+| extract | keyword、aliases、examples 数组，每条只有 chat_content、gt_case_title、queries |
 
 记录 ID、GT ID、call_sno、cluster_id、sources、文件路径、记录序号等仅保留在本地记录和聚类文件，用于去重、计数和追溯。calls 中的 input 和 prompt 记录的是实际发给模型的精简内容。缓存键也基于精简后的提示词，来源路径等元数据变化不再导致重复调用。旧的含元数据请求与新的精简请求具有不同缓存键，首次运行会重新调用相关任务。
 
@@ -92,6 +107,7 @@ python3 -m extract_knowledge --config extract_knowledge/config.production.json
 | `02_gt_clusters.json` | GT 聚类及全部记录 |
 | `03_keyword_results.json` | 关键词阶段调用结果 |
 | `04_keyword_clusters.json` / `rejected_keywords.json` | 关键词簇、计数、依据及未通过标题验证的词 |
+| `low_frequency_clusters.json` / `04_eligible_keyword_clusters.json` | 低频丢弃簇及原因、通过数量阈值的簇；04_keyword_clusters.json 仍保留完整聚类 |
 | `05_filter_results.json` | 过滤判断、覆盖条目引用和理由 |
 | `06_retained_clusters.json` | 保留簇 |
 | `covered_clusters.json` / `filter_failed_clusters.json` | 已覆盖簇、过滤失败待重试簇 |

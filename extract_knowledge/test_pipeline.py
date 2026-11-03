@@ -40,7 +40,7 @@ class PipelineTests(unittest.TestCase):
                     return {'status': 'success', 'result': result}
             args = argparse.Namespace(output_dir=str(root / 'out'), knowledge=str(knowledge), cases=None,
                                       dialogues=None, badcases=[str(source)], keyword_batch_size=1,
-                                      concurrency=4, max_examples=10)
+                                      concurrency=4, max_examples=10, min_cluster_size=0)
             with patch.object(p, 'Model', FakeModel):
                 self.assertEqual(p.run(args, {}), 1)
             entries = p.read_json(root / 'out/knowledge.json')
@@ -51,6 +51,21 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(p.read_json(root / 'out/existing_knowledge.json')['content'], knowledge.read_text())
             self.assertEqual(len(p.read_json(root / 'out/01_records.json')), 5)
             self.assertTrue(p.read_json(root / 'out/summary.json')['partial'])
+            # At the inclusive boundary count=2 is dropped, as are singleton clusters.
+            args.min_cluster_size = 2
+            with patch.object(p, 'Model', FakeModel):
+                self.assertEqual(p.run(args, {}), 1)  # malformed input still yields partial
+            self.assertEqual(p.read_json(root / 'out/knowledge.json'), [])
+            self.assertEqual(p.read_json(root / 'out/05_filter_results.json'), [])
+            self.assertEqual(p.read_json(root / 'out/07_extraction_results.json'), [])
+            discarded = p.read_json(root / 'out/low_frequency_clusters.json')
+            self.assertEqual(sorted(c['count'] for c in discarded), [1, 1, 1, 2])
+            # A larger cluster passes, while the singleton clusters never reach filtering.
+            args.min_cluster_size = 1
+            with patch.object(p, 'Model', FakeModel):
+                self.assertEqual(p.run(args, {}), 1)
+            self.assertEqual([c['keyword'] for c in p.read_json(root / 'out/knowledge.json')], ['Alpha'])
+            self.assertEqual(len(p.read_json(root / 'out/05_filter_results.json')), 1)
 
     def test_retry_checkpoint_and_resume(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -81,11 +96,14 @@ class PipelineTests(unittest.TestCase):
         expected = {key: row[key] for key in ('chat_content', 'gt_case_title', 'queries')}
         tasks = {
             'keywords': ({'case_id': 'secret-case', 'records': [row]}, {'records': [expected]}),
+            'merge': ({'keywords': ['华为wifi', '华为wi-fi'], 'source': '/secret/path'},
+                      {'keywords': ['华为wifi', '华为wi-fi']}),
             'filter': ({'keyword': 'WebG', 'existing_knowledge': '已有条目', 'source': '/secret/path'},
                        {'keyword': 'WebG', 'existing_knowledge': '已有条目'}),
             'extract': ({'cluster_id': 'secret-cluster', 'keyword': 'WebG', 'examples': [row]},
                         {'keyword': 'WebG', 'examples': [expected]})}
         outputs = {'keywords': {'keywords': []},
+                   'merge': {'groups': [{'keyword': '华为wifi', 'keywords': ['华为wifi', '华为wi-fi'], 'reason': '同义'}]},
                    'filter': {'covered': False, 'reason': '未覆盖'},
                    'extract': {'knowledge': 'WebG：外网访问时考虑', 'reason': '依据'}}
         with tempfile.TemporaryDirectory() as directory:
@@ -108,6 +126,77 @@ class PipelineTests(unittest.TestCase):
                 task['irrelevant_metadata'] = 'changed'
                 self.assertTrue(model.task(stage, task)['cached'])
             self.assertEqual(row['sources'][0]['file'], '/secret/path')
+
+    def test_candidate_fusion_dedup_and_failure(self):
+        from extract_knowledge.clustering import candidates, fuse, validate_partition, similarity
+        words = ['华为wifi', '华为wi-fi', '华为VPN']
+        shared = {'id': 'shared', 'expected_case_id': 'A'}
+        clusters = [{'keyword': word, 'records': [shared, {'id': str(i), 'expected_case_id': str(i)}],
+                     'keyword_evidence': [], 'count': 2} for i, word in enumerate(words)]
+        groups, edges = candidates(clusters)
+        self.assertEqual(groups, [words[:2]])
+        self.assertTrue(edges)
+        self.assertTrue(similarity('华为wifi', '华为 wi‑fi')['candidate'])
+        self.assertFalse(similarity('AB', 'AC')['candidate'])
+        task = {'keywords': words[:2]}
+        result = {'groups': [{'keyword': words[0], 'keywords': words[:2], 'reason': '连接符差异'}]}
+        merged = fuse(clusters, [task], [{'status': 'success', 'result': result}], p.digest)
+        self.assertEqual(merged[0]['count'], 3)
+        self.assertEqual(merged[0]['aliases'], words[:2])
+        self.assertEqual(merged[0]['gt_case_count'], 3)
+        self.assertEqual(len(fuse(clusters, [task], [{'status': 'failed'}], p.digest)), 3)
+        for bad in ({'groups': []}, {'groups': [{'keyword': words[0], 'keywords': words, 'reason': '新增'}]},
+                    {'groups': [{'keyword': words[0], 'keywords': [words[0], words[0]], 'reason': '重复'}]}):
+            with self.assertRaises(ValueError):
+                validate_partition(bad, words[:2])
+        # Chain-like candidates can be split by the model instead of unioned blindly.
+        split = {'groups': [{'keyword': w, 'keywords': [w], 'reason': '不同'} for w in words[:2]]}
+        self.assertEqual(len(fuse(clusters, [task], [{'status': 'success', 'result': split}], p.digest)), 3)
+
+    def test_merge_analysis_and_json_block(self):
+        words = ['华为wifi', '华为wi-fi']
+        answer = {'groups': [{'keyword': words[0], 'keywords': words, 'reason': '连接符差异'}]}
+        raw = '分析：检查每个词，两个名称核心概念一致。\n```json\n' + json.dumps(answer) + '\n```'
+        self.assertEqual(p.parse_result('merge', raw, {'keywords': words}), answer)
+        self.assertEqual(p.parse_result('merge', json.dumps(answer), {'keywords': words}), answer)
+        with self.assertRaises(ValueError):
+            p.parse_result('merge', '分析\n```json\n{"groups": []}\n```', {'keywords': words})
+
+    def test_size_filter_runs_before_candidate_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'bad.json'
+            rows = [{'expected_case_id': str(i), 'chat_content': f'用户{i}',
+                     'gt_case_title': word, 'query': '无法访问'}
+                    for i, word in enumerate(['华为wifi', '华为wifi', '华为wi-fi'])]
+            p.save(source, {'artifact_type': 'badcase_report', 'records': rows})
+            knowledge = root / 'existing.txt'
+            knowledge.write_text('')
+            stages = []
+            class FakeModel:
+                identity, templates = {}, {}
+                def __init__(self, *args):
+                    pass
+                def task(self, stage, data):
+                    stages.append(stage)
+                    if stage == 'keywords':
+                        result = {'keywords': [{'keyword': data['records'][0]['gt_case_title'], 'reason': '遗漏'}]}
+                    elif stage == 'filter':
+                        result = {'covered': False, 'reason': '无已有知识'}
+                    elif stage == 'extract':
+                        result = {'knowledge': '知识条目', 'reason': '依据'}
+                    else:
+                        raise AssertionError('singleton should not reach merge')
+                    return {'status': 'success', 'result': result}
+            args = argparse.Namespace(output_dir=str(root / 'out'), knowledge=str(knowledge),
+                                      cases=None, dialogues=None, badcases=[str(source)],
+                                      keyword_batch_size=10, concurrency=2, max_examples=10, min_cluster_size=1)
+            with patch.object(p, 'Model', FakeModel), patch.object(p, 'candidates', wraps=p.candidates) as candidates:
+                self.assertEqual(p.run(args, {}), 0)
+                self.assertEqual([c['keyword'] for c in candidates.call_args.args[0]], ['华为wifi'])
+            self.assertNotIn('merge', stages)
+            self.assertEqual(p.read_json(root / 'out/low_frequency_clusters.json')[0]['keyword'], '华为wi-fi')
+            self.assertEqual(p.read_json(root / 'out/knowledge.json')[0]['cluster_count'], 2)
 
     def test_extract_new_schema(self):
         result = {'knowledge': 'WebG：外网网关；访问外网时考虑 WebG', 'reason': '对话依据'}
@@ -140,6 +229,7 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(p.main(['--config', str(config)]), 0)
                 args, llm = run.call_args.args
                 self.assertEqual(args.concurrency, 7)
+                self.assertEqual(args.min_cluster_size, 1)
                 self.assertEqual(args.knowledge, str(p.HERE / 'existing_knowledge.txt'))
                 self.assertTrue(args.resume)
                 self.assertEqual(args.badcases, [str(root / 'bad1.json')])

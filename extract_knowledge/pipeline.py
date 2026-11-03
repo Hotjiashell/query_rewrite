@@ -17,6 +17,11 @@ import tempfile
 import time
 import unicodedata
 
+if __package__:
+    from .clustering import candidates, validate_partition, fuse
+else:
+    from clustering import candidates, validate_partition, fuse
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 
@@ -40,7 +45,7 @@ def save(path, value):
 def load_prompts(path):
     """Read editable Markdown sections without formatting literal JSON braces."""
     content = Path(path).read_text(encoding="utf-8")
-    sections = re.split(r"^## (keywords|filter|extract)\s*$", content, flags=re.M)
+    sections = re.split(r"^## (keywords|merge|filter|extract)\s*$", content, flags=re.M)
     templates = {}
     for stage, body in zip(sections[1::2], sections[2::2]):
         if stage in templates:
@@ -48,7 +53,7 @@ def load_prompts(path):
         if body.count("{input}") != 1:
             raise ValueError(f"提示词 {stage} 必须包含且仅包含一个 {{input}} 占位符")
         templates[stage] = body.strip()
-    missing = {"keywords", "filter", "extract"} - templates.keys()
+    missing = {"keywords", "merge", "filter", "extract"} - templates.keys()
     if missing:
         raise ValueError(f"提示词文件缺少阶段：{', '.join(sorted(missing))}")
     return templates
@@ -135,6 +140,9 @@ def validate(stage, obj):
         for item in items:
             if not isinstance(item, dict) or not text(item.get("keyword")) or not text(item.get("reason")):
                 raise ValueError("每个关键词必须包含非空 keyword / reason")
+    elif stage == "merge":
+        if not isinstance(obj.get("groups"), list):
+            raise ValueError("融合结果需要 groups 数组")
     elif stage == "filter":
         if type(obj.get("covered")) is not bool or not text(obj.get("reason")):
             raise ValueError("过滤结果需要 covered 布尔值及 reason")
@@ -147,6 +155,19 @@ def validate(stage, obj):
     return obj
 
 
+def parse_result(stage, raw, data):
+    """Merge may explain first; use the last fenced JSON as its final answer."""
+    if stage == "merge":
+        blocks = re.findall(r"```(?:json)?[ \t]*\r?\n(.*?)```", raw, flags=re.I | re.S)
+        content = blocks[-1].strip() if blocks else raw.strip()
+    else:
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
+    result = validate(stage, json.loads(content))
+    if stage == "merge":
+        validate_partition(result, data["keywords"])
+    return result
+
+
 def model_input(stage, data):
     """Whitelist semantic fields at the model boundary; retain metadata locally."""
     def example(row):
@@ -154,10 +175,13 @@ def model_input(stage, data):
 
     if stage == "keywords":
         return {"records": [example(row) for row in data["records"]]}
+    if stage == "merge":
+        return {"keywords": data["keywords"]}
     if stage == "filter":
-        return {name: data[name] for name in ("keyword", "existing_knowledge")}
+        return {name: data[name] for name in ("keyword", "existing_knowledge", "aliases") if name in data}
     if stage == "extract":
-        return {"keyword": data["keyword"], "examples": [example(row) for row in data["examples"]]}
+        return {**{name: data[name] for name in ("keyword", "aliases") if name in data},
+                "examples": [example(row) for row in data["examples"]]}
     raise ValueError(f"未知模型阶段：{stage}")
 
 
@@ -182,6 +206,8 @@ class Model:
                 cached = read_json(path)
                 if cached["status"] == "success":
                     validate(stage, cached["result"])
+                    if stage == "merge":
+                        validate_partition(cached["result"], data["keywords"])
                     return {**cached, "cached": True}
             except (OSError, ValueError, KeyError, TypeError):
                 pass
@@ -199,8 +225,7 @@ class Model:
                     raise ValueError("模型输出被截断，调大 --max-tokens")
                 if not isinstance(raw, str):
                     raise ValueError("模型返回空内容")
-                content = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
-                result = validate(stage, json.loads(content))
+                result = parse_result(stage, raw, data)
                 trace["result"] = result
                 trace["status"] = "success"
                 trace["attempts"].append({"response": raw})
@@ -293,10 +318,23 @@ def run(args, llm):
     ordered.sort(key=lambda c: (-c["count"], canonical(c["keyword"])))
     save(out / "04_keyword_clusters.json", ordered)
     save(out / "rejected_keywords.json", rejected)
-    filters = parallel("filter", [{"keyword": c["keyword"], "existing_knowledge": knowledge} for c in ordered],
+    eligible = [c for c in ordered if c["count"] > args.min_cluster_size]
+    low_frequency = [{**c, "discard_reason": f"count <= min_cluster_size ({args.min_cluster_size})"}
+                     for c in ordered if c["count"] <= args.min_cluster_size]
+    save(out / "low_frequency_clusters.json", low_frequency)
+    save(out / "04_eligible_keyword_clusters.json", eligible)
+    print(f"[cluster-size] total={len(ordered)} retained={len(eligible)} "
+          f"discarded={len(low_frequency)} threshold={args.min_cluster_size}", file=sys.stderr)
+    candidate_groups, edges = candidates(eligible)
+    save(out / "04_merge_candidates.json", {"groups": candidate_groups, "edges": edges})
+    merge_tasks = [{"keywords": words} for words in candidate_groups]
+    merged_results = parallel("merge", merge_tasks, model, args.concurrency, out / "04_merge_results.json")
+    merged = fuse(eligible, merge_tasks, merged_results, digest)
+    save(out / "04_merged_keyword_clusters.json", merged)
+    filters = parallel("filter", [{"keyword": c["keyword"], "aliases": c["aliases"], "existing_knowledge": knowledge} for c in merged],
                        model, args.concurrency, out / "05_filter_results.json")
     kept, excluded, unresolved = [], [], []
-    for cluster, response in zip(ordered, filters):
+    for cluster, response in zip(merged, filters):
         if response["status"] != "success":
             unresolved.append(cluster)
         elif response["result"]["covered"]:
@@ -306,7 +344,7 @@ def run(args, llm):
     save(out / "06_retained_clusters.json", kept)
     save(out / "covered_clusters.json", excluded)
     save(out / "filter_failed_clusters.json", unresolved)
-    extract_tasks = [{"cluster_id": c["id"], "keyword": c["keyword"],
+    extract_tasks = [{"cluster_id": c["id"], "keyword": c["keyword"], "aliases": c["aliases"],
                       "examples": diverse(c["records"], args.max_examples)} for c in kept]
     extracted = parallel("extract", extract_tasks, model, args.concurrency, out / "07_extraction_results.json")
     entries = []
@@ -314,14 +352,17 @@ def run(args, llm):
         if response["status"] == "success":
             result = response["result"]
             entries.append({**result, "keyword": cluster["keyword"], "cluster_id": cluster["id"],
-                            "cluster_count": cluster["count"], "gt_case_count": cluster["gt_case_count"],
+                            "aliases": cluster["aliases"], "cluster_count": cluster["count"], "gt_case_count": cluster["gt_case_count"],
                             "example_ids": [r["id"] for r in task["examples"]]})
     save(out / "knowledge.json", entries)
     (out / "knowledge.txt").write_text("\n".join(f"{i}. {r['knowledge'].strip()}" for i, r in enumerate(entries, 1)) + "\n", encoding="utf-8")
-    failures = sum(r["status"] != "success" for r in keyword_results + filters + extracted)
+    failures = sum(r["status"] != "success" for r in keyword_results + merged_results + filters + extracted)
     summary = {"created_at": datetime.now(timezone.utc).isoformat(), "input_files": paths,
                "record_count": len(records), "input_issue_count": len(issues), "gt_cluster_count": len(groups),
                "keyword_cluster_count": len(ordered), "covered_cluster_count": len(excluded),
+               "merge_candidate_group_count": len(merge_tasks), "merged_keyword_cluster_count": len(merged),
+               "min_cluster_size": args.min_cluster_size, "low_frequency_cluster_count": len(low_frequency),
+               "eligible_keyword_cluster_count": len(eligible),
                "retained_cluster_count": len(kept), "knowledge_count": len(entries),
                "failed_model_tasks": failures, "partial": bool(failures or issues),
                "concurrency": args.concurrency, "max_examples": args.max_examples,
@@ -336,7 +377,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("badcases", nargs="*", help="一个或多个 collect_badcases.py 输出文件（支持 shell 通配符）")
     parser.add_argument("--knowledge", help="只包含已有知识条目的独立文本文件，可为空")
-    parser.add_argument("--prompts-file", help="包含三个阶段提示词的 Markdown 文件")
+    parser.add_argument("--prompts-file", help="包含四个阶段提示词的 Markdown 文件")
     parser.add_argument("--cases", help="可选的案例标题映射 JSON")
     parser.add_argument("--dialogues", help="可选的原始对话 JSON，按 call_sno 补齐对话")
     parser.add_argument("--output-dir")
@@ -349,6 +390,7 @@ def main(argv=None):
     parser.add_argument("--retries", type=int, default=None, help="首次失败后的重试次数")
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--keyword-batch-size", type=int, default=None)
+    parser.add_argument("--min-cluster-size", type=int, help="丢弃去重 badcase 数小于等于此值的关键词簇，默认 1；0 表示不丢弃")
     parser.add_argument("--max-examples", type=int, choices=range(1, 11), default=None)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=None, help="复用相同输入/提示词/模型配置的成功调用，重试失败调用")
     args = parser.parse_args(argv)
@@ -363,7 +405,7 @@ def main(argv=None):
                     "cases": None, "dialogues": None, "output_dir": None,
                     "concurrency": 16, "timeout": 120, "retries": 2,
                     "max_tokens": 4096, "keyword_batch_size": 10,
-                    "max_examples": 10, "resume": False}
+                    "max_examples": 10, "min_cluster_size": 1, "resume": False}
         allowed = set(defaults) | {"badcases"}
         unknown = set(settings) - allowed
         if unknown:
@@ -389,9 +431,11 @@ def main(argv=None):
                 args.badcases.extend(matches)
         if not args.badcases or not args.output_dir:
             raise ValueError("请在配置文件 extract_knowledge 中填写 badcases 和 output_dir")
-        for name in ("concurrency", "retries", "max_tokens", "keyword_batch_size", "max_examples"):
+        for name in ("concurrency", "retries", "max_tokens", "keyword_batch_size", "max_examples", "min_cluster_size"):
             if type(getattr(args, name)) is not int:
                 raise ValueError(f"{name} 必须是整数")
+        if args.min_cluster_size < 0:
+            raise ValueError("min_cluster_size 不能为负")
         if not 1 <= args.max_examples <= 10:
             raise ValueError("max_examples 必须在 1～10 之间")
         if type(args.resume) is not bool:
