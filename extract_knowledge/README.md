@@ -136,3 +136,36 @@ python3 -m extract_knowledge --config extract_knowledge/config.production.json
 python3 -m unittest extract_knowledge.test_pipeline
 python3 -m extract_knowledge --help
 ```
+
+## 人工知识标注界面
+
+本地界面无需安装前端依赖，也不调用模型。指定一个已有 run 输出目录：
+
+```bash
+python3 -m extract_knowledge.annotate extract_knowledge/outputs/run_001
+```
+
+省略目录时，默认使用 `extract_knowledge/config.json` 的 `extract_knowledge.output_dir`：
+
+```bash
+python3 -m extract_knowledge.annotate
+```
+
+在浏览器打开 **http://127.0.0.1:8765**。端口冲突时可加 `--port 8766`。服务只监听本机，Ctrl+C 停止。也可直接运行 `python3 extract_knowledge/annotate.py <run目录>`。显式传入的相对目录按当前工作目录解释。
+
+- 左侧“确定知识”以该 run 的 `existing_knowledge.json` 快照为初始知识，每条可直接编辑、移除，也可手动新增；支持搜索。
+- 右侧每页展示一个模型生成的知识条目，包含关键词、别名、聚类数量、抽取依据及模型原文。待加入编辑框默认使用模型输出，人工修改后点击“加入确定知识”。同一模型条目重复点击会更新原有确定条目，不重复插入。
+- 下方展示该聚类全部来源案例标题、query 和完整对话，并标记最终模型总结使用的样本。可展开/折叠对话。来源从 `06_retained_clusters.json` 关联读取，并兼容其他聚类文件；缺失来源文件时会提示。
+- 支持上一条、下一条、页码跳转、下一条未处理；不需要的模型条目可标记“暂不加入”。编辑草稿、确定知识及当前页码自动保存到 run 目录的 `annotation_state.json`，刷新或重启可继续。
+- 点击“导出确定知识”，将保存当前编辑内容，并在 run 目录输出 **final_knowledge.txt**（全部确定知识的编号文本）和 **final_knowledge.json**（含条目来源及标注版本）。文本可直接用于下一轮配置的 knowledge 文件。
+
+导出包含初始知识及人工加入/新增的知识，只导出当前确定列表，未加入的草稿不会混入；不会修改原 `knowledge.json` 或全局 existing_knowledge.txt。导出可重复点击，会更新同名结果文件。保存失败会显示错误，可点击顶部保存状态重试；有未保存修改时关闭页面会提醒。多个页面同时修改会检查版本并拒绝覆盖，提示刷新。若重新跑抽取导致 knowledge.json 或已有知识快照改变，旧标注状态会拒绝加载，请使用新的 run 目录，或先备份移走旧 annotation_state.json。
+
+离线验证：
+
+```bash
+python3 -m unittest extract_knowledge.test_annotation extract_knowledge.test_pipeline
+node extract_knowledge/annotation/test_ui.cjs
+```
+
+前端逻辑测试使用最小 DOM 验证编辑、加入、防重复、翻页、跳过和导出；它不替代真实浏览器的视觉检查。
