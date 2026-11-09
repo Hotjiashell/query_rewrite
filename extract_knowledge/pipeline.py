@@ -18,9 +18,11 @@ import time
 import unicodedata
 
 if __package__:
-    from .clustering import candidates, validate_partition, fuse
+    from .clustering import validate_partition, fuse
+    from .embedding import precluster
 else:
-    from clustering import candidates, validate_partition, fuse
+    from clustering import validate_partition, fuse
+    from embedding import precluster
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -109,6 +111,11 @@ def load_records(paths, cases=None, dialogues=None):
                 if not title and cases:
                     entry = cases.get(case_id, {})
                     title = text(entry.get("case_name")) if isinstance(entry, dict) else ""
+                entry = cases.get(case_id, {}) if isinstance(cases, dict) else {}
+                content = text(entry.get("text")) if isinstance(entry, dict) else ""
+                content = content or text(raw.get("gt_case_content"))
+                if not content:
+                    raise ValueError("缺少 GT 案例正文，请配置 cases 文件（case_id -> {case_name, text}）")
                 if not case_id or not dialogue or not title:
                     raise ValueError("缺少 GT ID、对话或 GT 标题；可用 --cases / --dialogues 补齐")
                 queries = list(dict.fromkeys([text(raw.get("query"))] + [text(q) for q in (raw.get("queries") or []) if isinstance(q, str)]))
@@ -122,7 +129,7 @@ def load_records(paths, cases=None, dialogues=None):
                     old["queries"] = list(dict.fromkeys(old["queries"] + queries))
                     continue
                 row = {"id": key, "call_sno": raw.get("call_sno"), "expected_case_id": case_id,
-                       "gt_case_title": title, "chat_content": dialogue, "queries": queries, "sources": [source]}
+                       "gt_case_title": title, "gt_case_content": content, "chat_content": dialogue, "queries": queries, "sources": [source]}
                 seen[key] = row
                 records.append(row)
             except (ValueError, TypeError) as exc:
@@ -135,11 +142,17 @@ def validate(stage, obj):
         raise ValueError("模型必须输出 JSON 对象")
     if stage == "keywords":
         items = obj.get("keywords")
+        if isinstance(items, str):
+            if not text(obj.get("reason")):
+                raise ValueError("关键词需要非空 reason")
+            if items.strip() and not text(obj.get("desc")):
+                raise ValueError("关键词需要非空 desc 描述解释")
+            return {"keywords": [{"keyword": items.strip(), "desc": text(obj.get("desc")), "reason": obj["reason"]}] if items.strip() else []}
         if not isinstance(items, list):
             raise ValueError("keywords 必须为数组")
         for item in items:
-            if not isinstance(item, dict) or not text(item.get("keyword")) or not text(item.get("reason")):
-                raise ValueError("每个关键词必须包含非空 keyword / reason")
+            if not isinstance(item, dict) or not text(item.get("keyword")) or not text(item.get("reason")) or not text(item.get("desc")):
+                raise ValueError("每个关键词必须包含非空 keyword / desc / reason")
     elif stage == "merge":
         if not isinstance(obj.get("groups"), list):
             raise ValueError("融合结果需要 groups 数组")
@@ -149,15 +162,17 @@ def validate(stage, obj):
         if obj["covered"] and not text(obj.get("matched_knowledge")):
             raise ValueError("已覆盖必须引用 matched_knowledge")
     else:
-        for name in ("knowledge", "reason"):
+        for name in ("knowledge",):
             if not text(obj.get(name)):
                 raise ValueError(f"抽取缺少非空字符串 {name}")
+        if "reason" in obj and not text(obj["reason"]):
+            raise ValueError("抽取 reason 如提供必须为非空字符串")
     return obj
 
 
 def parse_result(stage, raw, data):
-    """Merge may explain first; use the last fenced JSON as its final answer."""
-    if stage == "merge":
+    """Stages permitting analysis use the last fenced JSON as the final answer."""
+    if stage in ("keywords", "merge", "extract"):
         blocks = re.findall(r"```(?:json)?[ \t]*\r?\n(.*?)```", raw, flags=re.I | re.S)
         content = blocks[-1].strip() if blocks else raw.strip()
     else:
@@ -174,13 +189,20 @@ def model_input(stage, data):
         return {name: row[name] for name in ("chat_content", "gt_case_title", "queries")}
 
     if stage == "keywords":
-        return {"records": [example(row) for row in data["records"]]}
+        records = data["records"]
+        case = records[0] if records else {}
+        return {"gt_case_title": case.get("gt_case_title", ""),
+                "gt_case_content": case.get("gt_case_content", ""),
+                "records": [{name: row[name] for name in ("chat_content", "queries")} for row in records]}
     if stage == "merge":
         return {"keywords": data["keywords"]}
     if stage == "filter":
-        return {name: data[name] for name in ("keyword", "existing_knowledge", "aliases") if name in data}
+        payload = {name: data[name] for name in ("keyword", "desc", "existing_knowledge", "aliases", "concepts") if name in data}
+        if data.get("desc"):
+            payload["keyword"] = data["keyword"] + "：" + data["desc"]
+        return payload
     if stage == "extract":
-        return {**{name: data[name] for name in ("keyword", "aliases") if name in data},
+        return {**{name: data[name] for name in ("keyword", "desc", "aliases", "concepts") if name in data},
                 "examples": [example(row) for row in data["examples"]]}
     raise ValueError(f"未知模型阶段：{stage}")
 
@@ -205,7 +227,7 @@ class Model:
             try:
                 cached = read_json(path)
                 if cached["status"] == "success":
-                    validate(stage, cached["result"])
+                    cached["result"] = validate(stage, cached["result"])
                     if stage == "merge":
                         validate_partition(cached["result"], data["keywords"])
                     return {**cached, "cached": True}
@@ -285,11 +307,15 @@ def run(args, llm):
     save(out / "02_gt_clusters.json", gt_groups)
     model = Model(args, llm)
     save(out / "prompt_templates.json", model.templates)
-    # Split large GT groups instead of silently dropping their evidence.
+    # One task per GT; stable random sampling keeps resume cache reusable.
     tasks = []
     for group in gt_groups:
-        for offset in range(0, group["count"], args.keyword_batch_size):
-            tasks.append({"case_id": group["case_id"], "records": group["records"][offset:offset+args.keyword_batch_size]})
+        selected = group["records"]
+        if group["count"] > args.keyword_batch_size:
+            rng = random.Random(digest([group["case_id"], selected]))
+            selected = rng.sample(selected, args.keyword_batch_size)
+        tasks.append({"case_id": group["case_id"], "records": selected})
+    save(out / "02_keyword_tasks.json", tasks)
     keyword_results = parallel("keywords", tasks, model, args.concurrency, out / "03_keyword_results.json")
     clusters = {}
     rejected = []
@@ -304,12 +330,23 @@ def run(args, llm):
                 rejected.append({"keyword": keyword, "case_id": task["case_id"], "reason": "关键词未出现在 GT 标题中"})
                 continue
             key = canonical(keyword)
-            cluster = clusters.setdefault(key, {"keyword": keyword, "records": {}, "keyword_evidence": []})
-            cluster["keyword_evidence"].append({"case_id": task["case_id"], "reason": item["reason"]})
+            cluster = clusters.setdefault(key, {"keyword": keyword, "records": {}, "descriptions": [], "keyword_evidence": []})
+            if item["desc"] not in cluster["descriptions"]:
+                cluster["descriptions"].append(item["desc"])
+            cluster["keyword_evidence"].append({"case_id": task["case_id"], "desc": item["desc"],
+                                                "dialogue_count": len(matching), "reason": item["reason"]})
             for row in matching:
                 cluster["records"][row["id"]] = row
     ordered = []
     for key, cluster in clusters.items():
+        evidence = cluster["keyword_evidence"]
+        max_count = max(item["dialogue_count"] for item in evidence)
+        candidates = [item for item in evidence if item["dialogue_count"] == max_count]
+        # Stable random tie-breaking avoids changing downstream caches on resume.
+        selected = random.Random(digest([key, candidates])).choice(candidates)
+        cluster["desc"] = selected["desc"]
+        cluster["description_source"] = {"case_id": selected["case_id"], "dialogue_count": max_count}
+        cluster["concept"] = cluster["keyword"] + "：" + cluster["desc"]
         cluster["records"] = list(cluster["records"].values())
         cluster["count"] = len(cluster["records"])
         cluster["gt_case_count"] = len({r["expected_case_id"] for r in cluster["records"]})
@@ -318,26 +355,25 @@ def run(args, llm):
     ordered.sort(key=lambda c: (-c["count"], canonical(c["keyword"])))
     save(out / "04_keyword_clusters.json", ordered)
     save(out / "rejected_keywords.json", rejected)
-    eligible = [c for c in ordered if c["count"] > args.min_cluster_size]
-    low_frequency = [{**c, "discard_reason": f"count <= min_cluster_size ({args.min_cluster_size})"}
-                     for c in ordered if c["count"] <= args.min_cluster_size]
-    save(out / "low_frequency_clusters.json", low_frequency)
-    save(out / "04_eligible_keyword_clusters.json", eligible)
-    print(f"[cluster-size] total={len(ordered)} retained={len(eligible)} "
-          f"discarded={len(low_frequency)} threshold={args.min_cluster_size}", file=sys.stderr)
-    precluster_config = {"edit_threshold": args.precluster_edit_threshold,
-                         "dice_threshold": args.precluster_dice_threshold,
-                         "short_threshold": args.precluster_short_threshold}
-    candidate_groups, edges = candidates(eligible, **precluster_config)
+    precluster_config = {"method": "embedding", "similarity_threshold": args.precluster_similarity_threshold}
+    args.output_dir = Path(args.output_dir)
+    candidate_groups, edges, embedding_failures = precluster(ordered, args, save, read_json, digest)
     save(out / "04_merge_candidates.json", {"configuration": precluster_config, "groups": candidate_groups, "edges": edges})
     merge_tasks = [{"keywords": words} for words in candidate_groups]
     merged_results = parallel("merge", merge_tasks, model, args.concurrency, out / "04_merge_results.json")
-    merged = fuse(eligible, merge_tasks, merged_results, digest)
+    merged = fuse(ordered, merge_tasks, merged_results, digest)
     save(out / "04_merged_keyword_clusters.json", merged)
-    filters = parallel("filter", [{"keyword": c["keyword"], "aliases": c["aliases"], "existing_knowledge": knowledge} for c in merged],
+    eligible = [c for c in merged if c["count"] > args.min_cluster_size]
+    low_frequency = [{**c, "discard_reason": f"count <= min_cluster_size ({args.min_cluster_size}) after merge"}
+                     for c in merged if c["count"] <= args.min_cluster_size]
+    save(out / "low_frequency_clusters.json", low_frequency)
+    save(out / "04_eligible_keyword_clusters.json", eligible)
+    print(f"[cluster-size after merge] total={len(merged)} retained={len(eligible)} "
+          f"discarded={len(low_frequency)} threshold={args.min_cluster_size}", file=sys.stderr)
+    filters = parallel("filter", [{"keyword": c["keyword"], "desc": c["desc"], "aliases": c["aliases"], "concepts": c["concepts"], "existing_knowledge": knowledge} for c in eligible],
                        model, args.concurrency, out / "05_filter_results.json")
     kept, excluded, unresolved = [], [], []
-    for cluster, response in zip(merged, filters):
+    for cluster, response in zip(eligible, filters):
         if response["status"] != "success":
             unresolved.append(cluster)
         elif response["result"]["covered"]:
@@ -347,7 +383,7 @@ def run(args, llm):
     save(out / "06_retained_clusters.json", kept)
     save(out / "covered_clusters.json", excluded)
     save(out / "filter_failed_clusters.json", unresolved)
-    extract_tasks = [{"cluster_id": c["id"], "keyword": c["keyword"], "aliases": c["aliases"],
+    extract_tasks = [{"cluster_id": c["id"], "keyword": c["keyword"], "desc": c["desc"], "aliases": c["aliases"], "concepts": c["concepts"],
                       "examples": diverse(c["records"], args.max_examples)} for c in kept]
     extracted = parallel("extract", extract_tasks, model, args.concurrency, out / "07_extraction_results.json")
     entries = []
@@ -355,11 +391,11 @@ def run(args, llm):
         if response["status"] == "success":
             result = response["result"]
             entries.append({**result, "keyword": cluster["keyword"], "cluster_id": cluster["id"],
-                            "aliases": cluster["aliases"], "cluster_count": cluster["count"], "gt_case_count": cluster["gt_case_count"],
+                            "desc": cluster["desc"], "concepts": cluster["concepts"], "aliases": cluster["aliases"], "cluster_count": cluster["count"], "gt_case_count": cluster["gt_case_count"],
                             "example_ids": [r["id"] for r in task["examples"]]})
     save(out / "knowledge.json", entries)
     (out / "knowledge.txt").write_text("\n".join(f"{i}. {r['knowledge'].strip()}" for i, r in enumerate(entries, 1)) + "\n", encoding="utf-8")
-    failures = sum(r["status"] != "success" for r in keyword_results + merged_results + filters + extracted)
+    failures = embedding_failures + sum(r["status"] != "success" for r in keyword_results + merged_results + filters + extracted)
     summary = {"created_at": datetime.now(timezone.utc).isoformat(), "input_files": paths,
                "record_count": len(records), "input_issue_count": len(issues), "gt_cluster_count": len(groups),
                "keyword_cluster_count": len(ordered), "covered_cluster_count": len(excluded),
@@ -369,7 +405,7 @@ def run(args, llm):
                "retained_cluster_count": len(kept), "knowledge_count": len(entries),
                "failed_model_tasks": failures, "partial": bool(failures or issues),
                "concurrency": args.concurrency, "max_examples": args.max_examples,
-               "precluster": precluster_config,
+               "precluster": precluster_config, "failed_embedding_batches": embedding_failures,
                "llm": model.identity}
     save(out / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -382,7 +418,7 @@ def main(argv=None):
     parser.add_argument("badcases", nargs="*", help="一个或多个 collect_badcases.py 输出文件（支持 shell 通配符）")
     parser.add_argument("--knowledge", help="只包含已有知识条目的独立文本文件，可为空")
     parser.add_argument("--prompts-file", help="包含四个阶段提示词的 Markdown 文件")
-    parser.add_argument("--cases", help="可选的案例标题映射 JSON")
+    parser.add_argument("--cases", help="案例映射 JSON，按 GT ID 读取 case_name 和 text 正文")
     parser.add_argument("--dialogues", help="可选的原始对话 JSON，按 call_sno 补齐对话")
     parser.add_argument("--output-dir")
     parser.add_argument("--config", default=str(HERE / "config.json"), help="配置文件，默认 extract_knowledge/config.json")
@@ -394,9 +430,7 @@ def main(argv=None):
     parser.add_argument("--retries", type=int, default=None, help="首次失败后的重试次数")
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--keyword-batch-size", type=int, default=None)
-    parser.add_argument("--precluster-edit-threshold", type=float)
-    parser.add_argument("--precluster-dice-threshold", type=float)
-    parser.add_argument("--precluster-short-threshold", type=float)
+    parser.add_argument("--precluster-similarity-threshold", type=float)
     parser.add_argument("--min-cluster-size", type=int, help="丢弃去重 badcase 数小于等于此值的关键词簇，默认 1；0 表示不丢弃")
     parser.add_argument("--max-examples", type=int, choices=range(1, 11), default=None)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=None, help="复用相同输入/提示词/模型配置的成功调用，重试失败调用")
@@ -413,8 +447,7 @@ def main(argv=None):
                     "concurrency": 16, "timeout": 120, "retries": 2,
                     "max_tokens": 4096, "keyword_batch_size": 10,
                     "max_examples": 10, "min_cluster_size": 1, "resume": False,
-                    "precluster_edit_threshold": 0.8, "precluster_dice_threshold": 0.8,
-                    "precluster_short_threshold": 0.9}
+                    "precluster_similarity_threshold": 0.85}
         allowed = set(defaults) | {"badcases"}
         unknown = set(settings) - allowed
         if unknown:
@@ -443,10 +476,9 @@ def main(argv=None):
         for name in ("concurrency", "retries", "max_tokens", "keyword_batch_size", "max_examples", "min_cluster_size"):
             if type(getattr(args, name)) is not int:
                 raise ValueError(f"{name} 必须是整数")
-        for name in ("precluster_edit_threshold", "precluster_dice_threshold", "precluster_short_threshold"):
-            value = getattr(args, name)
-            if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
-                raise ValueError(f"{name} 必须为 0～1 之间的有限数值")
+        value = args.precluster_similarity_threshold
+        if type(value) not in (int, float) or not math.isfinite(value) or not -1 <= value <= 1:
+            raise ValueError("precluster_similarity_threshold 必须为 -1～1 的有限数值")
         if args.min_cluster_size < 0:
             raise ValueError("min_cluster_size 不能为负")
         if not 1 <= args.max_examples <= 10:
@@ -465,6 +497,25 @@ def main(argv=None):
         for key in ("base_url", "model_name", "api_key"):
             if not isinstance(llm[key], str) or not llm[key].strip():
                 raise ValueError(f"缺少模型配置：{key}")
+        embedding = config.get("embedding", {})
+        if not isinstance(embedding, dict):
+            raise ValueError("embedding 必须为对象")
+        args.embedding = {
+            "base_url": embedding.get("base_url") or os.getenv("EMBEDDING_BASE_URL"),
+            "model_name": embedding.get("model_name") or os.getenv("EMBEDDING_MODEL"),
+            "api_key": embedding.get("api_key") or os.getenv(embedding.get("api_key_env") or "EMBEDDING_API_KEY") or llm["api_key"],
+            "batch_size": embedding.get("batch_size", 32), "concurrency": embedding.get("concurrency", 4),
+            "timeout": embedding.get("timeout", args.timeout), "retries": embedding.get("retries", args.retries)}
+        for name in ("base_url", "model_name", "api_key"):
+            if not isinstance(args.embedding[name], str) or not args.embedding[name].strip():
+                raise ValueError(f"缺少 embedding 配置：{name}")
+        for name in ("batch_size", "concurrency", "retries"):
+            value = args.embedding[name]
+            if type(value) is not int or value < (0 if name == "retries" else 1):
+                raise ValueError(f"embedding.{name} 数值无效")
+        value = args.embedding["timeout"]
+        if type(value) not in (int,float) or not math.isfinite(value) or value <= 0:
+            raise ValueError("embedding.timeout 必须为正有限数值")
         return run(args, llm)
     except KeyboardInterrupt:
         print("\n运行中断。已落盘的调用可通过 --resume 复用。", file=sys.stderr)

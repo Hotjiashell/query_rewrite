@@ -10,7 +10,7 @@
       "results/badcases*.json"
     ],
     "knowledge": "extract_knowledge/existing_knowledge.txt",
-    "cases": null,
+    "cases": "data/case_example.json",
     "dialogues": null,
     "output_dir": "extract_knowledge/outputs/run_001",
     "concurrency": 16,
@@ -22,8 +22,15 @@
     "resume": true,
     "prompts_file": "extract_knowledge/prompts.md",
     "min_cluster_size": 1,
-    "precluster_edit_threshold": 0.8,
-    "precluster_dice_threshold": 0.8,
-    "precluster_short_threshold": 0.9
+    "precluster_similarity_threshold": 0.85
+  },
+  "embedding": {
+    "base_url": "",
+    "model_name": "",
+    "api_key_env": "EMBEDDING_API_KEY",
+    "batch_size": 32,
+    "concurrency": 4,
+    "timeout": 120,
+    "retries": 2
   }
 }

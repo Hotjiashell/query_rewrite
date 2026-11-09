@@ -75,7 +75,7 @@ def validate_partition(result, words):
 
 
 def fuse(clusters, tasks, responses, digest):
-    lookup = {c['keyword']: c for c in clusters}
+    lookup = {c.get('concept', c['keyword']): c for c in clusters}
     partitions = []
     consumed = set()
     for task, response in zip(tasks, responses):
@@ -83,8 +83,8 @@ def fuse(clusters, tasks, responses, digest):
             groups = validate_partition(response['result'], task['keywords'])['groups']
             partitions.extend(groups)
             consumed.update(task['keywords'])
-    partitions.extend({'keyword': c['keyword'], 'keywords': [c['keyword']], 'reason': '保留原簇'}
-                      for c in clusters if c['keyword'] not in consumed)
+    partitions.extend({'keyword': c.get('concept', c['keyword']), 'keywords': [c.get('concept', c['keyword'])], 'reason': '保留原簇'}
+                      for c in clusters if c.get('concept', c['keyword']) not in consumed)
     result = []
     for group in partitions:
         records, evidence = {}, []
@@ -92,7 +92,10 @@ def fuse(clusters, tasks, responses, digest):
             cluster = lookup[word]
             records.update({r['id']: r for r in cluster['records']})
             evidence.extend(cluster['keyword_evidence'])
-        result.append({'keyword': group['keyword'], 'aliases': group['keywords'],
+        representative = lookup[group['keyword']]
+        result.append({'keyword': representative['keyword'], 'desc': representative.get('desc', ''),
+                       'concepts': group['keywords'], 'concept': group['keyword'],
+                       'aliases': list(dict.fromkeys(lookup[word]['keyword'] for word in group['keywords'])),
                        'id': digest(sorted(group['keywords']))[:16], 'records': list(records.values()),
                        'count': len(records), 'gt_case_count': len({r['expected_case_id'] for r in records.values()}),
                        'keyword_evidence': evidence, 'merge_reason': group['reason']})
