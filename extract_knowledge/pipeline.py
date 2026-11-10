@@ -47,7 +47,7 @@ def save(path, value):
 def load_prompts(path):
     """Read editable Markdown sections without formatting literal JSON braces."""
     content = Path(path).read_text(encoding="utf-8")
-    sections = re.split(r"^## (keywords|merge|filter|extract)\s*$", content, flags=re.M)
+    sections = re.split(r"^## (keywords|describe|merge|filter|extract)\s*$", content, flags=re.M)
     templates = {}
     for stage, body in zip(sections[1::2], sections[2::2]):
         if stage in templates:
@@ -55,7 +55,7 @@ def load_prompts(path):
         if body.count("{input}") != 1:
             raise ValueError(f"提示词 {stage} 必须包含且仅包含一个 {{input}} 占位符")
         templates[stage] = body.strip()
-    missing = {"keywords", "merge", "filter", "extract"} - templates.keys()
+    missing = {"keywords", "describe", "merge", "filter", "extract"} - templates.keys()
     if missing:
         raise ValueError(f"提示词文件缺少阶段：{', '.join(sorted(missing))}")
     return templates
@@ -145,14 +145,17 @@ def validate(stage, obj):
         if isinstance(items, str):
             if not text(obj.get("reason")):
                 raise ValueError("关键词需要非空 reason")
-            if items.strip() and not text(obj.get("desc")):
-                raise ValueError("关键词需要非空 desc 描述解释")
-            return {"keywords": [{"keyword": items.strip(), "desc": text(obj.get("desc")), "reason": obj["reason"]}] if items.strip() else []}
+            return {"keywords": [{"keyword": items.strip(), "reason": obj["reason"]}] if items.strip() else []}
         if not isinstance(items, list):
             raise ValueError("keywords 必须为数组")
+        if len(items) > 1:
+            raise ValueError("每个 GT 案例最多抽取一个关键词")
         for item in items:
-            if not isinstance(item, dict) or not text(item.get("keyword")) or not text(item.get("reason")) or not text(item.get("desc")):
-                raise ValueError("每个关键词必须包含非空 keyword / desc / reason")
+            if not isinstance(item, dict) or not text(item.get("keyword")) or not text(item.get("reason")):
+                raise ValueError("每个关键词必须包含非空 keyword / reason")
+    elif stage == "describe":
+        if not text(obj.get("desc")):
+            raise ValueError("描述解释需要非空 desc")
     elif stage == "merge":
         if not isinstance(obj.get("groups"), list):
             raise ValueError("融合结果需要 groups 数组")
@@ -189,11 +192,9 @@ def model_input(stage, data):
         return {name: row[name] for name in ("chat_content", "gt_case_title", "queries")}
 
     if stage == "keywords":
-        records = data["records"]
-        case = records[0] if records else {}
-        return {"gt_case_title": case.get("gt_case_title", ""),
-                "gt_case_content": case.get("gt_case_content", ""),
-                "records": [{name: row[name] for name in ("chat_content", "queries")} for row in records]}
+        return {"gt_case_title": data.get("gt_case_title", "")}
+    if stage == "describe":
+        return {name: data[name] for name in ("gt_case_title", "gt_case_content", "keyword")}
     if stage == "merge":
         return {"keywords": data["keywords"]}
     if stage == "filter":
@@ -307,36 +308,39 @@ def run(args, llm):
     save(out / "02_gt_clusters.json", gt_groups)
     model = Model(args, llm)
     save(out / "prompt_templates.json", model.templates)
-    # One task per GT; stable random sampling keeps resume cache reusable.
-    tasks = []
-    for group in gt_groups:
-        selected = group["records"]
-        if group["count"] > args.keyword_batch_size:
-            rng = random.Random(digest([group["case_id"], selected]))
-            selected = rng.sample(selected, args.keyword_batch_size)
-        tasks.append({"case_id": group["case_id"], "records": selected})
+    tasks = [{"case_id": group["case_id"], "gt_case_title": group["records"][0]["gt_case_title"]}
+             for group in gt_groups]
     save(out / "02_keyword_tasks.json", tasks)
     keyword_results = parallel("keywords", tasks, model, args.concurrency, out / "03_keyword_results.json")
-    clusters = {}
-    rejected = []
+    describe_tasks = []
     for task, response in zip(tasks, keyword_results):
         if response["status"] != "success":
             continue
         for item in response["result"]["keywords"]:
-            keyword = text(item["keyword"])
-            # Title grounding is enforced outside the model as well.
-            matching = [r for r in groups[task["case_id"]] if canonical(keyword) in canonical(r["gt_case_title"])]
-            if not matching:
-                rejected.append({"keyword": keyword, "case_id": task["case_id"], "reason": "关键词未出现在 GT 标题中"})
-                continue
-            key = canonical(keyword)
-            cluster = clusters.setdefault(key, {"keyword": keyword, "records": {}, "descriptions": [], "keyword_evidence": []})
-            if item["desc"] not in cluster["descriptions"]:
-                cluster["descriptions"].append(item["desc"])
-            cluster["keyword_evidence"].append({"case_id": task["case_id"], "desc": item["desc"],
-                                                "dialogue_count": len(matching), "reason": item["reason"]})
-            for row in matching:
-                cluster["records"][row["id"]] = row
+            row = groups[task["case_id"]][0]
+            describe_tasks.append({"case_id": task["case_id"], "keyword": item["keyword"],
+                                   "reason": item["reason"], "gt_case_title": row["gt_case_title"],
+                                   "gt_case_content": row["gt_case_content"]})
+    save(out / "03_description_tasks.json", describe_tasks)
+    description_results = parallel("describe", describe_tasks, model, args.concurrency,
+                                   out / "03_description_results.json")
+    clusters = {}
+    rejected = []
+    for task, response in zip(describe_tasks, description_results):
+        if response["status"] != "success":
+            continue
+        item = {"keyword": task["keyword"], "reason": task["reason"], "desc": response["result"]["desc"]}
+        keyword = text(item["keyword"])
+        # Model wording may differ from the title; associate the whole GT group.
+        matching = groups[task["case_id"]]
+        key = canonical(keyword)
+        cluster = clusters.setdefault(key, {"keyword": keyword, "records": {}, "descriptions": [], "keyword_evidence": []})
+        if item["desc"] not in cluster["descriptions"]:
+            cluster["descriptions"].append(item["desc"])
+        cluster["keyword_evidence"].append({"case_id": task["case_id"], "desc": item["desc"],
+                                            "dialogue_count": len(matching), "reason": item["reason"]})
+        for row in matching:
+            cluster["records"][row["id"]] = row
     ordered = []
     for key, cluster in clusters.items():
         evidence = cluster["keyword_evidence"]
@@ -395,10 +399,10 @@ def run(args, llm):
                             "example_ids": [r["id"] for r in task["examples"]]})
     save(out / "knowledge.json", entries)
     (out / "knowledge.txt").write_text("\n".join(f"{i}. {r['knowledge'].strip()}" for i, r in enumerate(entries, 1)) + "\n", encoding="utf-8")
-    failures = embedding_failures + sum(r["status"] != "success" for r in keyword_results + merged_results + filters + extracted)
+    failures = embedding_failures + sum(r["status"] != "success" for r in keyword_results + description_results + merged_results + filters + extracted)
     summary = {"created_at": datetime.now(timezone.utc).isoformat(), "input_files": paths,
                "record_count": len(records), "input_issue_count": len(issues), "gt_cluster_count": len(groups),
-               "keyword_cluster_count": len(ordered), "covered_cluster_count": len(excluded),
+               "description_task_count": len(describe_tasks), "keyword_cluster_count": len(ordered), "covered_cluster_count": len(excluded),
                "merge_candidate_group_count": len(merge_tasks), "merged_keyword_cluster_count": len(merged),
                "min_cluster_size": args.min_cluster_size, "low_frequency_cluster_count": len(low_frequency),
                "eligible_keyword_cluster_count": len(eligible),

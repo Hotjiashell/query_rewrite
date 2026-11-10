@@ -19,14 +19,14 @@ python3 extract_knowledge/pipeline.py
 | 配置项 | 说明 |
 | --- | --- |
 | `badcases` | 输入路径数组，支持 `results/badcases*.json` 等通配符 |
-| `prompts_file` | 四个阶段共用的提示词文件，默认 `extract_knowledge/prompts.md` |
+| `prompts_file` | 五个阶段共用的提示词文件，默认 `extract_knowledge/prompts.md` |
 | `knowledge` | 只包含已有知识条目的独立文本文件，默认 `extract_knowledge/existing_knowledge.txt` |
 | `cases` / `dialogues` | cases 为案例映射文件，按 GT ID 读取 case_name 和 text 正文；dialogues 为可选的对话补齐文件 |
 | `output_dir` | 各阶段结果和检查点输出目录 |
 | `concurrency` | 每阶段模型调用并发数，默认 16 |
 | `timeout` / `retries` | 单次请求超时秒数、失败后重试次数 |
 | `max_tokens` | 单次模型输出上限，默认 4096 |
-| `keyword_batch_size` | 每个 GT 案例抽取关键词时最多传入的对话数，默认 10；超出时随机抽样 |
+| `keyword_batch_size` | 旧配置兼容项，当前抽词仅传标题、解释仅传案例和关键词，不再使用此参数 |
 | `precluster_similarity_threshold` | embedding 余弦相似度阈值，默认 0.85，范围 -1～1 |
 | `min_cluster_size` | 模型融合后的去重 badcase 数阈值，默认 1；小于等于该值的簇不进入已有知识过滤和知识抽取，0 表示不丢弃 |
 | `max_examples` | 最终抽取时每簇样本数，1～10 |
@@ -56,27 +56,28 @@ python3 -m extract_knowledge --config extract_knowledge/config.production.json
 
 所有模型提示词集中在 [prompts.md](prompts.md) 中，可以直接编辑，无需修改 Python：
 
-- `## keywords`：先分析，再以 JSON 代码块返回单个关键词和依据；复合短语也可作为关键词。无符合项时 keywords 可为空字符串。非空关键词必须同时提供 desc 描述解释。
+- `## keywords`：只传 GT 案例标题，直接以 JSON 代码块返回单个关键词及 reason；复合短语也可作为关键词。无符合项时 keywords 可为空字符串。
+- `## describe`：只传 GT 标题、正文、关键词，返回非空 desc 描述解释。
 - `## merge`：只根据关键词判断同义分组。
 - `## filter`：判断已有知识是否覆盖关键词。
 - `## extract`：生成知识条目和触发条件。
 
-请保留这四个二级标题，每段保留唯一的 `{input}` 占位符。程序只替换该占位符，JSON 示例中的其他大括号不用转义。输出字段名称与类型由程序校验。extract 阶段现在仅需输出 `{"knowledge":"完整知识条目","reason":"抽取依据"}`，不再要求 applicable、keyword、explanation、trigger。可调整措辞、判断规则和示例。
+请保留这五个二级标题，每段保留唯一的 `{input}` 占位符。程序只替换该占位符，JSON 示例中的其他大括号不用转义。输出字段名称与类型由程序校验。extract 阶段现在仅需输出 `{"knowledge":"完整知识条目","reason":"抽取依据"}`，不再要求 applicable、keyword、explanation、trigger。可调整措辞、判断规则和示例。
 
 通过配置的 `extract_knowledge.prompts_file` 可以切换不同版本的提示词文件，也支持 `--prompts-file` 覆盖。每次启动会加载一次提示词，修改后重新运行即可生效。即使开启 `resume`，修改过提示词的阶段也会自动使用新缓存键重新调用；其他阶段输入和提示词未变时继续复用。当前模板快照保存在输出目录的 `prompt_templates.json`，各调用的完整渲染提示词仍保存在 `calls/` 中。
 
 ## 流程与计数
 
 1. 合并输入，以 **GT ID + 完整对话文本** 去重。重复记录合并 query 和来源，避免同一对话在多轮实验中反复失败导致计数膨胀。坏文件/坏记录单独记入 `input_issues.json`，不影响其他文件或记录。缺失对话或标题时可传 `--dialogues data/dialog_example.json`（按 call_sno 匹配）、`--cases data/case_example.json` 补齐。
-2. 按 GT ID 聚类。每个 GT 只生成一个关键词抽取任务，各案例任务并行执行。对话数不超过 `keyword_batch_size`（默认 10）时全部传入；超过时随机抽取指定数量，其余对话不参与关键词抽取。抽样使用由案例和记录内容生成的固定种子，同样输入重复运行可复现并复用缓存。一个 GT 可贡献多个关键词；模型可输出空数组。代码检查关键词确实出现在对应 GT 标题中。
-3. 按关键词聚类，匹配时做 Unicode NFKC、大小写和空白归一化；**不自动合并别名或语义相近的不同词**。一个关键词在某个 GT 案例中被发现后，聚入该 GT 所有标题含该词的去重对话。一条对话可以属于多个关键词簇。
+2. 按 GT ID 聚类。每个 GT 只生成一个关键词抽取任务，各案例任务并行执行。关键词抽取只传标题，不传对话或 query。非空关键词进入独立 describe 阶段，仅传案例标题、正文、关键词生成描述；解释失败记录 partial，跳过该案例，不让无解释词条进入聚类。每个 GT 最多抽取一个关键词；无符合项时输出空字符串。多关键词响应校验失败并重试。程序不做 GT 标题字符串匹配校验，允许模型换一种说法。
+3. 按关键词聚类，匹配时做 Unicode NFKC、大小写和空白归一化；**不自动合并别名或语义相近的不同词**。一个关键词在某个 GT 案例中被发现后，聚入该 GT 的全部去重对话。一条对话可以属于多个关键词簇。
 4. embedding 预聚类和模型融合后，按记录并集重新去重计数，再丢弃去重 badcase 对话数 `count <= min_cluster_size` 的关键词簇（默认阈值 1，即至少 2 条才保留）。这里不是按不同 GT 数 `gt_case_count` 判断。通过数量阈值的簇再并行与全部已有知识比较，由模型判断别名、缩写等覆盖关系。已覆盖的不进入抽取；过滤失败的单独保存，不能当成“未覆盖”。
 5. 对保留簇并行提炼知识。每簇最多 `--max-examples` 条（1～10，默认 10），按 GT 轮询优先覆盖不同 GT。extract 允许先分析再返回 JSON 代码块，必须包含非空 knowledge；reason 为可选字段，兼容旧输出。
 6. 最终按每个关键词簇的**去重对话数**降序排列，相同数量按关键词稳定排序。JSON 同时保留 `gt_case_count`（不同 GT 案例数量）。计数用完整簇，不受最多十条抽样影响。
 
 ## 相似关键词融合
 
-流程顺序为：GT 分组抽词 → 按词聚类 → embedding 语义预聚类 → 模型同义分组 → 合并记录并去重计数 → 数量阈值过滤 → 已有知识过滤 → 抽取知识。
+流程顺序为：GT 分组抽词 → 独立生成解释 → 按词聚类 → embedding 语义预聚类 → 模型同义分组 → 合并记录并去重计数 → 数量阈值过滤 → 已有知识过滤 → 抽取知识。
 
 预聚类现在只使用 embedding 语义相似度，不再使用编辑距离、Dice、短词阈值或字符串长度过滤。将“关键词：描述解释”完整文本发送到独立的 OpenAI-compatible embedding 服务（base_url 为 API 根地址，SDK 请求其 /embeddings 接口）。向量按余弦相似度比较，达到 `extract_knowledge.precluster_similarity_threshold`（默认 0.85）时连边，连通分量形成候选组，再交给 merge 模型判断。阈值越低候选越宽；不同 embedding 模型的分数分布不同，建议查看过程文件后调整。
 
@@ -110,7 +111,8 @@ embedding 分批并行、显示批次进度，检查返回索引、维度和有�
 
 | 阶段 | 实际传入内容 |
 | --- | --- |
-| keywords | 顶层 gt_case_title、gt_case_content 各提供一次；records 数组每条只有 chat_content、queries |
+| keywords | 仅 gt_case_title |
+| describe | 仅 gt_case_title、gt_case_content、keyword |
 | merge | keywords 词条列表，每项是“关键词：描述解释”，无案例、对话、ID、相似度或候选分组说明 |
 | filter | keyword（关键词：描述解释）、desc、aliases、concepts、existing_knowledge |
 | extract | keyword、desc、aliases、concepts、examples 数组，每条只有 chat_content、gt_case_title、queries |
@@ -124,9 +126,10 @@ embedding 输入只含“关键词：描述解释”。记录 ID、GT ID、call_
 | `01_records.json` / `input_issues.json` | 归一化对话、合并后的 query、全部来源，以及输入问题 |
 | `existing_knowledge.json` | 本次已有知识快照 |
 | `02_gt_clusters.json` | GT 聚类及全部记录 |
-| `02_keyword_tasks.json` | 每个 GT 的实际关键词抽取输入，记录抽中的对话 |
+| `02_keyword_tasks.json` | 每个 GT 的关键词抽取任务，模型仅接收标题 |
 | `03_keyword_results.json` | 关键词阶段调用结果 |
-| `04_keyword_clusters.json` / `rejected_keywords.json` | 关键词簇、计数、依据及未通过标题验证的词 |
+| `03_description_tasks.json` / `03_description_results.json` | 独立描述解释任务和结果，调用详情保存在 calls/describe/ |
+| `04_keyword_clusters.json` / `rejected_keywords.json` | 关键词簇、计数、依据；rejected_keywords.json 为兼容旧产物保留，目前为空列表 |
 | `low_frequency_clusters.json` / `04_eligible_keyword_clusters.json` | 模型融合后的低频丢弃簇及原因、通过数量阈值的融合簇；04_keyword_clusters.json 和 04_merged_keyword_clusters.json 分别保留完整原始簇和融合簇 |
 | `05_filter_results.json` | 过滤判断、覆盖条目引用和理由 |
 | `06_retained_clusters.json` | 保留簇 |
@@ -192,6 +195,6 @@ node extract_knowledge/annotation/test_ui.cjs
 
 关键词抽取输入新增 gt_case_content，优先按 GT ID 从 cases 文件的 text 字段读取，也可使用 badcase 自带的 gt_case_content。正文缺失的记录写入 input_issues.json 并跳过，避免无正文推断；请把配置中的 cases 改成实际完整案例库，示例库只用于展示格式。正文不截断，仅用于关键词抽取，后续 extract 样本仍保留原先的对话、标题和 query。
 
-新版关键词结果为 `{"keywords":"关键词","desc":"描述解释","reason":"依据"}`。非空关键词缺失 desc 会重试，旧的不带 desc 的成功缓存会失效并重新请求。同名关键词仍先聚合计数，描述选择关联有效去重对话数最多的 GT 案例所产出的那一份（按抽样前的完整关联对话数比较）；并列最多时随机选一份，使用固定种子保证相同输入可复现，不再拼接。各份描述及其对话数仍保存在 keyword_evidence 中，description_source 记录最终选用的案例及对话数，得到 concept=`关键词：描述解释`。同名多义词目前仍共享一个初始簇，不按含义拆分。
+关键词阶段结果为 `{"keywords":"关键词","reason":"依据"}`；独立 describe 阶段结果为 `{"desc":"描述解释"}`，desc 缺失或为空会重试。两个阶段各自保存检查点并可恢复。同名关键词仍先聚合计数，描述选择关联有效去重对话数最多的 GT 案例所产出的那一份（按抽样前的完整关联对话数比较）；并列最多时随机选一份，使用固定种子保证相同输入可复现，不再拼接。各份描述及其对话数仍保存在 keyword_evidence 中，description_source 记录最终选用的案例及对话数，得到 concept=`关键词：描述解释`。同名多义词目前仍共享一个初始簇，不按含义拆分。
 
 embedding、候选边、merge 输入及分组校验均使用完整 concept；模型必须原样返回完整词条，不可只返回关键词。融合后 keyword / desc 来自模型选择的代表词条，aliases 保留纯关键词，concepts 保存全部参与融合的描述词条。filter 和 extract 可看到 desc 与 concepts，knowledge.json 及人工审核页面也保留并展示描述。来源案例正文可在审核页面展开查看。数量过滤位置和去重计数规则保持不变。

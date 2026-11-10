@@ -11,6 +11,32 @@ from extract_knowledge import pipeline as p
 
 
 class PipelineTests(unittest.TestCase):
+    def test_empty_keyword_skips_description_and_description_failure_is_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, knowledge = root / 'bad.json', root / 'existing.txt'
+            knowledge.write_text('')
+            p.save(source, {'artifact_type': 'badcase_report', 'records': [
+                {'expected_case_id': key, 'chat_content': '对话', 'gt_case_title': key, 'gt_case_content': '正文'}
+                for key in ['empty', 'failed']]})
+            args = argparse.Namespace(output_dir=str(root / 'out'), knowledge=str(knowledge), cases=None,
+                                      dialogues=None, badcases=[str(source)], concurrency=2,
+                                      max_examples=10, min_cluster_size=1, precluster_similarity_threshold=0.85)
+            class FakeModel:
+                identity, templates = {}, {}
+                def __init__(self, *args):
+                    pass
+                def task(self, stage, data):
+                    if stage == 'keywords':
+                        return {'status': 'success', 'result': p.validate('keywords', {
+                            'keywords': '' if data['case_id'] == 'empty' else '内部词', 'reason': '依据'})}
+                    return {'status': 'failed'}
+            with patch.object(p, 'Model', FakeModel), patch.object(p, 'precluster', return_value=([], [], 0)):
+                self.assertEqual(p.run(args, {}), 1)
+            self.assertEqual(len(p.read_json(root / 'out/03_description_tasks.json')), 1)
+            self.assertEqual(p.read_json(root / 'out/04_keyword_clusters.json'), [])
+            self.assertEqual(p.read_json(root / 'out/summary.json')['failed_model_tasks'], 1)
+
     def test_cluster_description_uses_largest_case_and_random_ties(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -26,9 +52,11 @@ class PipelineTests(unittest.TestCase):
                 def __init__(self, *args):
                     pass
                 def task(self, stage, data):
+                    if stage == 'describe':
+                        return {'status': 'success', 'result': {'desc': '描述' + data['case_id'] if data['gt_case_title'] == '内部词' else '企业无线网络'}}
                     if stage == 'keywords':
                         return {'status': 'success', 'result': {'keywords': [
-                            {'keyword': '内部词', 'desc': '描述' + data['case_id'], 'reason': '依据'}]}}
+                            {'keyword': '改写后的内部词', 'desc': '描述' + data['case_id'], 'reason': '依据'}]}}
                     return {'status': 'failed'}
             for counts, allowed in [([1, 3, 2], {'描述B'}), ([1, 3, 3], {'描述B', '描述C'})]:
                 rows = [{'expected_case_id': case_id, 'chat_content': f'对话{i}',
@@ -39,14 +67,15 @@ class PipelineTests(unittest.TestCase):
                     p.run(args, {})
                     cluster = p.read_json(root / 'out/04_keyword_clusters.json')[0]
                     self.assertIn(cluster['desc'], allowed)
-                    self.assertEqual(cluster['concept'], '内部词：' + cluster['desc'])
+                    self.assertEqual(cluster['concept'], '改写后的内部词：' + cluster['desc'])
+                    self.assertEqual(p.read_json(root / 'out/rejected_keywords.json'), [])
                     self.assertEqual(cluster['description_source']['dialogue_count'], 3)
                     self.assertEqual(cluster['count'], sum(counts))
                     self.assertEqual([e['dialogue_count'] for e in cluster['keyword_evidence']], counts)
                     p.run(args, {})
                     self.assertEqual(p.read_json(root / 'out/04_keyword_clusters.json')[0]['desc'], cluster['desc'])
 
-    def test_one_keyword_task_per_case_with_reproducible_sampling(self):
+    def test_one_title_only_keyword_task_per_case(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             rows = [{'expected_case_id': case_id, 'chat_content': f'对话{i}',
@@ -66,14 +95,16 @@ class PipelineTests(unittest.TestCase):
                 def __init__(self, *args):
                     pass
                 def task(self, stage, data):
+                    if stage == 'describe':
+                        return {'status': 'success', 'result': {'desc': '描述' + data['case_id'] if data['gt_case_title'] == '内部词' else '企业无线网络'}}
                     self_test.assertEqual(stage, 'keywords')
                     return {'status': 'failed'}
             self_test = self
             with patch.object(p, 'Model', FakeModel), patch.object(p, 'precluster', return_value=([], [], 0)):
                 p.run(args, {})
                 tasks = p.read_json(root / 'out/02_keyword_tasks.json')
-                self.assertEqual([(t['case_id'], len(t['records'])) for t in tasks], [('large', 10), ('small', 2)])
-                self.assertEqual(len({r['id'] for r in tasks[0]['records']}), 10)
+                self.assertEqual([t['case_id'] for t in tasks], ['large', 'small'])
+                self.assertEqual(p.model_input('keywords', tasks[0]), {'gt_case_title': '内部产品'})
                 self.assertEqual(len(p.read_json(root / 'out/03_keyword_results.json')), 2)
                 self.assertEqual(len(p.read_json(root / 'out/01_records.json')), 27)
                 p.run(args, {})
@@ -96,8 +127,10 @@ class PipelineTests(unittest.TestCase):
                 def __init__(self, *args):
                     pass
                 def task(self, stage, data):
+                    if stage == 'describe':
+                        return {'status': 'success', 'result': {'desc': '描述' + data['case_id'] if data['gt_case_title'] == '内部词' else '企业无线网络'}}
                     if stage == 'keywords':
-                        result = {'keywords': [{'keyword': data['records'][0]['gt_case_title'].split()[0], 'desc': '企业登录产品', 'reason': 'query遗漏'}]}
+                        result = {'keywords': [{'keyword': data['gt_case_title'].split()[0], 'desc': '企业登录产品', 'reason': 'query遗漏'}]}
                     elif stage == 'filter':
                         if data['keyword'] == 'Broken':
                             return {'status': 'failed'}
@@ -163,16 +196,16 @@ class PipelineTests(unittest.TestCase):
                'queries': ['外网无法访问'], 'future_metadata': 'secret-future'}
         expected = {key: row[key] for key in ('chat_content', 'gt_case_title', 'queries')}
         tasks = {
-            'keywords': ({'case_id': 'secret-case', 'records': [row, row]},
-                         {'gt_case_title': row['gt_case_title'], 'gt_case_content': row['gt_case_content'],
-                          'records': [{'chat_content': row['chat_content'], 'queries': row['queries']}] * 2}),
+            'keywords': ({**row, 'records': [row]}, {'gt_case_title': row['gt_case_title']}),
+            'describe': ({**row, 'keyword': 'WebG'},
+                         {'gt_case_title': row['gt_case_title'], 'gt_case_content': row['gt_case_content'], 'keyword': 'WebG'}),
             'merge': ({'keywords': ['华为wifi', '华为wi-fi'], 'source': '/secret/path'},
                       {'keywords': ['华为wifi', '华为wi-fi']}),
             'filter': ({'keyword': 'WebG', 'desc': '外网网关', 'existing_knowledge': '已有条目', 'source': '/secret/path'},
                        {'keyword': 'WebG：外网网关', 'desc': '外网网关', 'existing_knowledge': '已有条目'}),
             'extract': ({'cluster_id': 'secret-cluster', 'keyword': 'WebG', 'desc': '外网网关', 'examples': [row]},
                         {'keyword': 'WebG', 'desc': '外网网关', 'examples': [expected]})}
-        outputs = {'keywords': {'keywords': []},
+        outputs = {'keywords': {'keywords': []}, 'describe': {'desc': '外网网关'},
                    'merge': {'groups': [{'keyword': '华为wifi', 'keywords': ['华为wifi', '华为wi-fi'], 'reason': '同义'}]},
                    'filter': {'covered': False, 'reason': '未覆盖'},
                    'extract': {'knowledge': 'WebG：外网访问时考虑', 'reason': '依据'}}
@@ -252,9 +285,11 @@ class PipelineTests(unittest.TestCase):
                 def __init__(self, *args):
                     pass
                 def task(self, stage, data):
+                    if stage == 'describe':
+                        return {'status': 'success', 'result': {'desc': '描述' + data['case_id'] if data['gt_case_title'] == '内部词' else '企业无线网络'}}
                     stages.append(stage)
                     if stage == 'keywords':
-                        result = {'keywords': [{'keyword': data['records'][0]['gt_case_title'], 'desc': '企业无线网络', 'reason': '遗漏'}]}
+                        result = {'keywords': [{'keyword': data['gt_case_title'], 'desc': '企业无线网络', 'reason': '遗漏'}]}
                     elif stage == 'filter':
                         result = {'covered': False, 'reason': '无已有知识'}
                     elif stage == 'extract':
@@ -275,6 +310,12 @@ class PipelineTests(unittest.TestCase):
 
     def test_single_keyword_analysis_and_semantic_candidates(self):
         from .embedding import semantic_groups, vectors_valid
+        direct = '```json\n{"keywords":"内部软件的权限", "desc":"内部权限功能", "reason":"标题包含"}\n```'
+        self.assertEqual(p.parse_result('keywords', direct, {})['keywords'][0]['keyword'], '内部软件的权限')
+        with self.assertRaisesRegex(ValueError, '最多抽取一个'):
+            p.validate('keywords', {'keywords': [
+                {'keyword': '词A', 'desc': '解释A', 'reason': '依据A'},
+                {'keyword': '词B', 'desc': '解释B', 'reason': '依据B'}]})
         result = p.parse_result('keywords', '分析文字\n```json\n{"keywords":"内部产品", "desc":"企业内部产品描述", "reason":"依据"}\n```', {})
         self.assertEqual(result['keywords'][0]['keyword'], '内部产品')
         self.assertEqual(p.validate('keywords', {'keywords':'', 'reason':'无符合项'}), {'keywords':[]})
@@ -330,10 +371,10 @@ class PipelineTests(unittest.TestCase):
                 {'expected_case_id':'GT','chat_content':'用户对话','query':'query'}]})
             rows,issues = p.load_records([source], {'GT':{'case_name':'内部词标题','text':'内部系统正文'}})
             self.assertEqual(issues,[])
-            self.assertEqual(p.model_input('keywords',{'records':rows})['gt_case_content'],'内部系统正文')
+            self.assertEqual(p.model_input('describe',{**rows[0], 'keyword':'内部词'})['gt_case_content'],'内部系统正文')
             self.assertEqual(len(p.load_records([source], {'GT':{'case_name':'标题'}})[1]),1)
         with self.assertRaises(ValueError):
-            p.validate('keywords',{'keywords':'内部词','reason':'依据'})
+            p.validate('describe',{'desc':''})
         clusters=[{'keyword':w,'desc':d,'concept':w+'：'+d,'records':[{'id':str(i),'expected_case_id':str(i)}],
                    'keyword_evidence':[]} for i,(w,d) in enumerate([('内部A','外网网关'),('内部B','网络出口')])]
         groups,_=semantic_groups(clusters,[[1,0],[1,0]],0.9)
