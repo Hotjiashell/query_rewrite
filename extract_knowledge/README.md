@@ -198,3 +198,16 @@ node extract_knowledge/annotation/test_ui.cjs
 关键词阶段结果为 `{"keywords":"关键词","reason":"依据"}`；独立 describe 阶段结果为 `{"desc":"描述解释"}`，desc 缺失或为空会重试。两个阶段各自保存检查点并可恢复。同名关键词仍先聚合计数，描述选择关联有效去重对话数最多的 GT 案例所产出的那一份（按抽样前的完整关联对话数比较）；并列最多时随机选一份，使用固定种子保证相同输入可复现，不再拼接。各份描述及其对话数仍保存在 keyword_evidence 中，description_source 记录最终选用的案例及对话数，得到 concept=`关键词：描述解释`。同名多义词目前仍共享一个初始簇，不按含义拆分。
 
 embedding、候选边、merge 输入及分组校验均使用完整 concept；模型必须原样返回完整词条，不可只返回关键词。融合后 keyword / desc 来自模型选择的代表词条，aliases 保留纯关键词，concepts 保存全部参与融合的描述词条。filter 和 extract 可看到 desc 与 concepts，knowledge.json 及人工审核页面也保留并展示描述。来源案例正文可在审核页面展开查看。数量过滤位置和去重计数规则保持不变。
+
+## 根据知识生成评估提示词
+
+```bash
+python3 -m extract_knowledge.build_eval_prompt \
+  extract_knowledge/outputs/run_001 \
+  extract_knowledge/eval_prompt_template.txt \
+  20
+```
+
+三个参数依次为 run 输出目录、模板路径、新知识数量 k。读取 run 中 `existing_knowledge.json` 的 content 快照作为全部已有知识，再按 `knowledge.json` 的原有顺序追加前 k 条 knowledge，统一编号成每行 `1. 内容`，替换模板中的 `{knowledge}`，写入 run 目录的 `final_prompt.txt`。不会读取人工标注的 final_knowledge，也不会读取当前可能已修改的 existing_knowledge.txt。原有编号会去除后重排；已有知识每个非空行视为一条。
+
+k 必须是非负整数；k=0 时只放已有知识，超过新知识总数时使用全部新知识。模板中的其他大括号保持原样。输入无效时输出错误并返回退出码 2，不覆盖已有 final_prompt.txt；成功时原子替换该文件。

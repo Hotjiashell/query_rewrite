@@ -1,0 +1,7 @@
+你是企业内部客服，你需要参考以下知识生成query。
+{knowledge}
+先分析然后生成query，格式为：
+...(anlysis)
+{
+    "query": ...
+}
