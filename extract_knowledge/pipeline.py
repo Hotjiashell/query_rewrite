@@ -192,7 +192,9 @@ def model_input(stage, data):
         return {name: row[name] for name in ("chat_content", "gt_case_title", "queries")}
 
     if stage == "keywords":
-        return {"gt_case_title": data.get("gt_case_title", "")}
+        return {"gt_case_title": data.get("gt_case_title", ""),
+                "records": [{name: row[name] for name in ("chat_content", "queries")}
+                            for row in data.get("records", [])]}
     if stage == "describe":
         return {name: data[name] for name in ("gt_case_title", "gt_case_content", "keyword")}
     if stage == "merge":
@@ -308,8 +310,13 @@ def run(args, llm):
     save(out / "02_gt_clusters.json", gt_groups)
     model = Model(args, llm)
     save(out / "prompt_templates.json", model.templates)
-    tasks = [{"case_id": group["case_id"], "gt_case_title": group["records"][0]["gt_case_title"]}
-             for group in gt_groups]
+    tasks = []
+    for group in gt_groups:
+        selected = group["records"]
+        if len(selected) > args.keyword_batch_size:
+            selected = random.Random(digest([group["case_id"], selected])).sample(selected, args.keyword_batch_size)
+        tasks.append({"case_id": group["case_id"], "gt_case_title": group["records"][0]["gt_case_title"],
+                      "records": selected})
     save(out / "02_keyword_tasks.json", tasks)
     keyword_results = parallel("keywords", tasks, model, args.concurrency, out / "03_keyword_results.json")
     describe_tasks = []

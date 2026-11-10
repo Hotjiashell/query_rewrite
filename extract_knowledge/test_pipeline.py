@@ -20,7 +20,7 @@ class PipelineTests(unittest.TestCase):
                 {'expected_case_id': key, 'chat_content': '对话', 'gt_case_title': key, 'gt_case_content': '正文'}
                 for key in ['empty', 'failed']]})
             args = argparse.Namespace(output_dir=str(root / 'out'), knowledge=str(knowledge), cases=None,
-                                      dialogues=None, badcases=[str(source)], concurrency=2,
+                                      dialogues=None, badcases=[str(source)], keyword_batch_size=10, concurrency=2,
                                       max_examples=10, min_cluster_size=1, precluster_similarity_threshold=0.85)
             class FakeModel:
                 identity, templates = {}, {}
@@ -75,7 +75,7 @@ class PipelineTests(unittest.TestCase):
                     p.run(args, {})
                     self.assertEqual(p.read_json(root / 'out/04_keyword_clusters.json')[0]['desc'], cluster['desc'])
 
-    def test_one_title_only_keyword_task_per_case(self):
+    def test_one_keyword_task_per_case_with_sampled_dialogues(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             rows = [{'expected_case_id': case_id, 'chat_content': f'对话{i}',
@@ -104,7 +104,11 @@ class PipelineTests(unittest.TestCase):
                 p.run(args, {})
                 tasks = p.read_json(root / 'out/02_keyword_tasks.json')
                 self.assertEqual([t['case_id'] for t in tasks], ['large', 'small'])
-                self.assertEqual(p.model_input('keywords', tasks[0]), {'gt_case_title': '内部产品'})
+                payload = p.model_input('keywords', tasks[0])
+                self.assertEqual(payload['gt_case_title'], '内部产品')
+                self.assertEqual([len(t['records']) for t in tasks], [10, 2])
+                self.assertEqual(set(payload['records'][0]), {'chat_content', 'queries'})
+                self.assertNotIn('gt_case_content', payload)
                 self.assertEqual(len(p.read_json(root / 'out/03_keyword_results.json')), 2)
                 self.assertEqual(len(p.read_json(root / 'out/01_records.json')), 27)
                 p.run(args, {})
@@ -196,7 +200,8 @@ class PipelineTests(unittest.TestCase):
                'queries': ['外网无法访问'], 'future_metadata': 'secret-future'}
         expected = {key: row[key] for key in ('chat_content', 'gt_case_title', 'queries')}
         tasks = {
-            'keywords': ({**row, 'records': [row]}, {'gt_case_title': row['gt_case_title']}),
+            'keywords': ({**row, 'records': [row]}, {'gt_case_title': row['gt_case_title'],
+                'records': [{'chat_content': row['chat_content'], 'queries': row['queries']}]}),
             'describe': ({**row, 'keyword': 'WebG'},
                          {'gt_case_title': row['gt_case_title'], 'gt_case_content': row['gt_case_content'], 'keyword': 'WebG'}),
             'merge': ({'keywords': ['华为wifi', '华为wi-fi'], 'source': '/secret/path'},

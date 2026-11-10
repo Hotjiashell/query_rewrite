@@ -26,7 +26,7 @@ python3 extract_knowledge/pipeline.py
 | `concurrency` | 每阶段模型调用并发数，默认 16 |
 | `timeout` / `retries` | 单次请求超时秒数、失败后重试次数 |
 | `max_tokens` | 单次模型输出上限，默认 4096 |
-| `keyword_batch_size` | 旧配置兼容项，当前抽词仅传标题、解释仅传案例和关键词，不再使用此参数 |
+| `keyword_batch_size` | 每个 GT 案例抽词时最多传入的对话数，默认 10；超出时随机抽样，相同输入可复现 |
 | `precluster_similarity_threshold` | embedding 余弦相似度阈值，默认 0.85，范围 -1～1 |
 | `min_cluster_size` | 模型融合后的去重 badcase 数阈值，默认 1；小于等于该值的簇不进入已有知识过滤和知识抽取，0 表示不丢弃 |
 | `max_examples` | 最终抽取时每簇样本数，1～10 |
@@ -56,7 +56,7 @@ python3 -m extract_knowledge --config extract_knowledge/config.production.json
 
 所有模型提示词集中在 [prompts.md](prompts.md) 中，可以直接编辑，无需修改 Python：
 
-- `## keywords`：只传 GT 案例标题，直接以 JSON 代码块返回单个关键词及 reason；复合短语也可作为关键词。无符合项时 keywords 可为空字符串。
+- `## keywords`：传 GT 案例标题、对话和 queries，不传案例正文，直接以 JSON 代码块返回单个关键词及 reason；复合短语也可作为关键词。无符合项时 keywords 可为空字符串。
 - `## describe`：只传 GT 标题、正文、关键词，返回非空 desc 描述解释。
 - `## merge`：只根据关键词判断同义分组。
 - `## filter`：判断已有知识是否覆盖关键词。
@@ -69,7 +69,7 @@ python3 -m extract_knowledge --config extract_knowledge/config.production.json
 ## 流程与计数
 
 1. 合并输入，以 **GT ID + 完整对话文本** 去重。重复记录合并 query 和来源，避免同一对话在多轮实验中反复失败导致计数膨胀。坏文件/坏记录单独记入 `input_issues.json`，不影响其他文件或记录。缺失对话或标题时可传 `--dialogues data/dialog_example.json`（按 call_sno 匹配）、`--cases data/case_example.json` 补齐。
-2. 按 GT ID 聚类。每个 GT 只生成一个关键词抽取任务，各案例任务并行执行。关键词抽取只传标题，不传对话或 query。非空关键词进入独立 describe 阶段，仅传案例标题、正文、关键词生成描述；解释失败记录 partial，跳过该案例，不让无解释词条进入聚类。每个 GT 最多抽取一个关键词；无符合项时输出空字符串。多关键词响应校验失败并重试。程序不做 GT 标题字符串匹配校验，允许模型换一种说法。
+2. 按 GT ID 聚类。每个 GT 只生成一个关键词抽取任务，各案例任务并行执行。关键词抽取传入标题、对话及 queries；对话超过 keyword_batch_size 时随机抽取指定数量，同样输入可复现。非空关键词进入独立 describe 阶段，仅传案例标题、正文、关键词生成描述；解释失败记录 partial，跳过该案例，不让无解释词条进入聚类。每个 GT 最多抽取一个关键词；无符合项时输出空字符串。多关键词响应校验失败并重试。程序不做 GT 标题字符串匹配校验，允许模型换一种说法。
 3. 按关键词聚类，匹配时做 Unicode NFKC、大小写和空白归一化；**不自动合并别名或语义相近的不同词**。一个关键词在某个 GT 案例中被发现后，聚入该 GT 的全部去重对话。一条对话可以属于多个关键词簇。
 4. embedding 预聚类和模型融合后，按记录并集重新去重计数，再丢弃去重 badcase 对话数 `count <= min_cluster_size` 的关键词簇（默认阈值 1，即至少 2 条才保留）。这里不是按不同 GT 数 `gt_case_count` 判断。通过数量阈值的簇再并行与全部已有知识比较，由模型判断别名、缩写等覆盖关系。已覆盖的不进入抽取；过滤失败的单独保存，不能当成“未覆盖”。
 5. 对保留簇并行提炼知识。每簇最多 `--max-examples` 条（1～10，默认 10），按 GT 轮询优先覆盖不同 GT。extract 允许先分析再返回 JSON 代码块，必须包含非空 knowledge；reason 为可选字段，兼容旧输出。
@@ -111,7 +111,7 @@ embedding 分批并行、显示批次进度，检查返回索引、维度和有�
 
 | 阶段 | 实际传入内容 |
 | --- | --- |
-| keywords | 仅 gt_case_title |
+| keywords | 顶层 gt_case_title；records 每条只有 chat_content、queries，不传案例正文 |
 | describe | 仅 gt_case_title、gt_case_content、keyword |
 | merge | keywords 词条列表，每项是“关键词：描述解释”，无案例、对话、ID、相似度或候选分组说明 |
 | filter | keyword（关键词：描述解释）、desc、aliases、concepts、existing_knowledge |
@@ -126,7 +126,7 @@ embedding 输入只含“关键词：描述解释”。记录 ID、GT ID、call_
 | `01_records.json` / `input_issues.json` | 归一化对话、合并后的 query、全部来源，以及输入问题 |
 | `existing_knowledge.json` | 本次已有知识快照 |
 | `02_gt_clusters.json` | GT 聚类及全部记录 |
-| `02_keyword_tasks.json` | 每个 GT 的关键词抽取任务，模型仅接收标题 |
+| `02_keyword_tasks.json` | 每个 GT 的关键词抽取任务及抽中的对话 |
 | `03_keyword_results.json` | 关键词阶段调用结果 |
 | `03_description_tasks.json` / `03_description_results.json` | 独立描述解释任务和结果，调用详情保存在 calls/describe/ |
 | `04_keyword_clusters.json` / `rejected_keywords.json` | 关键词簇、计数、依据；rejected_keywords.json 为兼容旧产物保留，目前为空列表 |
