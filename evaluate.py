@@ -1019,6 +1019,10 @@ def parse_args(
     parser.add_argument("--config", default="config.json", help="Run configuration JSON (default: config.json)")
     parser.add_argument("--input", help="Override the current stage input path")
     parser.add_argument("--output", help="Override the current stage output path")
+    parser.add_argument(
+        "--retry-errors", metavar="RESULT_JSON",
+        help="In retrieve mode, retry retrieval errors from this previous result and merge all records",
+    )
     parser.add_argument("--concurrency", type=int, help="Override the current stage concurrency")
     parser.add_argument("--query-input", help="Override query_generation.input_path in all mode")
     parser.add_argument("--query-output", help="Override query_generation.output_path in all mode")
@@ -1066,6 +1070,8 @@ def parse_args(
     args = parser.parse_args(argv)
     if forced_stage is not None:
         args.stage = forced_stage
+    if args.retry_errors and args.stage != "retrieve":
+        parser.error("--retry-errors is only supported in retrieve mode")
     return args
 
 
@@ -1099,15 +1105,39 @@ def _run_generate(args: argparse.Namespace) -> int:
 
 def _run_retrieve(args: argparse.Namespace) -> int:
     config = resolve_retrieval_config(args)
+    queries = load_generated_query_records(config.input_path)
+    previous_records = None
+    if getattr(args, "retry_errors", None):
+        previous = _load_json(args.retry_errors, "previous retrieval result")
+        if not isinstance(previous, Mapping) or previous.get("artifact_type") != RETRIEVAL_ARTIFACT_TYPE:
+            raise ValueError("--retry-errors requires a retrieval evaluation artifact")
+        previous_records = previous.get("records")
+        if not isinstance(previous_records, list) or any(not isinstance(r, Mapping) for r in previous_records):
+            raise ValueError("previous retrieval records must be an array of objects")
+        query_by_index = {q.sample_index: q for q in queries}
+        indices = [r.get("sample_index") for r in previous_records]
+        if len(set(indices)) != len(indices) or len(query_by_index) != len(queries) or set(indices) != set(query_by_index):
+            raise ValueError("previous results and query input must have matching unique sample indices")
+        for record in previous_records:
+            query = query_by_index[record["sample_index"]]
+            if any(record.get(key) != getattr(query, key) for key in ("query", "queries", "expected_case_id", "call_sno")):
+                raise ValueError(f"previous result differs from query input for sample {query.sample_index}")
+        queries = [query_by_index[r["sample_index"]] for r in previous_records
+                   if r.get("retrieval_status") in ("failed", "partial_success")
+                   or (r.get("retrieval_error") and r.get("retrieval_status") != "skipped")]
+        print(f"Retrying retrieval errors: {len(queries)}/{len(previous_records)} samples")
     records = RetrievalEvaluator(
         SearchRetriever(config.url, config.timeout),
         fusion_method=config.fusion_method,
         top_k=config.top_k,
     ).evaluate(
-        load_generated_query_records(config.input_path),
+        queries,
         concurrency=config.concurrency,
         progress=True,
     )
+    if previous_records is not None:
+        replacements = {r["sample_index"]: r for r in records}
+        records = [replacements.get(r["sample_index"], r) for r in previous_records]
     artifact = build_retrieval_artifact(
         records,
         input_path=config.input_path,
