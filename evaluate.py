@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -1023,6 +1025,7 @@ def parse_args(
         "--retry-errors", metavar="RESULT_JSON",
         help="In retrieve mode, retry retrieval errors from this previous result and merge all records",
     )
+    parser.add_argument("--internal-time", type=float, help="Wait this many seconds between retrieval-error retries until none remain (retrieve/all)")
     parser.add_argument("--concurrency", type=int, help="Override the current stage concurrency")
     parser.add_argument("--query-input", help="Override query_generation.input_path in all mode")
     parser.add_argument("--query-output", help="Override query_generation.output_path in all mode")
@@ -1072,6 +1075,11 @@ def parse_args(
         args.stage = forced_stage
     if args.retry_errors and args.stage != "retrieve":
         parser.error("--retry-errors is only supported in retrieve mode")
+    if args.internal_time is not None:
+        if args.stage not in ("retrieve", "all"):
+            parser.error("--internal-time is only supported in retrieve/all mode")
+        if not math.isfinite(args.internal_time) or args.internal_time <= 0:
+            parser.error("--internal-time must be a finite number greater than zero")
     return args
 
 
@@ -1249,6 +1257,37 @@ def _run_all(args: argparse.Namespace) -> int:
     return 0
 
 
+def _retry_until_success(args: argparse.Namespace) -> int:
+    """Retry only retrieval errors, persisting merged results after every round."""
+    retry_args = argparse.Namespace(**vars(args))
+    retry_args.stage = "retrieve"
+    if args.stage == "all":
+        generation_args = argparse.Namespace(**vars(args))
+        generation_args.input = args.query_input if args.query_input is not None else args.input
+        generation_args.output = args.query_output
+        generation_args.concurrency = args.query_concurrency if args.query_concurrency is not None else args.concurrency
+        generation = resolve_query_generation_config(generation_args)
+        retry_args.input = args.retrieval_input
+        retry_args.output = args.retrieval_output if args.retrieval_output is not None else args.output
+        retry_args.concurrency = args.retrieval_concurrency if args.retrieval_concurrency is not None else args.concurrency
+        config = resolve_retrieval_config(retry_args)
+        retry_args.input = generation.output_path
+    config = resolve_retrieval_config(retry_args)
+    retry_args.retry_errors = config.output_path
+    while True:
+        artifact = _load_json(config.output_path, "retrieval result")
+        pending = sum(record.get("retrieval_status") in ("failed", "partial_success")
+                      or bool(record.get("retrieval_error") and record.get("retrieval_status") != "skipped")
+                      for record in artifact["records"])
+        if not pending:
+            print("No retrieval errors remain.", flush=True)
+            return 0
+        print(f"{pending} samples have retrieval errors; retrying in {args.internal_time:g} seconds.", flush=True)
+        time.sleep(args.internal_time)
+        _run_retrieve(retry_args)
+
+
+
 def main(argv: Sequence[str] | None = None, *, forced_stage: str | None = None) -> int:
     args = parse_args(argv, forced_stage=forced_stage)
     try:
@@ -1256,9 +1295,10 @@ def main(argv: Sequence[str] | None = None, *, forced_stage: str | None = None) 
             return _run_metrics(args)
         if args.stage == "generate":
             return _run_generate(args)
-        if args.stage == "retrieve":
-            return _run_retrieve(args)
-        return _run_all(args)
+        result = _run_retrieve(args) if args.stage == "retrieve" else _run_all(args)
+        if result or args.internal_time is None:
+            return result
+        return _retry_until_success(args)
     except (ValueError, RuntimeError) as exc:
         print(f"{args.stage.capitalize()} stage failed to start or save results: {exc}", file=sys.stderr)
         return 2

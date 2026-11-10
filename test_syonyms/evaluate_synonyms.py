@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import math
+import time
 from dataclasses import replace
 from pathlib import Path
 import re
@@ -24,9 +26,8 @@ def load_synonyms(path):
         if len(fields) != 2 or not all(field.strip() for field in fields):
             raise ValueError(f"{path}:{number}: expected 原词, 同义词")
         source, target = (field.strip() for field in fields)
-        if source in pairs and pairs[source] != target:
-            raise ValueError(f"{path}:{number}: conflicting synonym for {source}")
-        pairs[source] = target
+        # Keep the first mapping in file order for duplicate source terms.
+        pairs.setdefault(source, target)
     return pairs
 
 
@@ -42,11 +43,49 @@ def render_suffix(dialogue, pairs, template):
     return template.replace("{syonyms_list}", "\n".join(matched)).replace("{}", "\n".join(matched)) if matched else ""
 
 
+def run_with_retries(argv, interval=None):
+    args = base.parse_args(argv)
+    if interval is not None and (not math.isfinite(interval) or interval <= 0):
+        raise ValueError("--internal-time must be a finite number greater than zero")
+    if interval is not None and args.stage not in ("retrieve", "all"):
+        raise ValueError("--internal-time requires retrieve or all")
+    result = base.main(argv)
+    if result or interval is None:
+        return result
+    retry_args = argparse.Namespace(**vars(args))
+    retry_args.stage = "retrieve"
+    if args.stage == "all":
+        generation_args = argparse.Namespace(**vars(args))
+        generation_args.input = args.query_input if args.query_input is not None else args.input
+        generation_args.output = args.query_output
+        generation_args.concurrency = args.query_concurrency if args.query_concurrency is not None else args.concurrency
+        generation = base.resolve_query_generation_config(generation_args)
+        retry_args.input = args.retrieval_input
+        retry_args.output = args.retrieval_output if args.retrieval_output is not None else args.output
+        retry_args.concurrency = args.retrieval_concurrency if args.retrieval_concurrency is not None else args.concurrency
+        config = base.resolve_retrieval_config(retry_args)
+        retry_args.input = generation.output_path
+    config = base.resolve_retrieval_config(retry_args)
+    retry_args.retry_errors = config.output_path
+    while True:
+        artifact = base._load_json(config.output_path, "retrieval result")
+        pending = sum(record.get("retrieval_status") in ("failed", "partial_success")
+                      or bool(record.get("retrieval_error") and record.get("retrieval_status") != "skipped")
+                      for record in artifact["records"])
+        if not pending:
+            print("No retrieval errors remain.", flush=True)
+            return 0
+        print(f"{pending} samples have retrieval errors; retrying in {interval:g} seconds.", flush=True)
+        time.sleep(interval)
+        base._run_retrieve(retry_args)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--synonym-mode", choices=("replace", "prompt"), required=True)
     parser.add_argument("--synonyms", default=str(HERE / "syonyms.txt"))
     parser.add_argument("--synonym-prompt", default=str(HERE / "prompt_template.txt"))
+    parser.add_argument("--internal-time", type=float, help="Seconds to wait between retrieval-error retries")
     options, remaining = parser.parse_known_args(argv)
     original_factory = base.create_query_generator
     original_loader = base.load_generated_query_records
@@ -73,8 +112,8 @@ def main(argv=None):
                 generator._render_prompt = MethodType(render, generator)
                 return generator
             base.create_query_generator = factory
-        return base.main(remaining)
-    except (ValueError, OSError) as exc:
+        return run_with_retries(remaining, options.internal_time)
+    except (ValueError, OSError, RuntimeError) as exc:
         print(f"Synonym evaluation failed: {exc}", file=sys.stderr)
         return 2
     finally:
