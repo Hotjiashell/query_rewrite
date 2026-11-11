@@ -102,6 +102,12 @@ def _hit_at(record: Mapping[str, Any] | None, cutoff: int) -> bool:
     return isinstance(rank, int) and not isinstance(rank, bool) and 1 <= rank <= cutoff
 
 
+def _normalise_per_query_traces(raw_traces: Any) -> list[list[dict[str, Any]]]:
+    if not isinstance(raw_traces, list):
+        return []
+    return [_normalise_trace(trace) for trace in raw_traces]
+
+
 def _safe_record(record: Mapping[str, Any] | None, cutoff: int) -> dict[str, Any]:
     """Copy only fields useful for comparing two methods."""
 
@@ -115,6 +121,9 @@ def _safe_record(record: Mapping[str, Any] | None, cutoff: int) -> dict[str, Any
             "matched_rank": None,
             "hit": False,
             "retrieval_trace": [],
+            "queries": [],
+            "per_query_traces": [],
+            "union_matched_rank": None,
         }
     return {
         "present": True,
@@ -130,6 +139,12 @@ def _safe_record(record: Mapping[str, Any] | None, cutoff: int) -> dict[str, Any
         else None,
         "hit": _hit_at(record, cutoff),
         "retrieval_trace": _normalise_trace(record.get("retrieval_trace")),
+        "queries": [q for q in record.get("queries", []) if isinstance(q, str)]
+        if isinstance(record.get("queries"), list) else [],
+        "per_query_traces": _normalise_per_query_traces(record.get("per_query_traces")),
+        "union_matched_rank": record.get("union_matched_rank")
+        if isinstance(record.get("union_matched_rank"), int)
+        and not isinstance(record.get("union_matched_rank"), bool) else None,
     }
 
 
