@@ -49,5 +49,13 @@
     "model_name": "",
     "api_key_env": "OPENAI_API_KEY",
     "temperature": 0
+  },
+  "research": {
+    "enabled": false,
+    "top_k": 5,
+    "max_searches": 3,
+    "min_dialogues": 10,
+    "concurrency": 4,
+    "timeout": 30
   }
 }

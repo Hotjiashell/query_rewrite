@@ -91,7 +91,7 @@ def refine(entries, clusters, model, reviewer, settings, existing, save, out, re
             examples = [{'chat_content': row['chat_content'], 'gt_case_title': row['gt_case_title'],
                          'queries': by_id[row['id']].get('queries', []) if tests else row.get('queries', [])}
                         for row in selected_examples]
-            revision_input = {'keyword': cluster['keyword'], 'desc': cluster['desc'],
+            revision_input = {**{k: cluster[k] for k in ('relations', 'relation_members') if k in cluster}, 'keyword': cluster['keyword'], 'desc': cluster['desc'],
                               'knowledge': current['knowledge'], 'existing_knowledge': existing,
                               'examples': examples, 'retrieval_failures': misses}
             if not review['result']['approved']:

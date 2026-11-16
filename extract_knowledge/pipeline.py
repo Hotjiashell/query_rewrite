@@ -49,7 +49,7 @@ def save(path, value):
 def load_prompts(path):
     """Read editable Markdown sections without formatting literal JSON braces."""
     content = Path(path).read_text(encoding="utf-8")
-    sections = re.split(r"^## (keywords|describe|merge|filter|extract|feedback_review|feedback_revise)\s*$", content, flags=re.M)
+    sections = re.split(r"^## (keywords|describe|merge|filter|extract|feedback_review|feedback_revise|research)\s*$", content, flags=re.M)
     templates = {}
     for stage, body in zip(sections[1::2], sections[2::2]):
         if stage in templates:
@@ -142,7 +142,19 @@ def load_records(paths, cases=None, dialogues=None):
 def validate(stage, obj):
     if not isinstance(obj, dict):
         raise ValueError("模型必须输出 JSON 对象")
-    if stage == "feedback_query":
+    if stage == "research":
+        if obj.get("action") == "search":
+            if not text(obj.get("query")):
+                raise ValueError("research search 需要 query")
+        elif obj.get("action") == "summarize":
+            if not text(obj.get("desc")) or not isinstance(obj.get("relations"), list):
+                raise ValueError("research summarize 需要 desc 和 relations")
+            for r in obj['relations']:
+                if not isinstance(r, dict) or any(not text(r.get(k)) for k in ('source', 'target', 'description')):
+                    raise ValueError("关联需要 source/target/description")
+        else:
+            raise ValueError("research action 必须为 search/summarize")
+    elif stage == "feedback_query":
         queries = obj.get("queries")
         if not isinstance(queries, list) or not 1 <= len(queries) <= 3 or any(not text(q) for q in queries):
             raise ValueError("queries 需要1～3条非空字符串")
@@ -184,7 +196,7 @@ def validate(stage, obj):
 
 def parse_result(stage, raw, data):
     """Stages permitting analysis use the last fenced JSON as the final answer."""
-    if stage in ("keywords", "merge", "extract", "feedback_query", "feedback_review", "feedback_revise"):
+    if stage in ("keywords", "merge", "extract", "feedback_query", "feedback_review", "feedback_revise", "research"):
         blocks = re.findall(r"```(?:json)?[ \t]*\r?\n(.*?)```", raw, flags=re.I | re.S)
         content = blocks[-1].strip() if blocks else raw.strip()
     else:
@@ -193,6 +205,13 @@ def parse_result(stage, raw, data):
         from gen_query import extract_queries
         return validate(stage, {"queries": extract_queries(raw)})
     result = validate(stage, json.loads(content))
+    if stage == "research":
+        if result['action'] == 'search' and not data['can_search']:
+            raise ValueError('调研预算耗尽，必须 summarize')
+        known = {canonical(w) for w in data['known_keywords']}
+        for r in result.get('relations', []):
+            if canonical(r['source']) != canonical(data['keyword']) or canonical(r['target']) not in known or canonical(r['source']) == canonical(r['target']):
+                raise ValueError('关联 source 须为当前词，target 须为其他已抽取关键词')
     if stage == "merge":
         validate_partition(result, data["keywords"])
     return result
@@ -203,11 +222,15 @@ def model_input(stage, data):
     def example(row):
         return {name: row[name] for name in ("chat_content", "gt_case_title", "queries")}
 
+    if stage == "research":
+        return {'keyword': data['keyword'], 'known_keywords': data['known_keywords'],
+                'cases': [{k: c[k] for k in ('title', 'content')} for c in data['cases']],
+                'previous_queries': data['previous_queries'], 'can_search': data['can_search']}
     if stage.startswith("feedback_"):
         fields = {
             "feedback_query": ("knowledge", "chat_content"),
             "feedback_review": ("knowledge", "examples"),
-            "feedback_revise": ("keyword", "desc", "knowledge", "existing_knowledge", "examples", "review", "retrieval_failures"),
+            "feedback_revise": ("keyword", "desc", "relations", "relation_members", "knowledge", "existing_knowledge", "examples", "review", "retrieval_failures"),
         }[stage]
         payload = {k: data[k] for k in fields if k in data}
         for name in ("examples", "retrieval_failures"):
@@ -228,12 +251,12 @@ def model_input(stage, data):
     if stage == "merge":
         return {"keywords": data["keywords"]}
     if stage == "filter":
-        payload = {name: data[name] for name in ("keyword", "desc", "existing_knowledge", "aliases", "concepts") if name in data}
+        payload = {name: data[name] for name in ("keyword", "desc", "existing_knowledge", "aliases", "concepts", "relations", "relation_members") if name in data}
         if data.get("desc"):
             payload["keyword"] = data["keyword"] + "：" + data["desc"]
         return payload
     if stage == "extract":
-        return {**{name: data[name] for name in ("keyword", "desc", "aliases", "concepts") if name in data},
+        return {**{name: data[name] for name in ("keyword", "desc", "aliases", "concepts", "relations", "relation_members") if name in data},
                 "examples": [example(row) for row in data["examples"]]}
     raise ValueError(f"未知模型阶段：{stage}")
 
@@ -247,6 +270,8 @@ class Model:
             missing = {"feedback_review", "feedback_revise"} - self.templates.keys()
             if missing:
                 raise ValueError(f"提示词文件缺少反馈阶段：{', '.join(sorted(missing))}")
+        if getattr(args, 'research', {}).get('enabled') and 'research' not in self.templates:
+            raise ValueError('提示词文件缺少 research 阶段')
         self.model = llm["model_name"]
         self.client = OpenAI(base_url=llm["base_url"], api_key=llm["api_key"],
                              timeout=args.timeout, max_retries=0)
@@ -269,6 +294,9 @@ class Model:
                 cached = read_json(path)
                 if cached["status"] == "success":
                     cached["result"] = validate(stage, cached["result"])
+                    if stage == 'research':
+                        # Recheck budget and entity constraints on cached responses as well.
+                        parse_result(stage, json.dumps(cached['result'], ensure_ascii=False), data)
                     if stage == "merge":
                         validate_partition(cached["result"], data["keywords"])
                     return {**cached, "cached": True}
@@ -367,8 +395,31 @@ def run(args, llm):
                                    "reason": item["reason"], "gt_case_title": row["gt_case_title"],
                                    "gt_case_content": row["gt_case_content"]})
     save(out / "03_description_tasks.json", describe_tasks)
-    description_results = parallel("describe", describe_tasks, model, args.concurrency,
-                                   out / "03_description_results.json")
+    research_results = {}
+    research_config = getattr(args, 'research', {})
+    if research_config.get('enabled'):
+        if __package__:
+            from .research import enrich
+        else:
+            from research import enrich
+        research_results = enrich(describe_tasks, groups, model, research_config, canonical, save, out)
+    # Research succeeds once per normalized keyword; others use the ordinary GT definition.
+    ordinary = [task for task in describe_tasks
+                if research_results.get(canonical(task['keyword']), {}).get('status') != 'success']
+    ordinary_results = parallel('describe', ordinary, model, args.concurrency, out / '03_ordinary_description_results.json')
+    by_task = {id(task): response for task, response in zip(ordinary, ordinary_results)}
+    description_results = []
+    for task in describe_tasks:
+        researched = research_results.get(canonical(task['keyword']))
+        if researched and researched['status'] == 'success':
+            description_results.append({'status': 'success', 'result': {'desc': researched['result']['desc']},
+                                        'description_method': 'research'})
+        else:
+            description_results.append(by_task[id(task)])
+    save(out / '03_description_results.json', description_results)
+    relations = [r for response in research_results.values() if response['status'] == 'success'
+                 for r in response['result']['relations']]
+    save(out / '03_keyword_relations.json', relations)
     clusters = {}
     rejected = []
     for task, response in zip(describe_tasks, description_results):
@@ -412,6 +463,13 @@ def run(args, llm):
     merged_results = parallel("merge", merge_tasks, model, args.concurrency, out / "04_merge_results.json")
     merged = fuse(ordered, merge_tasks, merged_results, digest)
     save(out / "04_merged_keyword_clusters.json", merged)
+    if research_config.get('enabled'):
+        if __package__:
+            from .research import expand
+        else:
+            from research import expand
+        merged = expand(merged, relations, canonical, digest)
+        save(out / '04_relation_clusters.json', merged)
     eligible = [c for c in merged if c["count"] > args.min_cluster_size]
     low_frequency = [{**c, "discard_reason": f"count <= min_cluster_size ({args.min_cluster_size}) after merge"}
                      for c in merged if c["count"] <= args.min_cluster_size]
@@ -419,7 +477,7 @@ def run(args, llm):
     save(out / "04_eligible_keyword_clusters.json", eligible)
     print(f"[cluster-size after merge] total={len(merged)} retained={len(eligible)} "
           f"discarded={len(low_frequency)} threshold={args.min_cluster_size}", file=sys.stderr)
-    filters = parallel("filter", [{"keyword": c["keyword"], "desc": c["desc"], "aliases": c["aliases"], "concepts": c["concepts"], "existing_knowledge": knowledge} for c in eligible],
+    filters = parallel("filter", [{"keyword": c["keyword"], "desc": c["desc"], "aliases": c["aliases"], "concepts": c["concepts"], **{k: c[k] for k in ("relations", "relation_members") if k in c}, "existing_knowledge": knowledge} for c in eligible],
                        model, args.concurrency, out / "05_filter_results.json")
     kept, excluded, unresolved = [], [], []
     for cluster, response in zip(eligible, filters):
@@ -433,7 +491,7 @@ def run(args, llm):
     save(out / "covered_clusters.json", excluded)
     save(out / "filter_failed_clusters.json", unresolved)
     extract_tasks = [{"cluster_id": c["id"], "keyword": c["keyword"], "desc": c["desc"], "aliases": c["aliases"], "concepts": c["concepts"],
-                      "examples": diverse(c["records"], args.max_examples)} for c in kept]
+                      **{k: c[k] for k in ("relations", "relation_members") if k in c}, "examples": diverse(c["records"], args.max_examples)} for c in kept]
     extracted = parallel("extract", extract_tasks, model, args.concurrency, out / "07_extraction_results.json")
     entries = []
     for cluster, task, response in zip(kept, extract_tasks, extracted):
@@ -441,7 +499,7 @@ def run(args, llm):
             result = response["result"]
             entries.append({**result, "keyword": cluster["keyword"], "cluster_id": cluster["id"],
                             "desc": cluster["desc"], "concepts": cluster["concepts"], "aliases": cluster["aliases"], "cluster_count": cluster["count"], "gt_case_count": cluster["gt_case_count"],
-                            "example_ids": [r["id"] for r in task["examples"]]})
+                            **{k: cluster[k] for k in ("relations", "relation_members") if k in cluster}, "example_ids": [r["id"] for r in task["examples"]]})
     feedback_rejected = feedback_errors = 0
     feedback = getattr(args, "feedback", {})
     if feedback.get("enabled"):
@@ -456,7 +514,7 @@ def run(args, llm):
             entries, kept, model, reviewer, feedback, knowledge, save, out)
     save(out / "knowledge.json", entries)
     (out / "knowledge.txt").write_text("\n".join(f"{i}. {r['knowledge'].strip()}" for i, r in enumerate(entries, 1)) + "\n", encoding="utf-8")
-    failures = feedback_errors + embedding_failures + sum(r["status"] != "success" for r in keyword_results + description_results + merged_results + filters + extracted)
+    failures = sum(r['status'] != 'success' for r in research_results.values()) + feedback_errors + embedding_failures + sum(r["status"] != "success" for r in keyword_results + description_results + merged_results + filters + extracted)
     summary = {"created_at": datetime.now(timezone.utc).isoformat(), "input_files": paths,
                "record_count": len(records), "input_issue_count": len(issues), "gt_cluster_count": len(groups),
                "description_task_count": len(describe_tasks), "keyword_cluster_count": len(ordered), "covered_cluster_count": len(excluded),
@@ -579,6 +637,22 @@ def main(argv=None):
         value = args.embedding["timeout"]
         if type(value) not in (int,float) or not math.isfinite(value) or value <= 0:
             raise ValueError("embedding.timeout 必须为正有限数值")
+        research = config.get('research', {})
+        if not isinstance(research, dict) or type(research.get('enabled', False)) is not bool:
+            raise ValueError('research.enabled 必须为布尔值')
+        args.research = {'enabled': False, 'top_k': 5, 'max_searches': 3, 'min_dialogues': 10,
+                         'concurrency': 4, 'timeout': 30, **research}
+        if args.research['enabled']:
+            from search import DEFAULT_RETRIEVAL_URL
+            args.research.setdefault('retrieval_url', DEFAULT_RETRIEVAL_URL)
+            if not isinstance(args.research['retrieval_url'], str) or not args.research['retrieval_url'].strip():
+                raise ValueError('research.retrieval_url 不能为空')
+            for key in ('top_k', 'max_searches', 'concurrency', 'min_dialogues'):
+                value = args.research[key]
+                if type(value) is not int or value < (0 if key == 'min_dialogues' else 1):
+                    raise ValueError(f'research.{key} 数值无效')
+            if type(args.research['timeout']) not in (int, float) or not math.isfinite(args.research['timeout']) or args.research['timeout'] <= 0:
+                raise ValueError('research.timeout 数值无效')
         feedback = config.get("feedback", {})
         if not isinstance(feedback, dict) or type(feedback.get("enabled", False)) is not bool:
             raise ValueError("feedback 必须为对象，enabled 必须为布尔值")

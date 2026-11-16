@@ -253,3 +253,33 @@ python3 -m extract_knowledge \
 
 
 feedback_revise 的对话总预算为10条，examples 与 retrieval_failures 共享预算，不重复传入同一条对话。优先从本轮未命中的对话中按 GT 轮询选择，不足10条时再从剩余对话按 GT 轮询补齐。评审拒绝而未执行检索时，从全簇按 GT 轮询选最多10条，携带历史 query。existing_knowledge 为反馈评测使用的已有知识文件全文，knowledge 为当前待修改条目。评审通过后若仅检索不达标，输入中完全省略 review 字段。检索验证仍使用全簇对话，评审样本范围不受本次修改采样影响。
+
+
+## 可选术语调研与关联聚类
+
+顶层 research.enabled 默认 false。流程严格为：所有 GT 关键词抽取完成 → 汇总同名关键词的去重对话数 → 达到门槛的词进行调研生成定义 → 其他词按原 describe 生成定义 → 同名聚类 → embedding 与同义融合 → 一跳关联聚类 → 数量阈值/已有知识过滤 → 抽取 → 可选反馈。
+
+```json
+"research": {
+  "enabled": true,
+  "top_k": 5,
+  "max_searches": 3,
+  "min_dialogues": 10,
+  "concurrency": 4,
+  "timeout": 30
+}
+```
+
+同名词按原有 NFKC、大小写、空白规则归一化，跨 GT 关联的记录 ID 取并集；仅当对话数严格大于 min_dialogues 时调研。例如10表示至少11条，0表示所有非空关键词都可调研。相同关键词只调研一次，结果共享给相关 GT。research 并发数与主流程独立，防止昂贵检索任务占满连接。
+
+第一次固定使用关键词检索，每次取 top_k 个案例的标题和正文。max_searches 是包括首次检索在内的总请求预算，至少1次。模型查看源 GT 标题/正文和累计去重的检索证据，可返回 search 动作生成新 query，或 summarize 动作给出 desc 与 relations；预算耗尽必须 summarize，违反约束会按原模型调用规则重试，最终失败不会越过预算。每次模型重试不增加检索请求。调研失败保留原 describe 路径产出可用定义，同时 summary.partial=true，不把缺少证据的调研当成功。恢复运行复用成功模型调用，但重新请求检索以获取当前证据。
+
+所有调研模型提示词位于 prompts.md 的 research 段。输入只含关键词、全部已抽取关键词列表、案例 title/content、已经查询的文本和是否还可查询；案例 ID、排名、分数、来源路径不传入模型。relations 每项为 source、target、description；source 必须为当前关键词，target 必须为本批其他已抽取关键词，description 为一句有证据支持的自然语言关联。相关不等于同义，调研不会自动新增关键词或伪造对话。
+
+语义同义融合完成后，将关联实体通过 aliases 映射回语义簇。无需双向确认，A→B 即可组成 A、B 的关联簇；每个源簇仅扩展它直接指向的邻居，不沿邻居继续搜索。因此 A→B、B→C 形成 AB 与 BC，不合并为传递闭包 ABC。多个直接关系 A→B、A→C 则形成 ABC。去除重复及被包含的冗余候选集合；关联簇可能重叠。每簇对话按 ID 取并集计数，不跨簇累加成唯一总数。
+
+关联簇包含 relations、relation_members（各语义簇代表词及定义）、aliases、concepts。过滤模型必须判断整个关联簇是否已被覆盖，不能只检查一个代表词；抽取和反馈修改模型使用关联定义，总结一条包含多个必要术语及分别适用条件的知识，允许多句“当……时可考虑某关键词”。关闭模块时原有行为保持不变。
+
+新增文件：03_research_results.json 保存各词检索 query、模型动作及结果；03_keyword_relations.json 保存结构化关系；03_ordinary_description_results.json 保存原 describe 调用；03_description_results.json 汇总最终定义；04_relation_clusters.json 保存一跳簇，04_merged_keyword_clusters.json 仍保存同义融合结果。calls/research 保存实际精简输入、证据和模型响应。knowledge.json 同时保留最终关系与成员定义。
+
+验证命令：`python3 -m unittest extract_knowledge.test_research extract_knowledge.test_feedback extract_knowledge.test_pipeline tests.test_evaluate tests.test_gen_query`。
