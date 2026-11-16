@@ -215,6 +215,7 @@ def collect_badcases(
                 "queries": queries,
                 "matched_rank": record.get("matched_rank"),
                 "retrieval_trace": _normalise_trace(record.get("retrieval_trace")),
+                "per_query_traces": [_normalise_trace(trace) for trace in (record.get("per_query_traces") or [])],
                 "gt_case_title": gt_case_title,
                 "gt_case_found": gt_case_found,
             }

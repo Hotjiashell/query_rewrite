@@ -104,6 +104,13 @@ def build_dataset(badcases, analysis, cases):
                         is_gt=item["case_id"] == gt_id)
         result.append({"key": key, "sample_index": index, "call_sno": row.get("call_sno"),
                        "chat_content": row.get("chat_content") or "", "query": row.get("query"),
+                       "per_query_traces": [[{
+                           "rank": t.get("rank"), "case_id": str(t.get("case_id") or ""),
+                           "title": t.get("case_title") or str(t.get("case_id") or ""),
+                           "score": t.get("score"),
+                           "text": (cases.get(str(t.get("case_id") or "")) or {}).get("text") or "",
+                       } for t in trace if isinstance(t, dict)]
+                           for trace in (row.get("per_query_traces") or []) if isinstance(trace, list)],
                        "queries": row.get("queries") or [], "gt": {"case_id": gt_id,
                        "title": gt.get("case_name") or row.get("gt_case_title") or gt_id,
                        "text": gt.get("text") or ""}, "retrieved": retrieved,
