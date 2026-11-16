@@ -305,3 +305,26 @@ python label_badcase/export_test_data.py \
 ```bash
 python -m unittest discover -s label_badcase -p 'test_*.py'
 ```
+
+## 独立的知识解决能力标注器
+
+新增入口不需要 `--analysis`，不展示或标注“其他正确案例”的模型判断，原标注器保持可用。
+
+```bash
+python label_badcase/knowledge_server.py --badcases results/badcases.json --cases data/case_example.json --output label_badcase/knowledge_annotations.json
+# 模拟数据
+python label_badcase/knowledge_server.py --demo
+```
+
+访问 http://127.0.0.1:8766 。每条必须选择“能 / 不能通过知识解决”。能时可填写知识条目；不能时可填写错误类型和原因；这些补充项均不影响保存。点击保存或保存并下一条未标注；已有判断的修改在翻页前保存，未保存关闭页面会提醒。支持搜索、未标注/能/不能筛选、导出 JSON，以及原对话、GT、原召回正文阅读。
+
+右侧提供可编辑基础提示词和测试知识，默认来自 `extract_knowledge/eval_prompt_template.txt`、`extract_knowledge/existing_knowledge.txt`，支持 `{knowledge}`、`{dialogue}`。点击“保存提示词与知识”保存到独立标注 JSON 的 `settings`，不改原始文本文件。单条填写的知识可追加到测试知识。生成测试始终使用编辑框当前文本，返回每条 query 的检索列表和融合结果，也支持手动输入 query 检索。测试结果仅保存在当前页面，刷新清空。
+
+模型及检索配置沿用原工具：`--llm-config config.json`、`--retrieval-url URL`、`--retrieval-timeout 30`；生成测试需要 Python 3.11+ 与项目模型/检索依赖。标注功能本身只使用标准库。
+
+独立输出类型为 `knowledge_badcase_annotations`，`annotations` 按记录 key 保存 `can_solve`（布尔值）、`knowledge_entry`、`error_type`、`reason`、时间和版本；判断保存后即视为完成。文件原子落盘，数据集指纹防混用，同条记录版本冲突会拒绝覆盖并保留页面输入。不要与原标注器共享输出文件。
+
+可使用 `--prompt-file /path/to/prompt.txt` 和 `--knowledge-file /path/to/knowledge.txt`
+分别指定基础提示词、测试知识的初始 UTF-8 文本文件，相对路径以启动命令的当前目录为准。
+这两个参数用于初始化新标注文件；若 `--output` 已存在，优先恢复其中保存的 `settings`，
+避免覆盖页面上已经编辑并保存的内容。需要重新初始化时请指定新的 `--output`。

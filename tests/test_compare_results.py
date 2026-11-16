@@ -125,6 +125,30 @@ class CompareResultsTests(unittest.TestCase):
         self.assertEqual(report["summary"]["first_hit_second_miss"], 0)
         self.assertEqual(report["records"], [])
 
+    def test_includes_multi_query_details_and_uses_fused_rank(self):
+        first = {
+            "sample_index": 0, "expected_case_id": "C0", "query": "q1",
+            "queries": ["q1", "q2"], "status": "success", "matched_rank": 2,
+            "union_matched_rank": 1,
+            "per_query_traces": [
+                [{"rank": 1, "case_id": "C0", "case_title": "target"}],
+                [{"rank": 4, "case_id": "C1", "case_title": "other"}],
+            ],
+        }
+        second = {**first, "matched_rank": None, "per_query_traces": []}
+        with tempfile.TemporaryDirectory() as directory:
+            first_path = Path(directory) / "first.json"
+            second_path = Path(directory) / "second.json"
+            first_path.write_text(json.dumps(_artifact([first])), encoding="utf-8")
+            second_path.write_text(json.dumps(_artifact([second])), encoding="utf-8")
+            report = compare_result_artifacts(first_path, second_path, cutoff=3)
+
+        self.assertEqual(report["summary"]["first_hit_second_miss"], 1)
+        detail = report["records"][0]["first"]
+        self.assertEqual(detail["queries"], ["q1", "q2"])
+        self.assertEqual(detail["union_matched_rank"], 1)
+        self.assertEqual(detail["per_query_traces"][0][0]["case_id"], "C0")
+
     def test_rejects_non_retrieval_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "bad.json"
