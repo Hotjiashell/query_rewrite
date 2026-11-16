@@ -25,4 +25,19 @@ class KnowledgeTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 loaded.mutate({**body, 'record_revision':0})
 
+    def test_multiuser_settings_and_record_versions_are_independent(self):
+        demo = server.load(Path(__file__).parent/'demo_data.json')
+        records = server.build_dataset(demo['badcases'], {'records': []}, demo['cases'])
+        with tempfile.TemporaryDirectory() as folder:
+            store = KnowledgeStore(records, Path(folder)/'annotations.json', {})
+            store.mutate({'action':'annotation', 'key':records[0]['key'], 'record_revision':0,
+                          'annotation':{'can_solve':True, 'owner':'甲'}})
+            settings = {'action':'settings', 'settings_revision':0,
+                        'settings':{'prompt':'测试', 'knowledge':'知识'}}
+            store.mutate(settings)
+            with self.assertRaises(RuntimeError): store.mutate(settings)
+            self.assertEqual(store.state['settings']['knowledge'], '知识')
+            self.assertEqual(store.state['annotations'][records[0]['key']]['owner'], '甲')
+            self.assertEqual(store.state['settings_revision'], 1)
+
 if __name__ == '__main__': unittest.main()

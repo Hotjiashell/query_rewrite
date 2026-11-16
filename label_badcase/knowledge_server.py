@@ -31,6 +31,7 @@ class KnowledgeStore(base.Store):
             if previous.get('artifact_type') != self.state['artifact_type'] or previous.get('dataset_fingerprint') != fingerprint:
                 raise ValueError('标注文件类型或数据集不匹配，请使用独立的 --output')
             self.state = previous
+        self.state.setdefault('settings_revision', 0)
 
     def summary(self):
         values = list(self.state['annotations'].values())
@@ -45,12 +46,13 @@ class KnowledgeStore(base.Store):
             old = copy.deepcopy(self.state)
             try:
                 if body.get('action') == 'settings':
-                    if body.get('revision') != self.state['revision']:
+                    if body.get('settings_revision') != self.state['settings_revision']:
                         raise RuntimeError('数据已更新，请刷新后重试；当前输入尚未保存')
                     settings = body['settings']
                     if any(not isinstance(settings.get(k), str) for k in ('prompt', 'knowledge')):
                         raise ValueError('提示词和知识必须是文本')
                     self.state['settings'] = {k: settings[k] for k in ('prompt', 'knowledge')}
+                    self.state['settings_revision'] += 1
                 elif body.get('action') == 'annotation':
                     key = str(body.get('key'))
                     if key not in self.by_key:
@@ -61,7 +63,7 @@ class KnowledgeStore(base.Store):
                     raw = body['annotation']
                     if type(raw.get('can_solve')) is not bool:
                         raise ValueError('必须选择能否通过知识解决')
-                    annotation = {k: raw.get(k, '') for k in ('knowledge_entry', 'error_type', 'reason')}
+                    annotation = {k: raw.get(k, '') for k in ('knowledge_entry', 'error_type', 'reason', 'owner')}
                     if any(not isinstance(v, str) for v in annotation.values()):
                         raise ValueError('选填项必须是文本')
                     annotation.update(record_key=key, sample_index=self.by_key[key]['sample_index'],
