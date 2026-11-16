@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from evaluate import QUERY_ARTIFACT_TYPE, RETRIEVAL_ARTIFACT_TYPE, write_json_atomically
+from evaluate import QUERY_ARTIFACT_TYPE, RETRIEVAL_ARTIFACT_TYPE, write_json_atomically, calculate_annotated_metrics
 
 
 DEFAULT_CUTOFF = 10
@@ -174,6 +174,8 @@ def collect_badcases(
     case_summary_path: str | Path,
     *,
     cutoff: int = DEFAULT_CUTOFF,
+    retrievable_only: bool = False,
+    dataset_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build a report of every top-``cutoff`` miss, with ground-truth titles filled in."""
 
@@ -183,10 +185,24 @@ def collect_badcases(
     case_summary = load_case_summary(case_summary_path)
     query_records = _load_query_records(result_payload, results_path)
 
+    samples = None
+    excluded = 0
+    if retrievable_only:
+        if dataset_path is None:
+            raise ValueError("--retrievable-only requires --dataset")
+        try:
+            samples = json.loads(Path(dataset_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"could not load annotated dataset: {exc}") from exc
+        metrics = calculate_annotated_metrics(result_payload["records"], samples)
+        excluded = metrics["coverage"]["excluded_can_retrieve_false"]
+
     badcases: list[dict[str, Any]] = []
     for position, record in enumerate(result_payload["records"]):
         if not isinstance(record, Mapping):
             raise ValueError(f"record {position} in {results_path} must be a JSON object")
+        if samples is not None and not samples[record["sample_index"]]["can_retrieve"]:
+            continue
         if not _is_miss(record, cutoff):
             continue
 
@@ -248,12 +264,16 @@ def collect_badcases(
         "created_at": datetime.now(UTC).isoformat(),
         "configuration": {
             "results_path": str(results_path),
+            "retrievable_only": retrievable_only,
+            "dataset_path": str(dataset_path) if dataset_path is not None else None,
             "case_summary_path": str(case_summary_path),
             "cutoff": cutoff,
         },
         "summary": {
             "cutoff": cutoff,
             "total_records": len(result_payload["records"]),
+            "excluded_can_retrieve_false": excluded,
+            "selected_records": len(result_payload["records"]) - excluded,
             "badcase_count": len(badcases),
             "unresolved_gt_case_count": sum(not item["gt_case_found"] for item in badcases),
         },
@@ -274,6 +294,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CUTOFF,
         help="Miss cutoff, e.g. 10 for top-10 (default: 10)",
     )
+    parser.add_argument("--retrievable-only", action="store_true", help="Only collect samples annotated can_retrieve=true; requires --dataset")
+    parser.add_argument("--dataset", help="Annotated dataset used by evaluate_annotated.py")
     parser.add_argument("--output", required=True, help="Output JSON report path")
     return parser
 
@@ -281,7 +303,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        report = collect_badcases(args.results, args.case_summary, cutoff=args.cutoff)
+        report = collect_badcases(args.results, args.case_summary, cutoff=args.cutoff,
+                                  retrievable_only=args.retrievable_only, dataset_path=args.dataset)
         write_json_atomically(report, args.output)
         summary = report["summary"]
         print(
