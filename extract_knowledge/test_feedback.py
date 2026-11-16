@@ -1,0 +1,115 @@
+import tempfile
+import unittest
+from pathlib import Path
+from .feedback import refine
+from .pipeline import model_input, save
+
+
+class FeedbackTests(unittest.TestCase):
+    def run_feedback(self, reject=False, broken=False):
+        rows = [{'id': str(i), 'expected_case_id': 'target', 'chat_content': f'用户诉求{i}',
+                 'gt_case_title': '目标标题', 'gt_case_content': '依据'} for i in range(12)]
+        class Model:
+            def task(self, stage, data):
+                if stage == 'feedback_query':
+                    assert set(data) == {'knowledge', 'chat_content'}
+                    return {'status': 'success', 'result': {'queries': [data['knowledge']]}}
+                if stage == 'feedback_review':
+                    assert all(set(e) == {'chat_content', 'gt_case_title'} for e in data['examples'])
+                    return {'status': 'success', 'result': {'approved': not reject and data['knowledge'] == '归纳规则', 'reason': '请归纳共同语义'}}
+                assert data['keyword'] == '内部词'
+                assert data['desc'] == '描述解释'
+                assert all(set(e) == {'chat_content', 'gt_case_title', 'queries'} and e['queries'] for e in data['examples'])
+                assert 'record_id' not in str(data)
+                return {'status': 'success', 'result': {'knowledge': '归纳规则'}}
+        def retrieve(query, **kwargs):
+            if broken:
+                raise RuntimeError('service unavailable')
+            return {'retrieval_result': {'top1': {'case_id': 'target' if '归纳规则' in query else 'other', 'case_title': '标题'}}}
+        with tempfile.TemporaryDirectory() as directory:
+            prompt_file = Path(directory) / 'prompt.txt'
+            knowledge_file = Path(directory) / 'existing.txt'
+            prompt_file.write_text('知识：{knowledge}')
+            knowledge_file.write_text('')
+            result = refine([{'cluster_id': 'cluster', 'knowledge': '罗列现象'}],
+                            [{'id': 'cluster', 'keyword': '内部词', 'desc': '描述解释', 'records': rows}], Model(), Model(),
+                            {'max_rounds': 2, 'top_k': 10, 'min_recall': 1, 'concurrency': 2, 'timeout': 1, 'prompt_file': str(prompt_file), 'knowledge_file': str(knowledge_file)},
+                            '', save, Path(directory), retrieve)
+            import json
+            history = json.loads((Path(directory) / '08_feedback_results.json').read_text())
+            self.assertEqual(len(history[0]['rounds'][0]['tests']), 12)
+            return result, history
+
+    def test_revision_must_pass_both_gates_and_tests_full_cluster(self):
+        (entries, rejected, errors), history = self.run_feedback()
+        self.assertEqual((len(entries), rejected, errors), (1, 0, 0))
+        self.assertEqual(entries[0]['knowledge'], '归纳规则')
+        self.assertEqual(len(history[0]['rounds']), 2)
+
+    def test_quality_rejection_even_when_retrieval_passes(self):
+        (entries, rejected, errors), _ = self.run_feedback(reject=True)
+        self.assertEqual((entries, rejected, errors), ([], 1, 0))
+
+    def test_service_failure_is_not_quality_feedback(self):
+        (entries, rejected, errors), history = self.run_feedback(broken=True)
+        self.assertEqual((entries, rejected, errors), ([], 1, 1))
+        self.assertEqual(len(history[0]['rounds']), 1)
+
+    def test_whitelist_strips_identifiers(self):
+        payload = model_input('feedback_revise', {'knowledge': '规则', 'examples': [
+            {'id': 'secret', 'expected_case_id': 'secret', 'chat_content': '诉求'}],
+            'review': '评审', 'retrieval_failures': [{'record_id': 'secret', 'queries': ['q'], 'retrieved_titles': ['标题']}]})
+        self.assertNotIn('secret', str(payload))
+
+    def test_custom_prompt_is_exact_and_query_parser_matches_evaluate(self):
+        from . import pipeline as p
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from gen_query import extract_queries
+        raw = '分析后返回：\n```json\n{"query": ["无线网络故障", "企业无线接入"]}\n```'
+        with tempfile.TemporaryDirectory() as directory:
+            model = p.Model.__new__(p.Model)
+            model.args = SimpleNamespace(output_dir=directory, resume=False, max_tokens=100, retries=0)
+            model.templates = {}
+            model.identity = {'model_name': 'fake', 'base_url': 'fake', 'temperature': 0}
+            model.model = 'fake'
+            model.feedback_query_template = '规则：{knowledge}\n对话：{dialogue}\n输出示例：{"query":"检索词"}'
+            client = Mock()
+            client.chat.completions.create.return_value = SimpleNamespace(choices=[
+                SimpleNamespace(message=SimpleNamespace(content=raw), finish_reason='stop')])
+            model.client = client
+            trace = model.task('feedback_query', {'knowledge': '已有知识\n新知识',
+                                'chat_content': '对话保留{knowledge}', 'expected_case_id': 'secret'})
+            self.assertEqual(trace['status'], 'success')
+            self.assertEqual(trace['result']['queries'], extract_queries(raw))
+            self.assertEqual(trace['prompt'], '规则：已有知识\n新知识\n对话：对话保留{knowledge}\n输出示例：{"query":"检索词"}')
+            self.assertNotIn('secret', trace['prompt'])
+            model.args.resume = True
+            model.task('feedback_query', {'knowledge': '已有知识\n新知识', 'chat_content': '对话保留{knowledge}'})
+            self.assertEqual(client.chat.completions.create.call_count, 1)
+
+    def test_evaluate_metrics_retained_in_feedback(self):
+        (_, _, _), history = self.run_feedback()
+        test = history[0]['rounds'][-1]['tests'][0]
+        self.assertEqual(test['evaluation']['matched_rank'], 1)
+        self.assertTrue(test['evaluation']['union_top_k']['10'])
+        self.assertEqual(test['evaluation']['retrieval_status'], 'success')
+
+    def test_review_whitelist_excludes_case_body(self):
+        payload = model_input('feedback_review', {'knowledge': '知识', 'examples': [
+            {'chat_content': '对话', 'gt_case_title': '标题', 'gt_case_content': '正文', 'id': '编号'}]})
+        self.assertEqual(payload, {'knowledge': '知识', 'examples': [
+            {'chat_content': '对话', 'gt_case_title': '标题'}]})
+
+    def test_feedback_templates_loaded_from_shared_markdown(self):
+        from . import pipeline as p
+        templates = p.load_prompts(p.HERE / 'prompts.md')
+        self.assertIn('feedback_review', templates)
+        self.assertIn('feedback_revise', templates)
+        raw = '先归纳共同诉求。\n```json\n{"knowledge":"新归纳知识"}\n```'
+        self.assertEqual(p.parse_result('feedback_revise', raw, {}), {'knowledge': '新归纳知识'})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'prompts.md'
+            original = (p.HERE / 'prompts.md').read_text()
+            path.write_text(original.replace('概括、泛用性还不是很好', '泛化能力需要提升'))
+            self.assertNotEqual(p.load_prompts(path)['feedback_revise'], templates['feedback_revise'])

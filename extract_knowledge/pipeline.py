@@ -26,6 +26,8 @@ else:
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+if not __package__:
+    sys.path.insert(0, str(ROOT))
 
 
 def read_json(path):
@@ -47,7 +49,7 @@ def save(path, value):
 def load_prompts(path):
     """Read editable Markdown sections without formatting literal JSON braces."""
     content = Path(path).read_text(encoding="utf-8")
-    sections = re.split(r"^## (keywords|describe|merge|filter|extract)\s*$", content, flags=re.M)
+    sections = re.split(r"^## (keywords|describe|merge|filter|extract|feedback_review|feedback_revise)\s*$", content, flags=re.M)
     templates = {}
     for stage, body in zip(sections[1::2], sections[2::2]):
         if stage in templates:
@@ -140,7 +142,14 @@ def load_records(paths, cases=None, dialogues=None):
 def validate(stage, obj):
     if not isinstance(obj, dict):
         raise ValueError("模型必须输出 JSON 对象")
-    if stage == "keywords":
+    if stage == "feedback_query":
+        queries = obj.get("queries")
+        if not isinstance(queries, list) or not 1 <= len(queries) <= 3 or any(not text(q) for q in queries):
+            raise ValueError("queries 需要1～3条非空字符串")
+    elif stage == "feedback_review":
+        if type(obj.get("approved")) is not bool or not text(obj.get("reason")):
+            raise ValueError("评审需要 approved 布尔值和非空 reason")
+    elif stage == "keywords":
         items = obj.get("keywords")
         if isinstance(items, str):
             if not text(obj.get("reason")):
@@ -175,11 +184,14 @@ def validate(stage, obj):
 
 def parse_result(stage, raw, data):
     """Stages permitting analysis use the last fenced JSON as the final answer."""
-    if stage in ("keywords", "merge", "extract"):
+    if stage in ("keywords", "merge", "extract", "feedback_query", "feedback_review", "feedback_revise"):
         blocks = re.findall(r"```(?:json)?[ \t]*\r?\n(.*?)```", raw, flags=re.I | re.S)
         content = blocks[-1].strip() if blocks else raw.strip()
     else:
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
+    if stage == "feedback_query":
+        from gen_query import extract_queries
+        return validate(stage, {"queries": extract_queries(raw)})
     result = validate(stage, json.loads(content))
     if stage == "merge":
         validate_partition(result, data["keywords"])
@@ -191,6 +203,22 @@ def model_input(stage, data):
     def example(row):
         return {name: row[name] for name in ("chat_content", "gt_case_title", "queries")}
 
+    if stage.startswith("feedback_"):
+        fields = {
+            "feedback_query": ("knowledge", "chat_content"),
+            "feedback_review": ("knowledge", "examples"),
+            "feedback_revise": ("keyword", "desc", "knowledge", "examples", "review", "retrieval_failures"),
+        }[stage]
+        payload = {k: data[k] for k in fields if k in data}
+        for name in ("examples", "retrieval_failures"):
+            if name in payload:
+                allowed = ("chat_content", "gt_case_title")
+                if stage == "feedback_revise":
+                    allowed += ("queries",)
+                if name == "retrieval_failures":
+                    allowed += ("queries", "retrieved_titles")
+                payload[name] = [{k: r[k] for k in allowed if k in r} for r in payload[name]]
+        return payload
     if stage == "keywords":
         return {"gt_case_title": data.get("gt_case_title", ""),
                 "records": [{name: row[name] for name in ("chat_content", "queries")}
@@ -215,6 +243,10 @@ class Model:
         from openai import OpenAI
         self.args = args
         self.templates = load_prompts(args.prompts_file)
+        if getattr(args, "feedback", {}).get("enabled"):
+            missing = {"feedback_review", "feedback_revise"} - self.templates.keys()
+            if missing:
+                raise ValueError(f"提示词文件缺少反馈阶段：{', '.join(sorted(missing))}")
         self.model = llm["model_name"]
         self.client = OpenAI(base_url=llm["base_url"], api_key=llm["api_key"],
                              timeout=args.timeout, max_retries=0)
@@ -223,7 +255,13 @@ class Model:
     def task(self, stage, data):
         data = model_input(stage, data)
         templates = self.templates
-        prompt = templates[stage].replace("{input}", json.dumps(data, ensure_ascii=False))
+        if stage == "feedback_query":
+            # Bind both placeholders in one pass so user data cannot become template syntax.
+            prompt = re.sub(r"\{(knowledge|dialogue)\}",
+                            lambda m: data['knowledge'] if m[1] == 'knowledge' else data['chat_content'],
+                            self.feedback_query_template)
+        else:
+            prompt = templates[stage].replace("{input}", json.dumps(data, ensure_ascii=False))
         key = digest([stage, prompt, self.identity, self.args.max_tokens])
         path = Path(self.args.output_dir) / "calls" / stage / f"{key}.json"
         if self.args.resume and path.exists():
@@ -404,9 +442,21 @@ def run(args, llm):
             entries.append({**result, "keyword": cluster["keyword"], "cluster_id": cluster["id"],
                             "desc": cluster["desc"], "concepts": cluster["concepts"], "aliases": cluster["aliases"], "cluster_count": cluster["count"], "gt_case_count": cluster["gt_case_count"],
                             "example_ids": [r["id"] for r in task["examples"]]})
+    feedback_rejected = feedback_errors = 0
+    feedback = getattr(args, "feedback", {})
+    if feedback.get("enabled"):
+        if __package__:
+            from .feedback import refine
+        else:
+            from feedback import refine
+        reviewer = Model(args, args.review_llm)
+        save(out / "feedback_prompt_templates.json", {k: model.templates[k] for k in ("feedback_review", "feedback_revise")})
+        save(out / "knowledge_initial.json", entries)
+        entries, feedback_rejected, feedback_errors = refine(
+            entries, kept, model, reviewer, feedback, knowledge, save, out)
     save(out / "knowledge.json", entries)
     (out / "knowledge.txt").write_text("\n".join(f"{i}. {r['knowledge'].strip()}" for i, r in enumerate(entries, 1)) + "\n", encoding="utf-8")
-    failures = embedding_failures + sum(r["status"] != "success" for r in keyword_results + description_results + merged_results + filters + extracted)
+    failures = feedback_errors + embedding_failures + sum(r["status"] != "success" for r in keyword_results + description_results + merged_results + filters + extracted)
     summary = {"created_at": datetime.now(timezone.utc).isoformat(), "input_files": paths,
                "record_count": len(records), "input_issue_count": len(issues), "gt_cluster_count": len(groups),
                "description_task_count": len(describe_tasks), "keyword_cluster_count": len(ordered), "covered_cluster_count": len(excluded),
@@ -414,7 +464,7 @@ def run(args, llm):
                "min_cluster_size": args.min_cluster_size, "low_frequency_cluster_count": len(low_frequency),
                "eligible_keyword_cluster_count": len(eligible),
                "retained_cluster_count": len(kept), "knowledge_count": len(entries),
-               "failed_model_tasks": failures, "partial": bool(failures or issues),
+               "failed_model_tasks": failures, "feedback_rejected_count": feedback_rejected, "feedback_enabled": bool(feedback.get("enabled")), "partial": bool(failures or issues or feedback_rejected),
                "concurrency": args.concurrency, "max_examples": args.max_examples,
                "precluster": precluster_config, "failed_embedding_batches": embedding_failures,
                "llm": model.identity}
@@ -427,6 +477,8 @@ def run(args, llm):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("badcases", nargs="*", help="一个或多个 collect_badcases.py 输出文件（支持 shell 通配符）")
+    parser.add_argument("--feedback-prompt-file", help="反馈验证的 query 提示词模板，含 {knowledge}，可含 {dialogue}")
+    parser.add_argument("--feedback-knowledge-file", help="反馈验证时使用的已有知识文本")
     parser.add_argument("--knowledge", help="只包含已有知识条目的独立文本文件，可为空")
     parser.add_argument("--prompts-file", help="包含四个阶段提示词的 Markdown 文件")
     parser.add_argument("--cases", help="案例映射 JSON，按 GT ID 读取 case_name 和 text 正文")
@@ -527,6 +579,45 @@ def main(argv=None):
         value = args.embedding["timeout"]
         if type(value) not in (int,float) or not math.isfinite(value) or value <= 0:
             raise ValueError("embedding.timeout 必须为正有限数值")
+        feedback = config.get("feedback", {})
+        if not isinstance(feedback, dict) or type(feedback.get("enabled", False)) is not bool:
+            raise ValueError("feedback 必须为对象，enabled 必须为布尔值")
+        review_config = config.get("review_llm", {})
+        if not isinstance(review_config, dict):
+            raise ValueError("review_llm 必须为对象")
+        args.feedback = {"enabled": False, "max_rounds": 3, "top_k": 10, "min_recall": 1.0,
+                         "timeout": 30, "concurrency": args.concurrency, **feedback}
+        if args.feedback["enabled"]:
+            from search import DEFAULT_RETRIEVAL_URL
+            from evaluate import FUSION_METHODS
+            for name, override, default in (
+                ('prompt_file', args.feedback_prompt_file, str(HERE / 'eval_prompt_template.txt')),
+                ('knowledge_file', args.feedback_knowledge_file, args.knowledge)):
+                value = override or args.feedback.get(name) or default
+                path = Path(value)
+                if not override and not path.is_absolute():
+                    path = ROOT / path
+                args.feedback[name] = str(path)
+                content = path.read_text(encoding='utf-8')
+                if name == 'prompt_file' and '{knowledge}' not in content:
+                    raise ValueError('反馈提示词模板必须包含 {knowledge}')
+            if args.feedback.get('fusion_method', 'round_robin') not in FUSION_METHODS:
+                raise ValueError('feedback.fusion_method 无效')
+            args.feedback.setdefault("retrieval_url", DEFAULT_RETRIEVAL_URL)
+            for name in ("max_rounds", "top_k", "concurrency"):
+                if type(args.feedback[name]) is not int or args.feedback[name] < 1:
+                    raise ValueError(f"feedback.{name} 必须为正整数")
+            for name, lower, upper in (("min_recall", 0, 1), ("timeout", 0, float("inf"))):
+                value = args.feedback[name]
+                if type(value) not in (int, float) or not math.isfinite(value) or not lower < value <= upper:
+                    raise ValueError(f"feedback.{name} 数值无效")
+            if not isinstance(args.feedback["retrieval_url"], str) or not args.feedback["retrieval_url"].strip():
+                raise ValueError("feedback.retrieval_url 不能为空")
+            review = review_config
+            if not isinstance(review, dict):
+                raise ValueError("review_llm 必须为对象")
+            args.review_llm = {**llm, **{k: v for k, v in review.items() if k in llm and v}}
+            args.review_llm["api_key"] = review.get("api_key") or os.getenv(review.get("api_key_env") or "OPENAI_API_KEY") or llm["api_key"]
         return run(args, llm)
     except KeyboardInterrupt:
         print("\n运行中断。已落盘的调用可通过 --resume 复用。", file=sys.stderr)

@@ -19,7 +19,7 @@ python3 extract_knowledge/pipeline.py
 | 配置项 | 说明 |
 | --- | --- |
 | `badcases` | 输入路径数组，支持 `results/badcases*.json` 等通配符 |
-| `prompts_file` | 五个阶段共用的提示词文件，默认 `extract_knowledge/prompts.md` |
+| `prompts_file` | 抽取与反馈阶段共用的提示词文件，默认 `extract_knowledge/prompts.md` |
 | `knowledge` | 只包含已有知识条目的独立文本文件，默认 `extract_knowledge/existing_knowledge.txt` |
 | `cases` / `dialogues` | cases 为案例映射文件，按 GT ID 读取 case_name 和 text 正文；dialogues 为可选的对话补齐文件 |
 | `output_dir` | 各阶段结果和检查点输出目录 |
@@ -62,7 +62,7 @@ python3 -m extract_knowledge --config extract_knowledge/config.production.json
 - `## filter`：判断已有知识是否覆盖关键词。
 - `## extract`：生成知识条目和触发条件。
 
-请保留这五个二级标题，每段保留唯一的 `{input}` 占位符。程序只替换该占位符，JSON 示例中的其他大括号不用转义。输出字段名称与类型由程序校验。extract 阶段现在仅需输出 `{"knowledge":"完整知识条目","reason":"抽取依据"}`，不再要求 applicable、keyword、explanation、trigger。可调整措辞、判断规则和示例。
+请保留这五个抽取阶段的二级标题；开启反馈时还必须包含 `feedback_review`、`feedback_revise` 两个二级标题，每段保留唯一的 `{input}` 占位符。程序只替换该占位符，JSON 示例中的其他大括号不用转义。输出字段名称与类型由程序校验。extract 阶段现在仅需输出 `{"knowledge":"完整知识条目","reason":"抽取依据"}`，不再要求 applicable、keyword、explanation、trigger。可调整措辞、判断规则和示例。
 
 通过配置的 `extract_knowledge.prompts_file` 可以切换不同版本的提示词文件，也支持 `--prompts-file` 覆盖。每次启动会加载一次提示词，修改后重新运行即可生效。即使开启 `resume`，修改过提示词的阶段也会自动使用新缓存键重新调用；其他阶段输入和提示词未变时继续复用。当前模板快照保存在输出目录的 `prompt_templates.json`，各调用的完整渲染提示词仍保存在 `calls/` 中。
 
@@ -211,3 +211,35 @@ python3 -m extract_knowledge.build_eval_prompt \
 三个参数依次为 run 输出目录、模板路径、新知识数量 k。读取 run 中 `existing_knowledge.json` 的 content 快照作为全部已有知识，再按 `knowledge.json` 的原有顺序追加前 k 条 knowledge，统一编号成每行 `1. 内容`，替换模板中的 `{knowledge}`，写入 run 目录的 `final_prompt.txt`。不会读取人工标注的 final_knowledge，也不会读取当前可能已修改的 existing_knowledge.txt。原有编号会去除后重排；已有知识每个非空行视为一条。
 
 k 必须是非负整数；k=0 时只放已有知识，超过新知识总数时使用全部新知识。模板中的其他大括号保持原样。输入无效时输出错误并返回退出码 2，不覆盖已有 final_prompt.txt；成功时原子替换该文件。
+
+## 抽取后双重反馈验证
+
+当前示例配置开启顶层 `feedback.enabled=true`。旧配置未提供该节时关闭。开启后会实际调用检索服务，需要安装根目录 requirements.txt 中的依赖并确保检索服务可访问。
+
+每条初始知识使用最终保留簇的全部去重对话测试，不受 max_examples 限制。query 模型只看到已有知识、本条候选知识和当前对话，不看到 GT 标题、正文、历史 query 或任何记录编号。query 响应复用 gen_query.extract_queries 解析（兼容 query 字符串或数组）；query 生成执行复用 evaluate.QueryGenerationRunner，检索复用 evaluate.RetrievalEvaluator，支持 round_robin 和 score 融合，检查 GT 是否命中融合后的 Top K。GT ID 只在本地匹配。
+
+独立 review_llm 仅接收候选知识、聚类对话和 GT 案例标题，不传案例正文；评审适用条件是否归纳共同语义，明确拒绝枚举样本原话、现象、操作或设备。修改模型收到关键词、描述解释、当前知识、全部对话及标题和本轮生成的 queries，同时收到评审理由与检索未命中的语义反馈（对话、目标标题、生成 query 和检索标题），不传案例 ID、记录 ID、来源路径、排名等管理字段。修改后重新执行两道验证，不能直接接受未验证的最后一次修改。
+
+顶层 feedback 参数：enabled（开关）、max_rounds（最多验证轮数，默认3，含首次验证）、top_k（轮询融合后的检索截断数，默认10）、min_recall（通过所需的簇内对话命中比例，默认1.0，即全部命中）、retrieval_url（默认 search.py 地址）、timeout（单次检索超时秒数，默认30）、concurrency（簇内测试并发，默认继承主流程）。服务错误停止本条迭代，标记未完成，可恢复重试；检索每次恢复时重新执行，模型成功调用沿用原有缓存机制。
+
+顶层 review_llm 可配置 base_url、model_name、api_key/api_key_env、temperature，未指定的模型连接字段继承 llm。要使用不同的评审模型，请显式填写 model_name，默认配置中的空字段会回退主模型。反馈提示词统一在 prompts.md 的 feedback_review 和 feedback_revise 段，可通过 prompts_file 切换；保留每段唯一的 {input} 占位符。
+
+新增产物：knowledge_initial.json 保存原始抽取；08_feedback_results.json 保存每轮知识、评审、query、实际检索和命中结果；feedback_rejected_knowledge.json 保存未通过条目；feedback_prompt_templates.json 保存模板快照。最终 knowledge.json/txt 仅含双重验证通过的知识；未通过或服务失败会令 summary.partial=true 并返回1。全部通过只代表在这些聚类样本上的验证结果，仍需独立样本评估泛化效果。
+
+离线回归：`python3 -m unittest extract_knowledge.test_feedback extract_knowledge.test_pipeline`。
+
+
+### 指定反馈评测提示词与已有知识
+
+feedback.prompt_file 指向 query 生成提示词模板，必须有 `{knowledge}`，可包含 `{dialogue}`。缺少对话占位符时会追加“当前对话”。仅替换这两个占位符，JSON 示例的大括号不需要转义，也不会额外添加 query 指令覆盖模板。feedback.knowledge_file 指向已有知识文本；每轮将它与当前候选知识合并填入模板。该文件可独立于抽取前过滤使用的 extract_knowledge.knowledge；不填写时使用过滤阶段的知识路径。路径在配置中相对项目根目录，命令行相对当前目录。
+
+```bash
+python3 -m extract_knowledge \
+  --feedback-prompt-file extract_knowledge/eval_prompt_template.txt \
+  --feedback-knowledge-file extract_knowledge/existing_knowledge.txt
+```
+
+这两个参数在 feedback.enabled=true 时生效。feedback.fusion_method 可设为 round_robin（默认）或 score，与 evaluate.py 一致。feedback_evaluation_settings.json 保存模板、已有知识和融合配置快照，每轮 tests.evaluation 保留 evaluate.py 的 matched_rank、union_top_k、per_query_traces 和检索状态等字段。通过条件使用融合排名不超过 top_k，部分检索失败保留评测明细但不算本条验证通过。
+
+
+反馈修改阶段与当前 feedback_revise 提示词对齐：输入字段为 keyword、desc、knowledge、examples、review、retrieval_failures。examples 每项仅含 chat_content、gt_case_title、queries；不传案例正文或管理编号。模型可先分析再输出 JSON 代码块，仅返回非空 knowledge 即可，reason 可选。修改后未返回 reason 时清除旧抽取依据，避免将旧依据误关联到新知识。所有抽取及反馈模板统一保存于 prompt_templates.json，反馈模板另外保留 feedback_prompt_templates.json 快照；模板变化自动改变对应阶段的缓存键。query 验证的外部模板仍通过 feedback.prompt_file 配置。

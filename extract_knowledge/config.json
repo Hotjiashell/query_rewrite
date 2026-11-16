@@ -32,5 +32,22 @@
     "concurrency": 4,
     "timeout": 120,
     "retries": 2
+  },
+  "feedback": {
+    "enabled": true,
+    "max_rounds": 3,
+    "top_k": 10,
+    "min_recall": 1.0,
+    "timeout": 30,
+    "concurrency": 16,
+    "prompt_file": "extract_knowledge/eval_prompt_template.txt",
+    "knowledge_file": "extract_knowledge/existing_knowledge.txt",
+    "fusion_method": "round_robin"
+  },
+  "review_llm": {
+    "base_url": "",
+    "model_name": "",
+    "api_key_env": "OPENAI_API_KEY",
+    "temperature": 0
   }
 }
