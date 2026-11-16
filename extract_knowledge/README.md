@@ -218,7 +218,7 @@ k 必须是非负整数；k=0 时只放已有知识，超过新知识总数时�
 
 每条初始知识使用最终保留簇的全部去重对话测试，不受 max_examples 限制。query 模型只看到已有知识、本条候选知识和当前对话，不看到 GT 标题、正文、历史 query 或任何记录编号。query 响应复用 gen_query.extract_queries 解析（兼容 query 字符串或数组）；query 生成执行复用 evaluate.QueryGenerationRunner，检索复用 evaluate.RetrievalEvaluator，支持 round_robin 和 score 融合，检查 GT 是否命中融合后的 Top K。GT ID 只在本地匹配。
 
-独立 review_llm 仅接收候选知识、聚类对话和 GT 案例标题，不传案例正文；评审适用条件是否归纳共同语义，明确拒绝枚举样本原话、现象、操作或设备。修改模型收到关键词、描述解释、当前知识、全部对话及标题和本轮生成的 queries，同时收到评审理由与检索未命中的语义反馈（对话、目标标题、生成 query 和检索标题），不传案例 ID、记录 ID、来源路径、排名等管理字段。修改后重新执行两道验证，不能直接接受未验证的最后一次修改。
+独立 review_llm 仅接收候选知识、聚类对话和 GT 案例标题，不传案例正文；评审适用条件是否归纳共同语义，明确拒绝枚举样本原话、现象、操作或设备。修改模型收到关键词、描述解释、当前知识、已有知识，以及最多10条对话的标题和 query；评审拒绝时附评审理由，检索未达标时附检索未命中的语义反馈（对话、目标标题、生成 query 和检索标题），不传案例 ID、记录 ID、来源路径、排名等管理字段。修改后重新执行两道验证，不能直接接受未验证的最后一次修改。
 
 顶层 feedback 参数：enabled（开关）、max_rounds（最多验证轮数，默认3，含首次验证）、top_k（轮询融合后的检索截断数，默认10）、min_recall（通过所需的簇内对话命中比例，默认1.0，即全部命中）、retrieval_url（默认 search.py 地址）、timeout（单次检索超时秒数，默认30）、concurrency（簇内测试并发，默认继承主流程）。服务错误停止本条迭代，标记未完成，可恢复重试；检索每次恢复时重新执行，模型成功调用沿用原有缓存机制。
 
@@ -242,4 +242,14 @@ python3 -m extract_knowledge \
 这两个参数在 feedback.enabled=true 时生效。feedback.fusion_method 可设为 round_robin（默认）或 score，与 evaluate.py 一致。feedback_evaluation_settings.json 保存模板、已有知识和融合配置快照，每轮 tests.evaluation 保留 evaluate.py 的 matched_rank、union_top_k、per_query_traces 和检索状态等字段。通过条件使用融合排名不超过 top_k，部分检索失败保留评测明细但不算本条验证通过。
 
 
-反馈修改阶段与当前 feedback_revise 提示词对齐：输入字段为 keyword、desc、knowledge、examples、review、retrieval_failures。examples 每项仅含 chat_content、gt_case_title、queries；不传案例正文或管理编号。模型可先分析再输出 JSON 代码块，仅返回非空 knowledge 即可，reason 可选。修改后未返回 reason 时清除旧抽取依据，避免将旧依据误关联到新知识。所有抽取及反馈模板统一保存于 prompt_templates.json，反馈模板另外保留 feedback_prompt_templates.json 快照；模板变化自动改变对应阶段的缓存键。query 验证的外部模板仍通过 feedback.prompt_file 配置。
+反馈修改阶段与当前 feedback_revise 提示词对齐：输入字段为 keyword、desc、knowledge、existing_knowledge、examples、retrieval_failures，以及仅在评审拒绝时提供的 review。examples 每项仅含 chat_content、gt_case_title、queries；不传案例正文或管理编号。模型可先分析再输出 JSON 代码块，仅返回非空 knowledge 即可，reason 可选。修改后未返回 reason 时清除旧抽取依据，避免将旧依据误关联到新知识。所有抽取及反馈模板统一保存于 prompt_templates.json，反馈模板另外保留 feedback_prompt_templates.json 快照；模板变化自动改变对应阶段的缓存键。query 验证的外部模板仍通过 feedback.prompt_file 配置。
+
+
+### 反馈执行顺序
+
+每轮先调用 feedback_review。评审拒绝时跳过 query 生成和检索，直接将评审意见交给 feedback_revise；修改后从评审重新开始。只有评审通过才测试整个聚类，检索命中比例不足时带着检索失败反馈修改，再重新评审。评审调用失败停止本条迭代，不当成质量拒绝。max_rounds 仍包含所有评审轮次，到达上限不再生成无法验证的新版本。
+
+跳过检索的轮次在 08_feedback_results.json 中记录 retrieval_status=skipped、tests=[]、recall=null，避免误认为命中率为零。此时修改输入的 examples.queries 使用原 badcase 的历史 query，retrieval_failures 为空；执行检索后则使用本轮实际生成的 query。
+
+
+feedback_revise 的对话总预算为10条，examples 与 retrieval_failures 共享预算，不重复传入同一条对话。优先从本轮未命中的对话中按 GT 轮询选择，不足10条时再从剩余对话按 GT 轮询补齐。评审拒绝而未执行检索时，从全簇按 GT 轮询选最多10条，携带历史 query。existing_knowledge 为反馈评测使用的已有知识文件全文，knowledge 为当前待修改条目。评审通过后若仅检索不达标，输入中完全省略 review 字段。检索验证仍使用全簇对话，评审样本范围不受本次修改采样影响。

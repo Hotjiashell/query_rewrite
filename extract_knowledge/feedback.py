@@ -5,6 +5,10 @@ from concurrent.futures import ThreadPoolExecutor
 def refine(entries, clusters, model, reviewer, settings, existing, save, out, retrieve=None):
     from evaluate import DialogueSample, QueryGenerationRunner, RetrievalEvaluator, SearchRetriever
     from gen_query import MultiQueryGenerator
+    if __package__:
+        from .pipeline import diverse
+    else:
+        from pipeline import diverse
     from pathlib import Path
     template = Path(settings['prompt_file']).read_text(encoding='utf-8')
     if '{knowledge}' not in template:
@@ -52,14 +56,18 @@ def refine(entries, clusters, model, reviewer, settings, existing, save, out, re
                 if evaluation['retrieval_status'] != 'success':
                     result['error'] = 'query_or_retrieval_failed'
                 return result
-            with ThreadPoolExecutor(max_workers=settings['concurrency']) as pool:
-                tests = list(pool.map(test, cluster['records']))
+            tests = []
+            retrieval_status = 'skipped'
+            if review['status'] == 'success' and review['result']['approved']:
+                with ThreadPoolExecutor(max_workers=settings['concurrency']) as pool:
+                    tests = list(pool.map(test, cluster['records']))
+                retrieval_status = 'completed'
             failed = review['status'] != 'success' or any('error' in t for t in tests)
             errors += int(failed)
-            recall = sum(t['hit'] for t in tests) / len(tests)
+            recall = sum(t['hit'] for t in tests) / len(tests) if tests else None
             passed = not failed and review['result']['approved'] and recall >= settings['min_recall']
             history['rounds'].append({'knowledge': current['knowledge'], 'review': review, 'tests': tests,
-                                      'recall': recall, 'passed': passed})
+                                      'recall': recall, 'retrieval_status': retrieval_status, 'passed': passed})
             save(out / '08_feedback_results.json', histories + [history])
             if passed:
                 accepted.append({**current, 'validation': {'passed': True, 'recall': recall, 'rounds': iteration + 1}})
@@ -67,16 +75,28 @@ def refine(entries, clusters, model, reviewer, settings, existing, save, out, re
             if failed or iteration + 1 == settings['max_rounds']:
                 rejected.append({**current, 'validation': {'passed': False, 'recall': recall}})
                 break
-            # Whitelist semantic feedback: no record IDs, GT IDs, ranks or source metadata.
+            # Share a ten-dialogue budget across examples and failure feedback.
+            by_id = {row['id']: test for row, test in zip(cluster['records'], tests)}
+            failed_rows = [row for row in cluster['records']
+                           if row['id'] in by_id and not by_id[row['id']]['hit']]
+            selected_failures = diverse(failed_rows, 10) if failed_rows else []
+            selected_ids = {row['id'] for row in selected_failures}
+            remaining = [row for row in cluster['records'] if row['id'] not in selected_ids]
+            budget = 10 - len(selected_failures)
+            selected_examples = diverse(remaining, budget) if budget else []
             misses = [{'chat_content': row['chat_content'], 'gt_case_title': row['gt_case_title'],
-                       'queries': test.get('queries', []),
-                       'retrieved_titles': [c['case_title'] for c in test.get('retrieved', [])]}
-                      for row, test in zip(cluster['records'], tests) if not test['hit']]
+                       'queries': by_id[row['id']].get('queries', []),
+                       'retrieved_titles': [c['case_title'] for c in by_id[row['id']].get('retrieved', [])]}
+                      for row in selected_failures]
             examples = [{'chat_content': row['chat_content'], 'gt_case_title': row['gt_case_title'],
-                         'queries': test.get('queries', [])} for row, test in zip(cluster['records'], tests)]
-            revised = model.task('feedback_revise', {'keyword': cluster['keyword'], 'desc': cluster['desc'],
-                                 'knowledge': current['knowledge'], 'examples': examples,
-                                 'review': review['result']['reason'], 'retrieval_failures': misses})
+                         'queries': by_id[row['id']].get('queries', []) if tests else row.get('queries', [])}
+                        for row in selected_examples]
+            revision_input = {'keyword': cluster['keyword'], 'desc': cluster['desc'],
+                              'knowledge': current['knowledge'], 'existing_knowledge': existing,
+                              'examples': examples, 'retrieval_failures': misses}
+            if not review['result']['approved']:
+                revision_input['review'] = review['result']['reason']
+            revised = model.task('feedback_revise', revision_input)
             history['rounds'][-1]['revision'] = revised
             if revised['status'] != 'success':
                 errors += 1

@@ -207,7 +207,7 @@ def model_input(stage, data):
         fields = {
             "feedback_query": ("knowledge", "chat_content"),
             "feedback_review": ("knowledge", "examples"),
-            "feedback_revise": ("keyword", "desc", "knowledge", "examples", "review", "retrieval_failures"),
+            "feedback_revise": ("keyword", "desc", "knowledge", "existing_knowledge", "examples", "review", "retrieval_failures"),
         }[stage]
         payload = {k: data[k] for k in fields if k in data}
         for name in ("examples", "retrieval_failures"):
