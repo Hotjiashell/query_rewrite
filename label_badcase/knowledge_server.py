@@ -26,11 +26,13 @@ class KnowledgeStore(base.Store):
                           dataset_fingerprint=fingerprint, sources=sources, revision=0, annotations={},
                           settings={'prompt': Path(kwargs.get('prompt_file') or ROOT.parent/'extract_knowledge/eval_prompt_template.txt').read_text(encoding='utf-8'),
                                     'knowledge': Path(kwargs.get('knowledge_file') or ROOT.parent/'extract_knowledge/existing_knowledge.txt').read_text(encoding='utf-8')})
+        self.initial_settings = copy.deepcopy(self.state['settings'])
         if output.exists():
             previous = base.load(output)
             if previous.get('artifact_type') != self.state['artifact_type'] or previous.get('dataset_fingerprint') != fingerprint:
                 raise ValueError('标注文件类型或数据集不匹配，请使用独立的 --output')
             self.state = previous
+        self.state.setdefault('record_settings', {})
         self.state.setdefault('settings_revision', 0)
 
     def summary(self):
@@ -39,20 +41,24 @@ class KnowledgeStore(base.Store):
                 'yes': sum(a['can_solve'] is True for a in values), 'no': sum(a['can_solve'] is False for a in values)}
 
     def snapshot(self):
-        return {'records': self.records, 'state': self.state, 'summary': self.summary(), 'output': str(self.output)}
+        return {'records': self.records, 'state': self.state, 'summary': self.summary(), 'output': str(self.output), 'initial_settings': self.initial_settings}
 
     def mutate(self, body):
         with self.lock:
             old = copy.deepcopy(self.state)
             try:
                 if body.get('action') == 'settings':
-                    if body.get('settings_revision') != self.state['settings_revision']:
-                        raise RuntimeError('数据已更新，请刷新后重试；当前输入尚未保存')
+                    key = str(body.get('key'))
+                    if key not in self.by_key:
+                        raise ValueError('记录不存在')
+                    current = self.state['record_settings'].get(key, {})
+                    if body.get('settings_revision') != current.get('revision', 0):
+                        raise RuntimeError('本条提示词和知识已被修改，请先同步处理冲突')
                     settings = body['settings']
                     if any(not isinstance(settings.get(k), str) for k in ('prompt', 'knowledge')):
                         raise ValueError('提示词和知识必须是文本')
-                    self.state['settings'] = {k: settings[k] for k in ('prompt', 'knowledge')}
-                    self.state['settings_revision'] += 1
+                    self.state['record_settings'][key] = {**{k: settings[k] for k in ('prompt', 'knowledge')},
+                                                        'revision': current.get('revision', 0)+1, 'updated_at': base.now()}
                 elif body.get('action') == 'annotation':
                     key = str(body.get('key'))
                     if key not in self.by_key:

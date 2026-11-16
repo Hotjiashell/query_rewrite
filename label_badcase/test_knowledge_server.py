@@ -32,12 +32,12 @@ class KnowledgeTests(unittest.TestCase):
             store = KnowledgeStore(records, Path(folder)/'annotations.json', {})
             store.mutate({'action':'annotation', 'key':records[0]['key'], 'record_revision':0,
                           'annotation':{'can_solve':True, 'owner':'甲'}})
-            settings = {'action':'settings', 'settings_revision':0,
+            settings = {'action':'settings', 'key':records[0]['key'], 'settings_revision':0,
                         'settings':{'prompt':'测试', 'knowledge':'知识'}}
             store.mutate(settings)
             with self.assertRaises(RuntimeError): store.mutate(settings)
-            self.assertEqual(store.state['settings']['knowledge'], '知识')
+            self.assertEqual(store.state['record_settings'][records[0]['key']]['knowledge'], '知识')
             self.assertEqual(store.state['annotations'][records[0]['key']]['owner'], '甲')
-            self.assertEqual(store.state['settings_revision'], 1)
+            self.assertEqual(store.state['record_settings'][records[0]['key']]['revision'], 1)
 
 if __name__ == '__main__': unittest.main()
