@@ -402,7 +402,22 @@ def run(args, llm):
             from .research import enrich
         else:
             from research import enrich
-        research_results = enrich(describe_tasks, groups, model, research_config, canonical, save, out)
+        if __package__:
+            from .embedding import embed_texts
+        else:
+            from embedding import embed_texts
+        from threading import Lock
+        embedding_lock = Lock()
+        def research_embed(texts):
+            # Batch concurrency is shared across all active research keywords.
+            with embedding_lock:
+                vectors, failures = embed_texts(texts, args, save, read_json, digest,
+                                               namespace='research_embedding')
+            if failures or any(t not in vectors for t in texts):
+                raise ValueError('research candidate embedding failed')
+            return vectors
+        research_results = enrich(describe_tasks, groups, model, research_config, canonical, save, out,
+                                  embed=research_embed)
     # Research succeeds once per normalized keyword; others use the ordinary GT definition.
     ordinary = [task for task in describe_tasks
                 if research_results.get(canonical(task['keyword']), {}).get('status') != 'success']
@@ -517,7 +532,8 @@ def run(args, llm):
             entries, kept, model, reviewer, feedback, knowledge, save, out)
     save(out / "knowledge.json", entries)
     (out / "knowledge.txt").write_text("\n".join(f"{i}. {r['knowledge'].strip()}" for i, r in enumerate(entries, 1)) + "\n", encoding="utf-8")
-    failures = sum(r['status'] != 'success' for r in research_results.values()) + feedback_errors + embedding_failures + sum(r["status"] != "success" for r in keyword_results + description_results + merged_results + filters + extracted)
+    failures = sum(r['status'] != 'success' or r.get('candidate_embedding_failed', False)
+                   for r in research_results.values()) + feedback_errors + embedding_failures + sum(r["status"] != "success" for r in keyword_results + description_results + merged_results + filters + extracted)
     summary = {"created_at": datetime.now(timezone.utc).isoformat(), "input_files": paths,
                "record_count": len(records), "input_issue_count": len(issues), "gt_cluster_count": len(groups),
                "description_task_count": len(describe_tasks), "keyword_cluster_count": len(ordered), "covered_cluster_count": len(excluded),

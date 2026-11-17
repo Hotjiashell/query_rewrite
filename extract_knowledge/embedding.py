@@ -3,6 +3,7 @@ import math
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 import sys
 
 
@@ -43,16 +44,17 @@ def semantic_groups(clusters, vectors, threshold):
     return [v for v in groups.values() if len(v)>1], edges
 
 
-def precluster(clusters, args, save, read_json, digest):
+def embed_texts(words, args, save, read_json, digest, namespace='embedding'):
+    """Embed texts with shared batching, retries and disk checkpoints."""
     config = args.embedding
     public = {k:v for k,v in config.items() if k != 'api_key'}
-    if len(clusters) < 2:
-        return [], [], 0
+    if not words:
+        return {}, []
     from openai import OpenAI
     client = OpenAI(base_url=config['base_url'], api_key=config['api_key'], timeout=config['timeout'], max_retries=0)
     def batch(words):
         key = digest([words, public])
-        path = args.output_dir / 'calls' / 'embedding' / (key+'.json')
+        path = Path(args.output_dir) / 'calls' / namespace / (key+'.json')
         if args.resume and path.exists():
             try:
                 cached = read_json(path)
@@ -78,7 +80,6 @@ def precluster(clusters, args, save, read_json, digest):
                 if attempt < config['retries']:
                     time.sleep(min(20,2**attempt)+random.random())
         return None,trace
-    words = [c.get('concept', c['keyword']) for c in clusters]
     batches = [words[i:i+config['batch_size']] for i in range(0,len(words),config['batch_size'])]
     results, failures = {}, []
     with ThreadPoolExecutor(max_workers=config['concurrency']) as pool:
@@ -90,7 +91,16 @@ def precluster(clusters, args, save, read_json, digest):
                 failures.append(error)
             else:
                 results.update(zip(batches[i],values))
-            print(f'\r[embedding] {done}/{len(batches)} failed={len(failures)}',end='\n' if done==len(batches) else '',file=sys.stderr,flush=True)
+            print(f'\r[{namespace}] {done}/{len(batches)} failed={len(failures)}',end='\n' if done==len(batches) else '',file=sys.stderr,flush=True)
+    return results, failures
+
+
+def precluster(clusters, args, save, read_json, digest):
+    if len(clusters) < 2:
+        return [], [], 0
+    public = {k:v for k,v in args.embedding.items() if k != 'api_key'}
+    words = [c.get('concept', c['keyword']) for c in clusters]
+    results, failures = embed_texts(words, args, save, read_json, digest)
     save(args.output_dir/'04_embeddings.json',{'configuration':public,'vectors':results,'failed_batches':failures})
     usable = [c for c in clusters if c.get('concept', c['keyword']) in results]
     try:

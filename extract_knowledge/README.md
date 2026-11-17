@@ -289,12 +289,18 @@ feedback_revise 的对话总预算为10条，examples 与 retrieval_failures 共
 
 第一次固定使用关键词检索，每次取 top_k 个案例的标题和正文。max_searches 是包括首次检索在内的总请求预算，至少1次。模型查看源 GT 标题/正文和累计去重的检索证据，可返回 search 动作生成新 query，或 summarize 动作给出 desc 与 relations；预算耗尽必须 summarize，违反约束会按原模型调用规则重试，最终失败不会越过预算。每次模型重试不增加检索请求。调研失败保留原 describe 路径产出可用定义，同时 summary.partial=true，不把缺少证据的调研当成功。恢复运行复用成功模型调用，但重新请求检索以获取当前证据。
 
-所有调研模型提示词位于 prompts.md 的 research 段。输入只含关键词、全部已抽取关键词列表、案例 title/content、已经查询的文本和是否还可查询；案例 ID、排名、分数、来源路径不传入模型。relations 每项为 source、target、description；source 必须为当前关键词，target 必须为本批其他已抽取关键词，description 为一句有证据支持的自然语言关联。相关不等于同义，调研不会自动新增关键词或伪造对话。
+所有调研模型提示词位于 prompts.md 的 research 段。输入只含当前关键词、筛选后的候选词名列表 known_keywords、案例 title/content、已经查询的文本和是否还可查询；候选词的 GT 片段、相似度、案例 ID、排名和来源路径不传入 research 模型。relations 每项为 source、target、description；source 必须为当前关键词，target 必须为本轮 known_keywords 中的词，description 为一句有证据支持的自然语言关联。相关不等于同义，调研不会自动新增关键词或伪造对话。
+
+候选词来自本次运行所有成功抽取的去重关键词（包括未达到调研门槛的词），排除当前词。每轮检索后，优先选累计案例标题或正文中直接出现的词（NFKC、大小写、空白归一化，英文名称加字母数字边界匹配），再用 embedding 按相关性补充；直接匹配之间按输入顺序选择，embedding 按余弦相似度降序、同分按归一化词排序。每轮最多新增20个，同一关键词的整个调研累计最多40个，已选词持续保留、不替换；达到40个后不再新增。因此各轮传入的列表可能为20、40、40个，而不是每轮都重置为20个。没有足够候选时不强制凑满。
+
+embedding 内部使用“候选关键词 + 对应源 GT 标题/正文”的上下文，与当前累计案例比较。正文按1000字符分段并保留标题，以最高片段相似度排序，覆盖长案例尾部及同词多 GT；候选 GT 片段只供 embedding 排序，research 模型仍只收到候选词名。复用顶层 embedding 配置、批处理、重试和缓存，调用文件位于 calls/research_embedding；单个关键词内已处理的证据向量跨轮复用。embedding 失败时保留已有候选并继续直接匹配，在调研结果中标记 candidate_embedding_failed，最终 summary.partial=true。
+
+research 提示词采用 ReAct：每轮以累计 cases 和 previous_queries 为 Observation，模型先输出简短的 Thought 说明证据、缺口或行动依据，再在 Action 下输出唯一的 JSON 代码块（search 或 summarize）。程序解析最后一个 JSON 代码块执行动作；search 的检索结果累计到下一轮 cases，summarize 结束调研。模型不自行生成 Observation。这里的 Thought 是普通响应正文中的分析说明，沿用现有调用设置，不依赖服务端原生 thinking 模式；原始 Thought 和动作响应保存在 calls/research 的 attempts 中。证据充分可提前总结，预算耗尽时只能总结有依据的内容并说明关键限制。
 
 语义同义融合完成后，将关联实体通过 aliases 映射回语义簇。无需双向确认，A→B 即可组成 A、B 的关联簇；每个源簇仅扩展它直接指向的邻居，不沿邻居继续搜索。因此 A→B、B→C 形成 AB 与 BC，不合并为传递闭包 ABC。多个直接关系 A→B、A→C 则形成 ABC。去除重复及被包含的冗余候选集合；关联簇可能重叠。每簇对话按 ID 取并集计数，不跨簇累加成唯一总数。
 
 关联簇包含 relations、relation_members（各语义簇代表词及定义）、aliases、concepts。过滤模型必须判断整个关联簇是否已被覆盖，不能只检查一个代表词；抽取和反馈修改模型使用关联定义，总结一条包含多个必要术语及分别适用条件的知识，允许多句“当……时可考虑某关键词”。关闭模块时原有行为保持不变。
 
-新增文件：03_research_results.json 保存各词检索 query、模型动作及结果；03_keyword_relations.json 保存结构化关系；03_ordinary_description_results.json 保存原 describe 调用；03_description_results.json 汇总最终定义；04_relation_clusters.json 保存一跳簇，04_merged_keyword_clusters.json 仍保存同义融合结果。calls/research 保存实际精简输入、证据和模型响应。knowledge.json 同时保留最终关系与成员定义。
+新增文件：03_research_results.json 保存各词检索 query、模型动作及结果，其中 candidate_selections 记录每轮新增词、入选方式、embedding 分数和累计候选列表；03_keyword_relations.json 保存结构化关系；03_ordinary_description_results.json 保存原 describe 调用；03_description_results.json 汇总最终定义；04_relation_clusters.json 保存一跳簇，04_merged_keyword_clusters.json 仍保存同义融合结果。calls/research 保存实际精简输入、证据和模型响应。knowledge.json 同时保留最终关系与成员定义。
 
 验证命令：`python3 -m unittest extract_knowledge.test_research extract_knowledge.test_feedback extract_knowledge.test_pipeline tests.test_evaluate tests.test_gen_query`。
