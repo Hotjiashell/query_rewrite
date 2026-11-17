@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
 import sys
+import traceback
 from typing import Any, Callable
 
 
@@ -58,7 +59,7 @@ class RetrievalAdapter:
         return convert_results(cases, self.top_k)
 
 
-def handler(adapter: RetrievalAdapter):
+def handler(adapter: RetrievalAdapter, *, debug: bool = False):
     class Handler(BaseHTTPRequestHandler):
         # Bound reads of incomplete HTTP requests; backend timeouts belong in retrieve_case.
         timeout = 30
@@ -103,6 +104,9 @@ def handler(adapter: RetrievalAdapter):
             except Exception as exc:
                 # Keep connection details and credentials in upstream exceptions out of responses.
                 print(f'[adapter] 检索失败 error_type={type(exc).__name__}', file=sys.stderr, flush=True)
+                if debug:
+                    traceback.print_exc(file=sys.stderr)
+                    sys.stderr.flush()
                 self.send_json(502, {'error': 'upstream_retrieval_failed', 'error_type': type(exc).__name__})
                 return
             self.send_json(200, result)
@@ -110,12 +114,12 @@ def handler(adapter: RetrievalAdapter):
     return Handler
 
 
-def create_server(host: str = '127.0.0.1', port: int = 8277, *, backend=None, **options):
+def create_server(host: str = '127.0.0.1', port: int = 8277, *, backend=None, debug=False, **options):
     if backend is None:
         from new_retrieve import retrieve_case
         backend = retrieve_case
     adapter = RetrievalAdapter(backend, **options)
-    return ThreadingHTTPServer((host, port), handler(adapter))
+    return ThreadingHTTPServer((host, port), handler(adapter, debug=debug))
 
 
 def main(argv=None):
@@ -128,6 +132,7 @@ def main(argv=None):
     parser.add_argument('--use-similar-question', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--use-chat', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--chat-content', default='', help='固定传给新接口的 chat_content；旧协议不携带对话')
+    parser.add_argument('--debug', action='store_true', help='在服务端 stderr 打印完整异常堆栈，HTTP 响应仍仅返回错误类型')
     args = parser.parse_args(argv)
     try:
         server = create_server(**vars(args))

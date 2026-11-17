@@ -1,4 +1,6 @@
 import json
+import io
+from contextlib import redirect_stderr
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -98,6 +100,18 @@ class AdapterHTTPTests(unittest.TestCase):
         self.backend.side_effect = None
         self.backend.return_value = {'unexpected': 'object'}
         self.assertEqual(requests.post(self.url, json={'retrieval_query': '查询'}, timeout=2).status_code, 502)
+
+    def test_debug_logs_type_error_traceback_only_on_server(self):
+        from retrieval_adapter import handler, RetrievalAdapter
+        self.server.RequestHandlerClass = handler(RetrievalAdapter(self.backend), debug=True)
+        self.backend.side_effect = TypeError("retrieve_case() got an unexpected keyword argument 'index'")
+        log = io.StringIO()
+        with redirect_stderr(log):
+            response = requests.post(self.url, json={'retrieval_query': '查询'}, timeout=2)
+        self.assertEqual(response.status_code, 502)
+        self.assertIn('Traceback (most recent call last)', log.getvalue())
+        self.assertIn("unexpected keyword argument 'index'", log.getvalue())
+        self.assertNotIn('unexpected keyword', response.text)
 
     def test_multiple_requests_keep_queries_independent(self):
         self.backend.side_effect = lambda **kw: [{**CASES[0], 'caseID': kw['query']}]

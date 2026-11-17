@@ -144,6 +144,8 @@ python evaluate.py retrieve --retrieval-url http://127.0.0.1:8277/run_case_retri
 
 `metadata` 不传入旧协议。返回空列表对应 `{"retrieval_result":{}}`；请求无效返回 HTTP 400，后端异常或结果格式不合法返回 HTTP 502。`GET /health` 检查转接服务是否运行，不调用后端，也不代表后端可用。
 
+排查 HTTP 502 时，启动参数加 `--debug`，服务端 stderr 会打印完整 Traceback 和异常具体原因（如函数参数不匹配或后端内部类型错误），HTTP 响应仍仅返回错误类型。需重启服务后再发送请求以获取堆栈。
+
 `--use-similar-question`、`--use-chat` 默认关闭，可分别用同名参数开启；`--chat-content` 默认空字符串。旧请求只携带 query，因此转接器无法自动取得原始对话，`--chat-content` 仅提供固定值。服务端的 `--top-k` 决定每次向新后端请求的数量，评测端 `--top-k` 仍控制多 query 融合后的截断数量。
 
 测试：`python -m unittest tests.test_retrieval_adapter tests.test_evaluate`，使用模拟后端验证真实本地 HTTP 请求、字段转换、评测命中、并发和异常处理，不调用真实检索服务。
