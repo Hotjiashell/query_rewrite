@@ -35,6 +35,7 @@
   },
   "feedback": {
     "enabled": true,
+    "retrieval_url": "http://10.67.43.14:8276/run_case_retrieval",
     "max_entries": 0,
     "max_rounds": 3,
     "top_k": 10,
@@ -53,6 +54,7 @@
   },
   "research": {
     "enabled": false,
+    "retrieval_url": "http://10.67.43.14:8276/run_case_retrieval",
     "top_k": 5,
     "max_searches": 3,
     "min_dialogues": 5,
