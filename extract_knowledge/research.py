@@ -1,9 +1,11 @@
 """Budgeted keyword research and non-transitive one-hop relation expansion."""
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
+import sys
 
 
 def investigate(keyword, seeds, known_keywords, model, settings, retrieve):
+    prefix = f'[research {keyword!r}]'
     evidence = list(seeds)
     queries, rounds = [], []
     query = keyword
@@ -12,6 +14,8 @@ def investigate(keyword, seeds, known_keywords, model, settings, retrieve):
             if query is not None:
                 if len(queries) >= settings['max_searches']:
                     raise ValueError('research retrieval budget exhausted')
+                print(f'{prefix} 检索 {len(queries) + 1}/{settings["max_searches"]} query={query!r}',
+                      file=sys.stderr, flush=True)
                 payload = retrieve(query).get('retrieval_result')
                 if not isinstance(payload, dict):
                     raise ValueError('invalid retrieval result')
@@ -26,16 +30,22 @@ def investigate(keyword, seeds, known_keywords, model, settings, retrieve):
                 queries.append(query)
             data = {'keyword': keyword, 'known_keywords': known_keywords, 'cases': evidence,
                     'previous_queries': queries, 'can_search': len(queries) < settings['max_searches']}
+            print(f'{prefix} 模型分析中 证据={len(evidence)} 可继续检索={data["can_search"]}',
+                  file=sys.stderr, flush=True)
             response = model.task('research', data)
             rounds.append(response)
             if response['status'] != 'success':
+                print(f'{prefix} 模型调用失败，回退普通定义生成', file=sys.stderr, flush=True)
                 return {'status': 'failed', 'rounds': rounds, 'queries': queries}
             result = response['result']
             if result['action'] == 'summarize':
+                print(f'{prefix} 总结完成 关系={len(result["relations"])}', file=sys.stderr, flush=True)
                 return {'status': 'success', 'result': result, 'rounds': rounds, 'queries': queries}
+            print(f'{prefix} 模型选择继续检索', file=sys.stderr, flush=True)
             query = result['query']
         raise ValueError('research did not summarize within budget')
     except Exception as exc:
+        print(f'{prefix} 调研失败（{type(exc).__name__}），回退普通定义生成', file=sys.stderr, flush=True)
         return {'status': 'failed', 'error_type': type(exc).__name__, 'rounds': rounds, 'queries': queries}
 
 
@@ -60,8 +70,21 @@ def enrich(tasks, groups, model, settings, canonical, save, out, retrieve=None):
             if case not in seeds:
                 seeds.append(case)
         return key, investigate(items[0]['keyword'], seeds, known, model, settings, retrieve)
+    print(f'[research] 0/{len(eligible)} 待调研={len(eligible)} 跳过={len(buckets) - len(eligible)} '
+          f'并发={settings["concurrency"]}', file=sys.stderr, flush=True)
+    completed, failed = 0, 0
+    by_key = {}
     with ThreadPoolExecutor(max_workers=settings['concurrency']) as pool:
-        results = dict(pool.map(research, eligible))
+        futures = [pool.submit(research, item) for item in eligible]
+        for future in as_completed(futures):
+            key, result = future.result()
+            by_key[key] = result
+            completed += 1
+            failed += result['status'] != 'success'
+            print(f'[research] {completed}/{len(eligible)} 成功={completed - failed} 失败={failed}',
+                  file=sys.stderr, flush=True)
+    # Retain input order so downstream relation and cluster ordering stays stable.
+    results = {key: by_key[key] for key, _ in eligible}
     save(out / '03_research_results.json', results)
     return results
 

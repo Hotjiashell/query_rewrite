@@ -428,6 +428,7 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(args.min_cluster_size, 1)
                 self.assertEqual(args.knowledge, str(p.HERE / 'existing_knowledge.txt'))
                 self.assertTrue(args.resume)
+                self.assertEqual(args.feedback['max_entries'], 0)
                 self.assertEqual(args.badcases, [str(root / 'bad1.json')])
                 self.assertEqual(args.output_dir, str(p.ROOT / 'extract_knowledge/outputs/test'))
                 self.assertEqual(llm['model_name'], 'fake')
@@ -435,6 +436,23 @@ class PipelineTests(unittest.TestCase):
                 args = run.call_args.args[0]
                 self.assertEqual(args.concurrency, 3)
                 self.assertFalse(args.resume)
+                config_data = p.read_json(config)
+                config_data['feedback'] = {'max_entries': 5}
+                p.save(config, config_data)
+                self.assertEqual(p.main(['--config', str(config)]), 0)
+                self.assertEqual(run.call_args.args[0].feedback['max_entries'], 5)
+                self.assertEqual(p.main(['--config', str(config), '--feedback-max-entries', '2']), 0)
+                self.assertEqual(run.call_args.args[0].feedback['max_entries'], 2)
+                self.assertEqual(p.main(['--config', str(config), '--feedback-max-entries', '0']), 0)
+                self.assertEqual(run.call_args.args[0].feedback['max_entries'], 0)
+                for invalid in (-1, True, 1.5, '5'):
+                    config_data['feedback']['max_entries'] = invalid
+                    p.save(config, config_data)
+                    run.reset_mock()
+                    self.assertEqual(p.main(['--config', str(config)]), 2)
+                    run.assert_not_called()
+                config_data['feedback']['max_entries'] = 0
+                p.save(config, config_data)
             with patch.object(p, 'HERE', root), patch.object(p, 'run', return_value=0) as run:
                 self.assertEqual(p.main([]), 0)
                 self.assertTrue(run.called)

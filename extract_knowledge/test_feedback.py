@@ -6,7 +6,7 @@ from .pipeline import model_input, save
 
 
 class FeedbackTests(unittest.TestCase):
-    def run_feedback(self, reject=False, broken=False, retrieval_miss=False):
+    def run_feedback(self, reject=False, broken=False, retrieval_miss=False, max_entries=0, entry_count=1):
         rows = [{'id': str(i), 'expected_case_id': 'target', 'chat_content': f'用户诉求{i}',
                  'gt_case_title': '目标标题', 'gt_case_content': '依据', 'queries': ['历史query']} for i in range(12)]
         calls = []
@@ -39,12 +39,15 @@ class FeedbackTests(unittest.TestCase):
             knowledge_file = Path(directory) / 'existing.txt'
             prompt_file.write_text('知识：{knowledge}')
             knowledge_file.write_text('已有知识')
-            result = refine([{'cluster_id': 'cluster', 'knowledge': '罗列现象'}],
-                            [{'id': 'cluster', 'keyword': '内部词', 'desc': '描述解释', 'records': rows}], Model(), Model(),
-                            {'max_rounds': 2, 'top_k': 10, 'min_recall': 1, 'concurrency': 2, 'timeout': 1, 'prompt_file': str(prompt_file), 'knowledge_file': str(knowledge_file)},
+            result = refine([{'cluster_id': f'cluster{i}', 'knowledge': '罗列现象'} for i in range(entry_count)],
+                            [{'id': f'cluster{i}', 'keyword': '内部词', 'desc': '描述解释', 'records': rows}
+                             for i in range(entry_count)], Model(), Model(),
+                            {'max_entries': max_entries, 'max_rounds': 2, 'top_k': 10, 'min_recall': 1, 'concurrency': 2, 'timeout': 1, 'prompt_file': str(prompt_file), 'knowledge_file': str(knowledge_file)},
                             '', save, Path(directory), retrieve)
             import json
             history = json.loads((Path(directory) / '08_feedback_results.json').read_text())
+            skipped = json.loads((Path(directory) / 'feedback_skipped_knowledge.json').read_text())
+            self.assertEqual(len(skipped), max(0, entry_count - max_entries) if max_entries else 0)
             if not retrieval_miss:
                 self.assertEqual(history[0]['rounds'][0]['tests'], [])
                 self.assertIsNone(history[0]['rounds'][0]['recall'])
@@ -53,6 +56,31 @@ class FeedbackTests(unittest.TestCase):
                 self.assertNotIn('feedback_query', calls)
                 self.assertNotIn('retrieve', calls)
             return result, history
+
+    def test_limit_reviews_prefix_and_preserves_unvalidated_remainder(self):
+        (entries, rejected, errors), history = self.run_feedback(max_entries=1, entry_count=2)
+        self.assertEqual((rejected, errors), (0, 0))
+        self.assertEqual([h['cluster_id'] for h in history], ['cluster0'])
+        self.assertEqual([e['cluster_id'] for e in entries], ['cluster0', 'cluster1'])
+        self.assertEqual(entries[0]['knowledge'], '归纳规则')
+        self.assertTrue(entries[0]['validation']['passed'])
+        self.assertEqual(entries[1]['knowledge'], '罗列现象')
+        self.assertTrue(entries[1]['validation']['skipped'])
+        self.assertIsNone(entries[1]['validation']['passed'])
+
+    def test_limit_does_not_replace_rejected_entries_with_lower_ranks(self):
+        (entries, rejected, errors), history = self.run_feedback(reject=True, max_entries=1, entry_count=2)
+        self.assertEqual((rejected, errors), (1, 0))
+        self.assertEqual([h['cluster_id'] for h in history], ['cluster0'])
+        self.assertEqual([e['cluster_id'] for e in entries], ['cluster1'])
+        self.assertTrue(entries[0]['validation']['skipped'])
+
+    def test_zero_or_large_limit_validates_all_entries(self):
+        for limit in (0, 10):
+            with self.subTest(limit=limit):
+                (entries, rejected, errors), history = self.run_feedback(max_entries=limit, entry_count=2)
+                self.assertEqual((len(entries), rejected, errors, len(history)), (2, 0, 0, 2))
+                self.assertTrue(all(e['validation']['passed'] for e in entries))
 
     def test_revision_must_pass_both_gates_and_tests_full_cluster(self):
         (entries, rejected, errors), history = self.run_feedback()

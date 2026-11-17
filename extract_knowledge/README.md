@@ -216,7 +216,18 @@ k 必须是非负整数；k=0 时只放已有知识，超过新知识总数时�
 
 当前示例配置开启顶层 `feedback.enabled=true`。旧配置未提供该节时关闭。开启后会实际调用检索服务，需要安装根目录 requirements.txt 中的依赖并确保检索服务可访问。
 
-每条初始知识使用最终保留簇的全部去重对话测试，不受 max_examples 限制。query 模型只看到已有知识、本条候选知识和当前对话，不看到 GT 标题、正文、历史 query 或任何记录编号。query 响应复用 gen_query.extract_queries 解析（兼容 query 字符串或数组）；query 生成执行复用 evaluate.QueryGenerationRunner，检索复用 evaluate.RetrievalEvaluator，支持 round_robin 和 score 融合，检查 GT 是否命中融合后的 Top K。GT ID 只在本地匹配。
+每条参与反馈的知识使用最终保留簇的全部去重对话测试，不受 max_examples 限制。query 模型只看到已有知识、本条候选知识和当前对话，不看到 GT 标题、正文、历史 query 或任何记录编号。query 响应复用 gen_query.extract_queries 解析（兼容 query 字符串或数组）；query 生成执行复用 evaluate.QueryGenerationRunner，检索复用 evaluate.RetrievalEvaluator，支持 round_robin 和 score 融合，检查 GT 是否命中融合后的 Top K。GT ID 只在本地匹配。
+
+`feedback.max_entries` 限制参与反馈的知识数量：默认 `0` 表示全部，正整数 N 表示只处理 `knowledge_initial.json` 中排名前 N 条。当前顺序按最终簇的去重对话数从多到少排列，同数时沿用原顺序；这是成功抽取的知识排名。限制同时作用于评审、query 生成、检索和反馈修改，前 N 条未通过时不从后面递补。它与控制检索结果排名的 `feedback.top_k` 是两个独立参数。可在配置中设置，例如：
+
+```json
+"feedback": {
+  "enabled": true,
+  "max_entries": 20
+}
+```
+
+也可用 `python -m extract_knowledge --feedback-max-entries 20` 覆盖配置。超过实际条目数时处理全部；负数、布尔值和非整数无效。未选中的知识保留原文，写入最终 `knowledge.json/txt`，并在 JSON 中标记 `validation.skipped=true`、`validation.passed=null`，不能视为已通过验证。`feedback_skipped_knowledge.json` 单独保存这些条目；`summary.json` 的 `feedback_selected_count` 和 `feedback_skipped_count` 记录参与与跳过数量。主动限制范围本身不会令 `summary.partial=true`；选中条目未通过或调用失败仍按原规则标记 partial。
 
 独立 review_llm 仅接收候选知识、聚类对话和 GT 案例标题，不传案例正文；评审适用条件是否归纳共同语义，明确拒绝枚举样本原话、现象、操作或设备。修改模型收到关键词、描述解释、当前知识、已有知识，以及最多10条对话的标题和 query；评审拒绝时附评审理由，检索未达标时附检索未命中的语义反馈（对话、目标标题、生成 query 和检索标题），不传案例 ID、记录 ID、来源路径、排名等管理字段。修改后重新执行两道验证，不能直接接受未验证的最后一次修改。
 
@@ -224,7 +235,7 @@ k 必须是非负整数；k=0 时只放已有知识，超过新知识总数时�
 
 顶层 review_llm 可配置 base_url、model_name、api_key/api_key_env、temperature，未指定的模型连接字段继承 llm。要使用不同的评审模型，请显式填写 model_name，默认配置中的空字段会回退主模型。反馈提示词统一在 prompts.md 的 feedback_review 和 feedback_revise 段，可通过 prompts_file 切换；保留每段唯一的 {input} 占位符。
 
-新增产物：knowledge_initial.json 保存原始抽取；08_feedback_results.json 保存每轮知识、评审、query、实际检索和命中结果；feedback_rejected_knowledge.json 保存未通过条目；feedback_prompt_templates.json 保存模板快照。最终 knowledge.json/txt 仅含双重验证通过的知识；未通过或服务失败会令 summary.partial=true 并返回1。全部通过只代表在这些聚类样本上的验证结果，仍需独立样本评估泛化效果。
+新增产物：knowledge_initial.json 保存原始抽取；08_feedback_results.json 保存参与反馈条目的每轮知识、评审、query、实际检索和命中结果；feedback_rejected_knowledge.json 保存未通过条目；feedback_prompt_templates.json 保存模板快照。最终 knowledge.json/txt 包含双重验证通过的知识，以及因 max_entries 限制跳过反馈的原始知识；参与验证但未通过或服务失败会令 summary.partial=true 并返回1。全部通过只代表在这些聚类样本上的验证结果，仍需独立样本评估泛化效果。
 
 离线回归：`python3 -m unittest extract_knowledge.test_feedback extract_knowledge.test_pipeline`。
 
@@ -251,6 +262,8 @@ python3 -m extract_knowledge \
 
 跳过检索的轮次在 08_feedback_results.json 中记录 retrieval_status=skipped、tests=[]、recall=null，避免误认为命中率为零。此时修改输入的 examples.queries 使用原 badcase 的历史 query，retrieval_failures 为空；执行检索后则使用本轮实际生成的 query。
 
+终端通过 stderr 实时打印 `[feedback]` 总进度，以及当前知识的评审轮次、评审通过/拒绝、query 生成与检索完成数、命中数、错误数、命中比例和修改状态。簇内检索按实际完成顺序更新进度，过程文件中的测试顺序仍与原对话顺序一致。
+
 
 feedback_revise 的对话总预算为10条，examples 与 retrieval_failures 共享预算，不重复传入同一条对话。优先从本轮未命中的对话中按 GT 轮询选择，不足10条时再从剩余对话按 GT 轮询补齐。评审拒绝而未执行检索时，从全簇按 GT 轮询选最多10条，携带历史 query。existing_knowledge 为反馈评测使用的已有知识文件全文，knowledge 为当前待修改条目。评审通过后若仅检索不达标，输入中完全省略 review 字段。检索验证仍使用全簇对话，评审样本范围不受本次修改采样影响。
 
@@ -271,6 +284,8 @@ feedback_revise 的对话总预算为10条，examples 与 retrieval_failures 共
 ```
 
 同名词按原有 NFKC、大小写、空白规则归一化，跨 GT 关联的记录 ID 取并集；仅当对话数严格大于 min_dialogues 时调研。例如10表示至少11条，0表示所有非空关键词都可调研。相同关键词只调研一次，结果共享给相关 GT。research 并发数与主流程独立，防止昂贵检索任务占满连接。
+
+终端通过 stderr 实时打印 `[research]` 的待调研/跳过数量、关键词完成数和成功/失败数；每个关键词另外打印当前检索次数及 query、累计证据数、模型分析与继续检索/总结状态，失败时提示回退普通定义生成。并发关键词的日志带关键词标识。
 
 第一次固定使用关键词检索，每次取 top_k 个案例的标题和正文。max_searches 是包括首次检索在内的总请求预算，至少1次。模型查看源 GT 标题/正文和累计去重的检索证据，可返回 search 动作生成新 query，或 summarize 动作给出 desc 与 relations；预算耗尽必须 summarize，违反约束会按原模型调用规则重试，最终失败不会越过预算。每次模型重试不增加检索请求。调研失败保留原 describe 路径产出可用定义，同时 summary.partial=true，不把缺少证据的调研当成功。恢复运行复用成功模型调用，但重新请求检索以获取当前证据。
 

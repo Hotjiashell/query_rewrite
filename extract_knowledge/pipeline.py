@@ -500,7 +500,7 @@ def run(args, llm):
             entries.append({**result, "keyword": cluster["keyword"], "cluster_id": cluster["id"],
                             "desc": cluster["desc"], "concepts": cluster["concepts"], "aliases": cluster["aliases"], "cluster_count": cluster["count"], "gt_case_count": cluster["gt_case_count"],
                             **{k: cluster[k] for k in ("relations", "relation_members") if k in cluster}, "example_ids": [r["id"] for r in task["examples"]]})
-    feedback_rejected = feedback_errors = 0
+    feedback_rejected = feedback_errors = feedback_selected = feedback_skipped = 0
     feedback = getattr(args, "feedback", {})
     if feedback.get("enabled"):
         if __package__:
@@ -510,6 +510,9 @@ def run(args, llm):
         reviewer = Model(args, args.review_llm)
         save(out / "feedback_prompt_templates.json", {k: model.templates[k] for k in ("feedback_review", "feedback_revise")})
         save(out / "knowledge_initial.json", entries)
+        limit = feedback.get('max_entries', 0)
+        feedback_selected = min(limit, len(entries)) if limit else len(entries)
+        feedback_skipped = len(entries) - feedback_selected
         entries, feedback_rejected, feedback_errors = refine(
             entries, kept, model, reviewer, feedback, knowledge, save, out)
     save(out / "knowledge.json", entries)
@@ -522,6 +525,7 @@ def run(args, llm):
                "min_cluster_size": args.min_cluster_size, "low_frequency_cluster_count": len(low_frequency),
                "eligible_keyword_cluster_count": len(eligible),
                "retained_cluster_count": len(kept), "knowledge_count": len(entries),
+               "feedback_selected_count": feedback_selected, "feedback_skipped_count": feedback_skipped,
                "failed_model_tasks": failures, "feedback_rejected_count": feedback_rejected, "feedback_enabled": bool(feedback.get("enabled")), "partial": bool(failures or issues or feedback_rejected),
                "concurrency": args.concurrency, "max_examples": args.max_examples,
                "precluster": precluster_config, "failed_embedding_batches": embedding_failures,
@@ -537,6 +541,7 @@ def main(argv=None):
     parser.add_argument("badcases", nargs="*", help="一个或多个 collect_badcases.py 输出文件（支持 shell 通配符）")
     parser.add_argument("--feedback-prompt-file", help="反馈验证的 query 提示词模板，含 {knowledge}，可含 {dialogue}")
     parser.add_argument("--feedback-knowledge-file", help="反馈验证时使用的已有知识文本")
+    parser.add_argument("--feedback-max-entries", type=int, help="仅对排名前 N 条知识执行反馈验证，0 表示全部")
     parser.add_argument("--knowledge", help="只包含已有知识条目的独立文本文件，可为空")
     parser.add_argument("--prompts-file", help="包含四个阶段提示词的 Markdown 文件")
     parser.add_argument("--cases", help="案例映射 JSON，按 GT ID 读取 case_name 和 text 正文")
@@ -659,8 +664,12 @@ def main(argv=None):
         review_config = config.get("review_llm", {})
         if not isinstance(review_config, dict):
             raise ValueError("review_llm 必须为对象")
-        args.feedback = {"enabled": False, "max_rounds": 3, "top_k": 10, "min_recall": 1.0,
+        args.feedback = {"enabled": False, "max_entries": 0, "max_rounds": 3, "top_k": 10, "min_recall": 1.0,
                          "timeout": 30, "concurrency": args.concurrency, **feedback}
+        if args.feedback_max_entries is not None:
+            args.feedback['max_entries'] = args.feedback_max_entries
+        if type(args.feedback['max_entries']) is not int or args.feedback['max_entries'] < 0:
+            raise ValueError('feedback.max_entries 必须为非负整数，0 表示全部')
         if args.feedback["enabled"]:
             from search import DEFAULT_RETRIEVAL_URL
             from evaluate import FUSION_METHODS
