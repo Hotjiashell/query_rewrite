@@ -112,6 +112,42 @@ config-file value, then environment variable. All three prompt methods include
 `extra_body={"chat_template_kwargs": {"enable_thinking": false}}` on every
 model request.
 
+## 新检索接口转接服务
+
+[retrieval_adapter.py](retrieval_adapter.py) 接收现有 `search.py` / `evaluate.py` 的 HTTP 请求，在服务进程内调用 [new_retrieve.py](new_retrieve.py) 的 `retrieve_case()`，再转换成旧检索协议。无需修改评测代码，也不新增依赖。
+
+先在 `new_retrieve.py` 中实现实际检索函数（当前文件是返回 `[]` 的占位实现），然后启动：
+
+```bash
+python retrieval_adapter.py --host 127.0.0.1 --port 8277 \
+  --top-k 10 --strategy 'lexical&semantic' --index document_12
+```
+
+其他机器需要访问时可将监听地址设置为 `--host 0.0.0.0`。服务支持并发请求；`retrieve_case()` 的实现应支持并发调用，并为它内部的网络请求设置超时。旧客户端的请求超时不会中断服务器内正在执行的 Python 函数。
+
+评测指向转接服务：
+
+```bash
+python evaluate.py retrieve --retrieval-url http://127.0.0.1:8277/run_case_retrieval
+```
+
+或将配置中的 `retrieval.url` 设置为这个地址。知识抽取流程可将 `feedback.retrieval_url` 和 `research.retrieval_url` 分别指向此地址。
+
+输入为 `POST /run_case_retrieval`，请求体 `{"retrieval_query":"用户查询"}`。转接器将查询及启动参数传给 `retrieve_case(query=..., top_k=..., strategy=..., index=..., use_similar_question=..., use_chat=..., chat_content=...)`，按返回列表顺序编号为 `top1`、`top2`，不重新按 score 排序，最多保留服务端 `--top-k` 条：
+
+| 新接口字段 | 旧接口字段 |
+| --- | --- |
+| `caseID` | `retrieval_result.topN.case_id`，转为字符串 |
+| `case_name` | `retrieval_result.topN.case_title` |
+| `text` | `retrieval_result.topN.content`，保留完整正文 |
+| `score` | `retrieval_result.topN.score`，未提供时为 null |
+
+`metadata` 不传入旧协议。返回空列表对应 `{"retrieval_result":{}}`；请求无效返回 HTTP 400，后端异常或结果格式不合法返回 HTTP 502。`GET /health` 检查转接服务是否运行，不调用后端，也不代表后端可用。
+
+`--use-similar-question`、`--use-chat` 默认关闭，可分别用同名参数开启；`--chat-content` 默认空字符串。旧请求只携带 query，因此转接器无法自动取得原始对话，`--chat-content` 仅提供固定值。服务端的 `--top-k` 决定每次向新后端请求的数量，评测端 `--top-k` 仍控制多 query 融合后的截断数量。
+
+测试：`python -m unittest tests.test_retrieval_adapter tests.test_evaluate`，使用模拟后端验证真实本地 HTTP 请求、字段转换、评测命中、并发和异常处理，不调用真实检索服务。
+
 ## LLM reranking
 
 After retrieval, `rerank_cases.py` can ask the model to judge the returned
